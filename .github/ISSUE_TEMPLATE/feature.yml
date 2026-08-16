@@ -1,0 +1,69 @@
+name: "Feature"
+description: "A coherent, testable product capability delivered through independently accepted Stories."
+title: "[feature] "
+type: Feature
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Capability outcome
+      description: Which actors receive what complete capability and why?
+    validations:
+      required: true
+
+  - type: textarea
+    id: canonical
+    attributes:
+      label: Canonical authorities
+      description: Product, system, capability, workflow, rule, requirement and decision links.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflows
+    attributes:
+      label: Actors, workflows and rules
+      description: Summarise entry-to-outcome workflows and the governing rules without copying the full specification.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      placeholder: |
+        In scope:
+        -
+
+        Non-goals:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: completion
+    attributes:
+      label: Feature completion evidence
+      description: What running-product, operational and measurable evidence proves the capability is complete?
+      placeholder: |
+        - [ ] End-to-end actor workflow
+        - [ ] Cross-system contract and failure evidence
+        - [ ] Operational/monitoring evidence
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Systems, dependencies, decisions and risks
+      description: Include owning repositories and cross-repository blockers.
+    validations:
+      required: true
+
+  - type: textarea
+    id: children
+    attributes:
+      label: Child Story plan
+      description: Describe the intended vertical slices. Replace with native sub-issues when created.
+    validations:
+      required: true

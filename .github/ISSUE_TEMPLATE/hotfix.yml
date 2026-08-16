@@ -1,0 +1,74 @@
+name: "Hotfix"
+description: "Urgent production P0/P1 correction requiring containment, rollback and immediate test reconciliation."
+title: "[hotfix] "
+type: Bug
+body:
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - "P0 — outage, active data loss/corruption or critical security exposure"
+        - "P1 — major workflow blocked with no acceptable workaround"
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Production impact and evidence
+      description: Affected users/tenants/workflows, start time, revision and observable evidence without secrets.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction or detection path
+      description: Exact steps, alert/query or reason direct reproduction is unsafe.
+    validations:
+      required: true
+
+  - type: textarea
+    id: containment
+    attributes:
+      label: Immediate containment
+      description: How impact is stopped or reduced while the patch is prepared.
+    validations:
+      required: true
+
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback plan and trigger
+      description: Exact recovery action, owner and condition for rollback.
+    validations:
+      required: true
+
+  - type: textarea
+    id: fix
+    attributes:
+      label: Focused fix and non-goals
+      description: Smallest safe correction; identify deliberate follow-up work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Focused validation and monitoring
+      description: Pre-release checks, production smoke/metrics/logs and observation period.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: controls
+    attributes:
+      label: Mandatory controls
+      options:
+        - label: "Human approval and production authorisation are required."
+          required: true
+        - label: "The exact change will be reconciled into test immediately."
+          required: true
+        - label: "A complete/preventive follow-up is linked when this patch is deliberately narrow."
+          required: true

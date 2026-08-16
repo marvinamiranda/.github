@@ -1,0 +1,70 @@
+name: "Bug"
+description: "An observed deviation from approved or expected behaviour."
+title: "[bug] "
+type: Bug
+body:
+  - type: textarea
+    id: expectation
+    attributes:
+      label: Approved expectation
+      description: Link the story, requirement, rule or other authority that defines correct behaviour.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour and impact
+      description: What happened, who/what is affected, and is there a workaround?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and revision
+      description: URL/environment, application/build/commit, tenant/location test scope, device/OS/browser and first/last observed time where known.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: Severity is impact, not delivery priority.
+      options:
+        - "P0 — outage, active data loss/corruption or critical security exposure"
+        - "P1 — major workflow blocked with no acceptable workaround"
+        - "P2 — material defect with a workaround"
+        - "P3 — minor/cosmetic defect"
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Screenshots, logs, traces or request/response details with secrets and personal data removed.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Fix and regression acceptance
+      description: Expected correct behaviour, regression checks and deployed verification.
+      placeholder: |
+        - [ ] Original reproduction no longer fails
+        - [ ] Regression test covers the cause
+        - [ ] Negative/adjacent behaviour remains correct
+    validations:
+      required: true

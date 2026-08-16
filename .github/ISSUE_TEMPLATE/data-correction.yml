@@ -1,0 +1,52 @@
+name: "Data correction"
+description: "A controlled, auditable repair of existing data with preview, backup, rollback and post-check."
+title: "[data-correction] "
+type: Task
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Incorrect data and approved expectation
+      description: What is wrong and which rule/source defines the correct state?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Exact environment and affected set
+      description: Environment, tenant/scope, entities/tables and expected row/item count. Do not include personal data.
+    validations:
+      required: true
+
+  - type: textarea
+    id: preview
+    attributes:
+      label: Read-only preview and reconciliation
+      description: Query/steps proving the affected set and totals before mutation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: fix
+    attributes:
+      label: Idempotent correction plan
+      description: Transaction/error behaviour, assertions and how repeated execution is made safe.
+    validations:
+      required: true
+
+  - type: textarea
+    id: backup
+    attributes:
+      label: Backup and rollback
+      description: Snapshot/reversible evidence, rollback steps, owner and trigger.
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Independent review and post-fix checks
+      description: Reviewer, authorised executor, audit evidence, post-counts and business reconciliation.
+    validations:
+      required: true

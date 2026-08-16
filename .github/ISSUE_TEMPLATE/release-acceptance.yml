@@ -1,0 +1,72 @@
+name: "Release acceptance"
+description: "Release-level evidence, UAT, operational readiness and production decision."
+title: "[release] "
+type: Task
+body:
+  - type: textarea
+    id: horizon
+    attributes:
+      label: Delivery horizon and outcome
+      description: Link the approved milestone/horizon and describe the release outcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contents
+    attributes:
+      label: Included issues and immutable artifacts
+      description: Link accepted issues, PRs, revisions, image/artifact digests and target environments.
+    validations:
+      required: true
+
+  - type: textarea
+    id: readiness
+    attributes:
+      label: Migration, configuration and operational readiness
+      description: Migrations, secrets/config, dependencies, capacity, monitoring, support/runbook and compatibility checks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: uat
+    attributes:
+      label: UAT scenarios and evidence
+      description: Real actor/customer scenarios beyond the individual Story checks.
+      placeholder: |
+        - [ ] Scenario, environment and evidence
+    validations:
+      required: true
+
+  - type: textarea
+    id: limitations
+    attributes:
+      label: Known limitations and accepted residual risk
+      description: Link authorised exceptions; write “none” only after review.
+    validations:
+      required: true
+
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback and recovery
+      description: Artifact rollback, data compatibility, owner and decision trigger.
+    validations:
+      required: true
+
+  - type: textarea
+    id: monitoring
+    attributes:
+      label: Production smoke and monitoring plan
+      description: Checks, dashboards/alerts, observation window and accountable owner.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: decision
+    attributes:
+      label: Release decision controls
+      options:
+        - label: "Every included Story has independent running-test acceptance."
+          required: true
+        - label: "A human must approve the test-to-main pull request and production release."
+          required: true

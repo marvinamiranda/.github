@@ -1,0 +1,53 @@
+name: "Technical task"
+description: "An independently verifiable technical enabler with no hidden user-story scope."
+title: "[task] "
+type: Task
+body:
+  - type: textarea
+    id: parent
+    attributes:
+      label: Parent outcome and canonical authority
+      description: Link the Story/Feature and governing architecture/quality/operational authority.
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Required technical output
+      description: State the concrete artifact or changed capability and why it can be owned independently.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      placeholder: |
+        In scope:
+        -
+
+        Non-goals:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Dependencies, risks and rollback
+      description: Include public contracts, migrations, data, security, deployment and cross-repository effects.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and verification
+      description: No task automatically skips tests; list the appropriate automated and operational evidence.
+      placeholder: |
+        - [ ] Technical outcome is observable
+        - [ ] Required repository gates pass
+        - [ ] Failure/rollback path is verified where applicable
+    validations:
+      required: true
