@@ -53,12 +53,18 @@ body:
       required: true
 
   - type: textarea
-    id: dependencies
+    id: boundaries
     attributes:
-      label: Systems, dependencies, decisions and risks
-      description: Include owning repositories and cross-repository blockers.
+      label: Systems, repositories, decisions and risks
+      description: Identify owning repositories, affected contracts and unresolved decisions or material risks.
     validations:
       required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and sequencing (optional)
+      description: Link known upstream/downstream work, cross-repository dependencies or blockers. Leave blank when the Feature is independent.
 
   - type: textarea
     id: children

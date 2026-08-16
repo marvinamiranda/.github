@@ -35,10 +35,16 @@ body:
   - type: textarea
     id: risks
     attributes:
-      label: Dependencies, risks and rollback
-      description: Include public contracts, migrations, data, security, deployment and cross-repository effects.
+      label: Risks and rollback
+      description: Include public contracts, migrations, data, security and deployment effects.
     validations:
       required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and sequencing (optional)
+      description: Link known upstream/downstream work, cross-repository dependencies or blockers. Leave blank when the Task is independent.
 
   - type: textarea
     id: acceptance
