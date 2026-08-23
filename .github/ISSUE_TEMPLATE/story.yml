@@ -80,10 +80,16 @@ body:
   - type: textarea
     id: boundaries
     attributes:
-      label: Systems, repositories and dependencies
-      description: Name the owning repository, contracts/data ownership, blockers and sequencing.
+      label: Systems and repositories
+      description: Name the owning repository, affected systems, contracts and data ownership.
     validations:
       required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and sequencing (optional)
+      description: Link known upstream/downstream work, cross-repository dependencies or blockers. Leave blank when the Story is independent.
 
   - type: textarea
     id: rollout
@@ -136,7 +142,7 @@ body:
       options:
         - label: "The outcome and canonical baseline are approved."
           required: true
-        - label: "Dependencies, decisions and non-goals are explicit."
+        - label: "Known dependencies, decisions and non-goals are explicit; no dependency was invented."
           required: true
         - label: "The Story is independently demonstrable and testable."
           required: true

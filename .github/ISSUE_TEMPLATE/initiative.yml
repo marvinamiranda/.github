@@ -59,10 +59,16 @@ body:
   - type: textarea
     id: risks
     attributes:
-      label: Decisions, dependencies and material risks
-      description: List unresolved decisions with owners, external dependencies and high-risk boundaries.
+      label: Decisions and material risks
+      description: List unresolved decisions with owners and high-risk boundaries.
     validations:
       required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and sequencing (optional)
+      description: Link known upstream/downstream work, external dependencies or blockers. Leave blank when the Initiative is independent.
 
   - type: textarea
     id: children

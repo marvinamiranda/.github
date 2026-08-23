@@ -58,6 +58,12 @@ body:
       description: Screenshots, logs, traces or request/response details with secrets and personal data removed.
 
   - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies or related changes (optional)
+      description: Link known blockers, upstream fixes or related work. Leave blank when none is known.
+
+  - type: textarea
     id: acceptance
     attributes:
       label: Fix and regression acceptance
