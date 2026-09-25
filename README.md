@@ -95,12 +95,27 @@ jobs:
 - **The workflow checks the pin** before it fetches any governance code.
   `governance-ref` must equal `job.workflow_sha`, the commit the caller's
   `uses:` pinned (`github.workflow_sha` would be the caller's own commit), and
-  that commit must be on this repository's `test` (GitHub's compare of
-  `test...<sha>` says `identical` or `behind`). Otherwise `governance/issue-link`
-  fails, and so does `governance / areas`. So a pin to an unmerged pull request
-  commit, to a fork's commit, or to two different commits never judges
-  anything. The check is inline in the workflow, because code fetched at
-  `governance-ref` cannot vouch for `governance-ref`.
+  that commit must be on this repository's `test`: the branch is read by name
+  (`repos.getBranch`, which a tag named `test` cannot shadow), and GitHub's
+  compare of its head with the pin says `identical` or `behind`. Otherwise
+  `governance/issue-link` fails, and so does `governance / areas`. The check is
+  inline in the workflow, because code fetched at `governance-ref` cannot vouch
+  for `governance-ref`.
+- **What that catches:** a `governance-ref` that is not the `uses:` pin, and a
+  pin to a commit that carries this check but is not on `test`, such as an
+  unmerged pull request commit or a fork's.
+- **What it cannot catch**, because the check is code at the pinned commit:
+  - a pin to a commit without the check, merged or not (any commit from before
+    it), which runs no check at all;
+  - a pin moved back to an older merged commit, which passes (`behind`) with a
+    weaker judge;
+  - a pull request that adds its own workflow posting `governance/issue-link`:
+    every workflow of the repository runs as the Actions app the rulesets pin
+    the check to.
+
+  Review is the control for those, which is why moving the pin, and any change
+  to `.github/**` in an adopted repository, is `tier:senior` with an
+  adversarial review (DELIVERY §10).
 - `concurrency` cancels a superseded run, so an edit followed by a push cannot
   finish out of order and leave the older verdict on the head.
 - `edited` is what re-runs the issue-link check when only the body changes.
@@ -166,20 +181,52 @@ eval "$(governance/identity/agent-env.sh mm-reviewer)"  # a reviewer's shell
 governance/identity/post-review.sh owner/repo <sha> success "Matches the Task; tests seen failing first."
 ```
 
+**Claude Code and Codex: the `eval` must open every tool command**, as in
+`eval "$(<checkout>/governance/identity/agent-env.sh mm-agent)" && gh pr create …`.
+Both rebuild each tool command's shell from a snapshot taken when the session
+began, and a snapshot taken from the owner's environment carries it. Claude
+Code's re-applies the `PATH` it captured, which puts the real `gh` first.
+Codex's re-exports every variable it captured, which on the owner's machine
+includes their `gh` login token as `GH_PACKAGES_TOKEN` (from `~/.zshrc`). That
+is the residual: a tool command that does not open with the `eval` runs as its
+snapshot has it, and the snapshot files keep whatever was exported when they
+were taken (Codex writes them readable by every local user). Only the owner
+can clear those files. An eval costs about 0.07 s once its commit is known to
+be on `test`.
+
 `agent-env.sh` is a strong default, not a sandbox: agents run on the owner's
 machine as the owner's user, and the owner's keyring login stays one absolute
-path away (`/opt/homebrew/bin/gh auth token`). What it does:
+path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
 
-- puts the identity's `gh` shim first on `PATH` (`gh-shim.sh`, through a
-  launcher in `~/.config/mm-agent/<name>/bin/`), so every child process uses it
-  too: scripts, `bash -c`, an agent CLI's tool shells;
+- puts the identity's `gh` first on `PATH`: a launcher in
+  `~/.config/mm-agent/<name>/shim/<commit>/bin/`, the only file there, for
+  copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`. The copies are
+  the blobs of the checkout's HEAD commit, so a session keeps its shim when the
+  checkout changes or goes away, and sessions evaluated from different commits
+  never swap shims under each other;
+- refuses a checkout whose three identity scripts differ from its HEAD commit
+  (compared by content, so a change hidden from `git status` counts), and
+  warns when that commit is not on this repository's `test`. A commit found on
+  `test` is remembered; anything else is asked again at the next eval;
+- keeps that `gh` first in zsh, login or interactive, without editing the
+  owner's files: `ZDOTDIR` points at startup files that source the owner's
+  (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`, with `ZDOTDIR` set to
+  the owner's directory while each runs), then put the shim first again, drop
+  any `gh` alias or function, and set the variables below again. The owner's
+  `~/.zprofile` runs `brew shellenv`, which otherwise puts the real `gh` first
+  in every login zsh;
 - gives every `gh` call a token from `app-token.sh`, and fails without running
   `gh` when none can be minted;
-- refuses `gh auth` except a plain `gh auth status`. `gh auth token --user
-  <owner>` reads the owner's keyring login whatever `GH_TOKEN` holds, and a
-  raw token copied into a variable is never renewed;
-- unsets `GH_TOKEN`, `GITHUB_TOKEN` and `GH_PACKAGES_TOKEN`, and prints no
-  token;
+- refuses `gh auth` except a plain `gh auth status`, `gh alias` except `list`
+  and `delete`, and any flag ahead of the command other than a lone `--help`,
+  `-h` or `--version` (`gh --help=false auth token` runs `gh auth token`).
+  `gh auth token --user <owner>` reads the owner's keyring login whatever
+  `GH_TOKEN` holds, and a raw token copied into a variable is never renewed;
+- sets `GH_TOKEN` to a sentinel that is not a token, which the shim replaces on
+  every call: a real `gh` reached some other way answers `gh auth token` with
+  the sentinel, not the keyring login, and GitHub refuses the sentinel;
+- unsets `GITHUB_TOKEN`, sets `GH_PACKAGES_TOKEN` only from the owner's
+  packages file (below), and prints no token;
 - points `GH_CONFIG_DIR` at an empty directory, so the real `gh` finds no
   stored login;
 - gives git a github.com credential helper that mints a token per operation,
@@ -187,10 +234,36 @@ path away (`/opt/homebrew/bin/gh auth token`). What it does:
 - sets the App's bot as git author and committer.
 
 If `agent-env.sh` itself fails, it prints an environment with no identity
-(tokens unset, `gh` and git refusing, no commit identity, a failing status)
-instead of nothing, which would leave the shell on the owner's login. An agent
-CLI that starts a fresh shell for each tool call (Claude Code does) needs the
-`eval` in every call, or must be started from a shell that ran it.
+(the sentinel, `gh` refusing and kept first in zsh the same way, git told to
+quit, no commit identity, a failing status) instead of nothing, which would
+leave the shell on the owner's login.
+
+Bash login shells are not wrapped: on this machine they keep the shim first
+(the owner's bash files do not run `brew shellenv`), but macOS `path_helper`
+moves inherited entries behind `/usr/local/bin`, so a `gh` installed there
+would come first in `bash -l`.
+
+### Packages
+
+GitHub Packages accepts only a classic personal access token, and no App can
+mint one, so agents get their own, made by the owner once:
+
+1. On github.com: Settings, Developer settings, Personal access tokens, Tokens
+   (classic), Generate new token (classic). Scope: `read:packages` and nothing
+   else. Give it an expiry.
+2. Save it where only you can read it:
+   ```bash
+   ( umask 077 && read -rs t && printf '%s\n' "$t" > ~/.config/mm-agent/packages-token )   # paste it, then Enter
+   ```
+
+`agent-env.sh` then exports `GH_PACKAGES_TOKEN` (which `nuget.config` reads)
+from that file, for both identities. It refuses the file, leaving the variable
+unset and saying why in one line, unless it is a regular file you own, with
+no permission for group or others (0600), holding one `ghp_` token and
+nothing else. So `gh auth token > ~/.config/mm-agent/packages-token`, which
+would hand agents your login, is refused. The printed environment reads the
+file (`$(cat …)`); it never contains the token. Restores made with it are the
+owner's in GitHub's logs: the token is theirs, limited to reading packages.
 
 `app-token.sh` reuses a token for at most 5 minutes after minting it, so a
 revoked or suspended installation's token is served for at most 5 minutes,
@@ -216,12 +289,31 @@ also refuses a checkout with uncommitted changes, and files outside a git
 checkout. It prints the commit it runs from. A dry run from anywhere else
 warns and carries on.
 
-In this order:
+**First, straight after this repository's own pull request merges**, before
+any product repository moves its pin to that commit: this repository's own
+rulesets, on their own. Until then it has none, so "on `test`" means only
+"pushed", both for the workflow's pin check and for `--apply`'s provenance.
 
 ```bash
-git checkout <merged sha>
+git checkout <the merged sha>
+governance/bootstrap.sh --self-only                   # dry run
+governance/bootstrap.sh --self-only --probe --apply   # the probe, then this repository's rulesets
+```
+
+`--self-only` takes no `--repo` and touches nothing else: no issue types, no
+default branch, no labels. It is also the first run anywhere to create
+`main-owner-only`, whose user bypass has never been applied: if GitHub refuses
+it, it does so here, after `test-integration` exists, and a re-run is
+idempotent.
+
+**Then, for each product repository, after its adoption pull request has
+merged into its `test`.** Every step reads that repository's
+`.github/governance/` from `test`, so none of them can run before the merge (a
+dry run can read an unmerged adoption with `--config-dir`). In this order:
+
+```bash
 governance/bootstrap.sh --repo <repo> ...                                  # 1. dry run: reads only
-governance/bootstrap.sh --repo <repo> ... --no-rulesets --apply            # 2. stage an adoption
+governance/bootstrap.sh --repo <repo> ... --no-rulesets --apply            # 2. default branch, labels
 governance/bootstrap.sh --repo <repo> ... --probe --no-rulesets --apply    # 3. the Reviewer App probe
 # 4. one Agent App squash-merge into test (proven: see below)
 governance/bootstrap.sh --repo <repo> ... --apply                          # 5. rulesets, owner only
@@ -243,6 +335,42 @@ governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # als
   changing anything. This repository's own `test-integration` would otherwise
   require only `governance tests`, which a pull request here can rewrite.
 
+**The credential for `--apply`** is a fine-grained personal access token of
+the owner's that expires the next day, passed as `GH_TOKEN` for that run only.
+Never add `admin:org` to the `gh` keyring login: agents on this machine can
+reach it, `admin:org` can disable the rulesets, and a scope removed again with
+`gh auth refresh --remove-scopes` stays on the token already issued
+([cli/cli#9233](https://github.com/cli/cli/issues/9233)). The token, at
+github.com/settings/personal-access-tokens:
+
+| Setting | Value | For |
+|---|---|---|
+| Resource owner | `marvinamiranda` | |
+| Expiration | Custom: the next day | |
+| Repository access | `.github` and each `--repo` (or all) | |
+| Organization: Issue Types | Read and write | a) Epic, Decision, Spike |
+| Organization: Projects | Read and write | f) only with `--project` |
+| Repository: Administration | Read and write | b) the default branch; e) rulesets |
+| Repository: Contents | Read | each repository's `.github/governance/` and `test` |
+| Repository: Issues | Read and write | c) labels |
+| Repository: Metadata | Read (always included) | repositories, ruleset lists |
+
+The probe, d), needs none of these: it posts with the Reviewer App's own
+token. `--self-only` needs Administration and Metadata on `.github` alone. The
+organisation may have to approve the token first. Pass it without leaving it
+in the shell history:
+
+```bash
+read -rs GH_TOKEN && export GH_TOKEN      # paste it; nothing is echoed
+governance/bootstrap.sh ... --apply
+unset GH_TOKEN
+```
+
+GitHub reports no permissions for a fine-grained token, so the bootstrap
+checks none in advance: it says which credential it runs with, and a step that
+lacks a permission fails, with nothing after it run. `--apply` on the keyring
+login warns. `--help` prints the same list.
+
 Reads each repository's `.github/governance/` from `test` (`--config-dir
 <dir>/<repo>/` overrides it for local testing). Dry run by default; idempotent;
 never deletes. Labels and Project fields outside the standard are reported for
@@ -250,10 +378,10 @@ the owner to retire; legacy rulesets on `test` or `main` are set to enforcement
 `disabled`, never deleted. `--help` lists the options. Payloads are kept, and
 their path printed, when a run fails.
 
-The rulesets go on each `--repo` **and on this repository**: its `test` and
-`main` hold the code every other repository's checks run, so they need a pull
-request, `governance tests`, and (on `test`) `review/independent`, with no
-bypass.
+The rulesets go on this repository, first, **and on each `--repo`**. This
+repository's `test` and `main` hold the code every other repository's checks
+run, so they need a pull request, `governance tests`, and (on `test`)
+`review/independent`, with no bypass.
 
 - **`test-integration`**: pull request, no approvals. The repo's required
   checks + `governance/issue-link`, all pinned to the Actions app, plus
@@ -286,3 +414,7 @@ actionlint                                                                    # 
 `node governance/tests/*.test.js` runs only the first file: node takes the
 rest as its arguments. The bootstrap and identity tests run the scripts
 against stubs of `gh` and `curl`, so they need no network and touch no login.
+The identity suite also starts zsh as a login and an interactive shell, under
+a fake HOME whose startup files put another `gh` first; without zsh those
+cases are skipped, and `IDENTITY_REQUIRE_ZSH=1` (set in CI) fails them
+instead.
