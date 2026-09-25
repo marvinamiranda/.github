@@ -37,6 +37,7 @@ function ok(name, condition, detail = '') {
 
 const SHA = 'eded4bf1f05be3a33a354795bac37d77105bac16';
 const OTHER = 'b2f0637eea5c71aa1bb09d0dd0d1b87c8eebc3d3';
+const TEST_TIP = '69b68cd158547974bb71b1fdc01ba7a89629c46c'; // what the branch named test points at
 const BEGIN = /\/\/ BEGIN verify-pin[^\n]*\n/;
 const END = /\n[ \t]*\/\/ END verify-pin/;
 const script = (step) => (step.with && typeof step.with.script === 'string' ? step.with.script : '');
@@ -79,20 +80,32 @@ ok('both jobs run the identical pin check', blocks.length === 2 && norm(blocks[0
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
 const verifyPin = blocks[0] ? new AsyncFunction('github', 'env', `${blocks[0]}\nreturn verifyPin({ github, env });`) : null;
 
-function fakeGitHub(status) {
+// `branch`: what repos.getBranch answers for test (a sha, an HTTP status to
+// throw, or a body without a commit). `status`: what the compare answers.
+function fakeGitHub(status, branch = TEST_TIP) {
   const calls = [];
+  const branchCalls = [];
+  const fail = (code) => { const e = new Error('HTTP error'); e.status = code; throw e; };
   return {
     calls,
-    rest: { repos: { compareCommitsWithBasehead: async (a) => {
-      calls.push(a);
-      if (typeof status === 'number') { const e = new Error('HTTP error'); e.status = status; throw e; }
-      return { data: { status, ahead_by: 0, behind_by: 3 } };
-    } } },
+    branchCalls,
+    rest: { repos: {
+      getBranch: async (a) => {
+        branchCalls.push(a);
+        if (typeof branch === 'number') fail(branch);
+        return { data: typeof branch === 'string' ? { name: a.branch, commit: { sha: branch } } : branch };
+      },
+      compareCommitsWithBasehead: async (a) => {
+        calls.push(a);
+        if (typeof status === 'number') fail(status);
+        return { data: { status, ahead_by: 0, behind_by: 3 } };
+      },
+    } },
   };
 }
 const env = (o = {}) => ({ SELF_SHA: SHA, SELF_REPOSITORY: 'marvinamiranda/.github', GOVERNANCE_REF: SHA, ...o });
 
-// [name, env, compare status or HTTP error, pass?, text the problem must contain, may compare?]
+// [name, env, compare status or HTTP error, pass?, text the problem must contain, may compare?, getBranch answer]
 const cases = [
   ['the pin is test\'s head (identical): passes', env(), 'identical', true, '', true],
   ['the pin is an older commit of test (behind): passes', env(), 'behind', true, '', true],
@@ -104,20 +117,29 @@ const cases = [
   ['GitHub reports no workflow commit: fails closed', env({ SELF_SHA: '' }), 'identical', false, 'job.workflow_sha', false],
   ['the workflow runs from a copy in another repository: fails', env({ SELF_REPOSITORY: 'someone/.github' }), 'identical', false, 'not marvinamiranda/.github', false],
   ['the commit is unknown to GitHub (404): fails', env(), 404, false, 'HTTP 404', true],
+  // R5: test is read as a branch, so a tag named test cannot stand in for it.
+  ['the branch test cannot be read (404): fails closed, without comparing', env(), 'identical', false, 'Could not read marvinamiranda/.github test', false, 404],
+  ['GitHub returns a branch without a commit: fails closed, without comparing', env(), 'identical', false, 'no commit for marvinamiranda/.github test', false, { name: 'test' }],
 ];
 
 (async () => {
-  for (const [name, e, status, pass, needle, mayCompare] of cases) {
+  for (const [name, e, status, pass, needle, mayCompare, branch] of cases) {
     if (!verifyPin) { ok(`pin check: ${name}`, false, 'no verify-pin block'); continue; }
-    const gh = fakeGitHub(status);
+    const gh = fakeGitHub(status, branch === undefined ? TEST_TIP : branch);
     let problem;
     try { problem = await verifyPin(gh, e); } catch (error) { problem = `threw ${error.message}`; }
     const issues = [];
     if (pass && problem !== '') issues.push(`expected a pass, got: ${problem}`);
     if (!pass && !(typeof problem === 'string' && problem.includes(needle))) issues.push(`expected a problem naming "${needle}", got: ${JSON.stringify(problem)}`);
     if (!mayCompare && gh.calls.length) issues.push('asked GitHub although the pin was already wrong');
-    if (gh.calls.length && !(gh.calls[0].owner === 'marvinamiranda' && gh.calls[0].repo === '.github' && gh.calls[0].basehead === `test...${e.SELF_SHA}`)) {
+    // The base of the compare is the sha the branch named test points at, never
+    // the name "test", which a tag could shadow.
+    if (gh.calls.length && !(gh.calls[0].owner === 'marvinamiranda' && gh.calls[0].repo === '.github' && gh.calls[0].basehead === `${TEST_TIP}...${e.SELF_SHA}`)) {
       issues.push(`compared the wrong thing: ${JSON.stringify(gh.calls[0])}`);
+    }
+    if (gh.calls.length && !(gh.branchCalls.length === 1 && gh.branchCalls[0].owner === 'marvinamiranda'
+        && gh.branchCalls[0].repo === '.github' && gh.branchCalls[0].branch === 'test')) {
+      issues.push(`compared without reading the branch named test first: ${JSON.stringify(gh.branchCalls)}`);
     }
     ok(`pin check: ${name}`, issues.length === 0, issues.join('; '));
   }

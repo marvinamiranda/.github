@@ -18,16 +18,32 @@
 # on an older event cannot keep a pull request red after a later run passes.
 #
 # CALLERS PIN THIS FILE BY COMMIT SHA and pass the same SHA as
-# governance-ref, so the code that judges a pull request is a reviewed commit
-# of this repository, never whatever `test` holds at the time. Both jobs check
-# that before they fetch any code of governance-ref: governance-ref must equal
+# governance-ref, so the code that judges a pull request is a commit of this
+# repository, never whatever `test` holds at the time. Before either job fetches
+# any code of governance-ref, it checks the pin: governance-ref must equal
 # job.workflow_sha (the commit of this file that the caller's `uses:` pinned;
-# github.workflow_sha would be the caller's own commit), and that commit must
-# be on marvinamiranda/.github `test` (the compare API says identical or
-# behind), so neither an unmerged pull request commit nor a fork's commit can
-# judge. The check is inline because code fetched at governance-ref cannot
-# vouch for governance-ref; governance/tests/pr-governance.test.js runs it.
-# Actions are pinned by SHA for the same reason. No third-party actions.
+# github.workflow_sha would be the caller's own commit), and that commit must be
+# on marvinamiranda/.github `test` (the branch read by name, then compared with
+# the pin: identical or behind).
+#
+# What the check catches: a governance-ref that is not the `uses:` pin, and a
+# pin to a commit that carries this check but is not on test, such as an
+# unmerged pull request commit or a fork's.
+# What it cannot catch, because the check is code at the pinned commit:
+#   - a pin to a commit without this check (any commit from before it, merged
+#     or not) runs no check at all;
+#   - a pin to an older merged commit passes ("behind"), so a pull request can
+#     move the pin back to a weaker judge;
+#   - a pull request that adds its own workflow posting governance/issue-link
+#     never meets it: every workflow of the repository runs as the Actions app
+#     that the rulesets pin the check to.
+# So the pin check is not the control for a hostile pin: review is. Moving the
+# pin, and any change to .github/** in an adopted repository, is tier:senior
+# and has an adversarial review (DELIVERY §10).
+#
+# The check is inline because code fetched at governance-ref cannot vouch for
+# governance-ref; governance/tests/pr-governance.test.js runs it. Actions are
+# pinned by SHA for the same reason. No third-party actions.
 name: PR governance
 
 on:
@@ -78,10 +94,22 @@ jobs:
               if (ref !== self) {
                 return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
               }
+              // test is read as a branch, then compared by its sha: the bare
+              // name "test" in a compare could resolve to a tag of that name.
+              let tip;
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner: 'marvinamiranda', repo: '.github', branch: 'test' });
+                tip = branch && branch.commit && branch.commit.sha;
+              } catch (error) {
+                return `Could not read marvinamiranda/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(tip || '')) {
+                return 'GitHub returned no commit for marvinamiranda/.github test, so the pin cannot be checked.';
+              }
               let status;
               try {
                 ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
-                  owner: 'marvinamiranda', repo: '.github', basehead: `test...${self}`, per_page: 1 }));
+                  owner: 'marvinamiranda', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
               } catch (error) {
                 return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
               }
@@ -166,10 +194,22 @@ jobs:
               if (ref !== self) {
                 return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
               }
+              // test is read as a branch, then compared by its sha: the bare
+              // name "test" in a compare could resolve to a tag of that name.
+              let tip;
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner: 'marvinamiranda', repo: '.github', branch: 'test' });
+                tip = branch && branch.commit && branch.commit.sha;
+              } catch (error) {
+                return `Could not read marvinamiranda/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(tip || '')) {
+                return 'GitHub returned no commit for marvinamiranda/.github test, so the pin cannot be checked.';
+              }
               let status;
               try {
                 ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
-                  owner: 'marvinamiranda', repo: '.github', basehead: `test...${self}`, per_page: 1 }));
+                  owner: 'marvinamiranda', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
               } catch (error) {
                 return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
               }
