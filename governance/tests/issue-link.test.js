@@ -104,10 +104,12 @@ for (const [name, issue, expected] of bugCases) {
   }
 }
 
-// judge: the published verdict, against a fake API client.
+// judge: the published verdict, against a fake API client. `closing` is what
+// GitHub links; `closingSeq` is what it links on each successive lookup.
 function fakeGitHub({ body, head = '742-supplier-list', base = 'test', number = 761, defaultBranch = 'test',
-  closing = [], issues = {} }) {
+  closing = [], closingSeq = null, issues = {} }) {
   const calls = [];
+  let lookups = 0;
   return {
     calls,
     rest: {
@@ -120,11 +122,18 @@ function fakeGitHub({ body, head = '742-supplier-list', base = 'test', number = 
         return { data: issue }; } },
     },
     graphql: async (query, vars) => { calls.push(['graphql', vars.number]);
+      const linked = closingSeq ? closingSeq[Math.min(lookups, closingSeq.length - 1)] : closing;
+      lookups += 1;
       return { repository: { pullRequest: { closingIssuesReferences: {
-        totalCount: closing.length,
-        nodes: closing.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }; },
+        totalCount: linked.length,
+        nodes: linked.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }; },
   };
 }
+// judge waits before asking GitHub again; the test records the wait instead.
+function fakeSleep(gh) {
+  return async (ms) => { gh.calls.push(['sleep', ms]); };
+}
+const count = (gh, kind) => gh.calls.filter((c) => c[0] === kind).length;
 const ctx = (number = 761) => ({ repo: { owner: 'marvinamiranda', repo: 'omni237' }, payload: { pull_request: { number, body: 'STALE' } } });
 
 // [name, fake options, expected ok, extra assertion(verdict, gh) -> problem string or '']
@@ -147,6 +156,24 @@ const judgeCases = [
   ['hotfix: a pull request typed Bug is not an issue', { body: 'Fixes #903', head: 'hotfix/till', base: 'main', issues: { 903: { type: { name: 'Bug' }, pull_request: {} } } }, false, () => ''],
   ['hotfix: a Bug in another repository is never looked up', { body: 'Fixes marvinamiranda/sm360#9', head: 'hotfix/till', base: 'main' }, false,
     (v, gh) => (gh.calls.some((c) => c[0] === 'issues.get') ? 'looked outside the repository' : '')],
+
+  // GitHub links closing issues when it parses the body, after the event that
+  // started the run, so a first lookup can come back empty.
+  ['GitHub links the issue at once: asked once, no wait', { body: 'Closes #742', closing: [742] }, true,
+    (v, gh) => (count(gh, 'graphql') === 1 && count(gh, 'sleep') === 0 ? '' : `graphql ${count(gh, 'graphql')}, sleeps ${count(gh, 'sleep')}`)],
+  ['GitHub links nothing at first, then the issue: passes on the one retry', { body: 'Closes #742', closingSeq: [[], [742]] }, true,
+    (v, gh) => {
+      const waits = gh.calls.filter((c) => c[0] === 'sleep').map((c) => c[1]);
+      if (count(gh, 'graphql') !== 2) return `graphql ${count(gh, 'graphql')} times, expected 2`;
+      if (waits.length !== 1 || waits[0] < 2000 || waits[0] > 10000) return `waits ${JSON.stringify(waits)}, expected one of a few seconds`;
+      return /GitHub will close: marvinamiranda\/omni237#742/.test(v.summary) ? '' : v.summary;
+    }],
+  ['GitHub links nothing twice: fails after exactly one retry, and says how to make GitHub re-read the body', { body: 'Closes #742', closingSeq: [[], [], [742]] }, false,
+    (v, gh) => {
+      if (count(gh, 'graphql') !== 2) return `graphql ${count(gh, 'graphql')} times, expected 2`;
+      if (!/default branch/i.test(v.summary) || !/(re-?save|save it again|edit the body)/i.test(v.summary)) return `summary lacks the re-save advice: ${v.summary}`;
+      return '';
+    }],
 ];
 
 (async () => {
@@ -154,7 +181,7 @@ const judgeCases = [
     const gh = fakeGitHub(opts);
     let problem = '';
     try {
-      const v = await judge({ github: gh, context: ctx(opts.number) });
+      const v = await judge({ github: gh, context: ctx(opts.number), sleep: fakeSleep(gh) });
       if (v.ok !== expectedOk) problem = `ok ${v.ok}, expected ${expectedOk} (${v.title})`;
       else if (v.headSha !== 'a'.repeat(40)) problem = 'check not attached to the current head';
       else problem = extra(v, gh);

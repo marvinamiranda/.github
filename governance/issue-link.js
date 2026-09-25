@@ -141,11 +141,18 @@ const CLOSING_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
   }
 }`;
 
+// GitHub links closing issues when it parses the body, and the event that
+// starts a run can arrive before it has: an empty first answer is asked again
+// once, this long after.
+const RELOOK_MS = 5000;
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // The verdict the `governance/issue-link` check publishes.
 //   github:  an Octokit client (actions/github-script's `github`)
 //   context: the Actions context of a pull_request event
+//   sleep:   waits before the second lookup (tests pass a recorder)
 // Returns { ok, title, summary, headSha }.
-async function judge({ github, context }) {
+async function judge({ github, context, sleep = pause }) {
   const { owner, repo } = context.repo;
   const repository = `${owner}/${repo}`;
   const number = context.payload.pull_request.number;
@@ -171,12 +178,20 @@ async function judge({ github, context }) {
   const { data: repoData } = await github.rest.repos.get({ owner, repo });
   if (pr.base.ref === repoData.default_branch) {
     // GitHub's own parsing is the authority: it is what closes the issue.
-    const result = await github.graphql(CLOSING_QUERY, { owner, repo, number });
-    const closing = result.repository.pullRequest.closingIssuesReferences;
+    const lookup = async () => (await github.graphql(CLOSING_QUERY, { owner, repo, number }))
+      .repository.pullRequest.closingIssuesReferences;
+    let closing = await lookup();
+    if (!closing || closing.totalCount === 0) {
+      await sleep(RELOOK_MS);
+      closing = await lookup();
+    }
     if (!closing || closing.totalCount === 0) {
       return done(false, 'GitHub sees no issue this pull request closes',
-        `The body mentions ${refs.map((r) => r.key).join(', ')}, but GitHub links no issue to close on merge. ` +
-        'Check the number is an issue (not a pull request), that it exists, and that the keyword and reference are written as in the template.');
+        `The body mentions ${refs.map((r) => r.key).join(', ')}, but GitHub links no issue to close on merge ` +
+        `(asked twice, ${RELOOK_MS / 1000} s apart). ` +
+        'Check the number is an issue (not a pull request), that it exists, and that the keyword and reference are written as in the template. ' +
+        `If this pull request was opened before ${repoData.default_branch} became the default branch, GitHub still holds the links it ` +
+        'parsed then: edit the body and save it again (any change will do), and GitHub re-reads it.');
     }
     lines.push(`GitHub will close: ${closing.nodes.map((n) => `${n.repository.nameWithOwner}#${n.number}`).join(', ') || `${closing.totalCount} issue(s)`}`);
   } else {
