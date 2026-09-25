@@ -1,28 +1,38 @@
 #!/usr/bin/env bash
-# Print the environment an agent session runs under, for `eval` (DELIVERY
-# Appendix A):
+# Install, or refresh, an agent identity, and print its environment for `eval`
+# (DELIVERY Appendix A). From a checkout of a merged commit, by the script's
+# absolute path, and never without `|| echo false`: a bare `eval "$(...)"` of a
+# script that is not there evaluates nothing, succeeds, and whatever follows
+# runs as the owner:
 #
-#   eval "$(governance/identity/agent-env.sh mm-agent)"      # a builder's shell
-#   eval "$(governance/identity/agent-env.sh mm-reviewer)"   # a reviewer's shell
+#   eval "$(<checkout>/governance/identity/agent-env.sh mm-agent || echo false)" && gh auth status
 #
-# CLAUDE CODE AND CODEX: THE EVAL MUST OPEN EVERY TOOL COMMAND, as in
+# THE PER-COMMAND FORM, which must open every tool command in Claude Code and
+# Codex, sources the env file that eval installed, joined with && (never ;):
 #
-#   eval "$(<checkout>/governance/identity/agent-env.sh mm-agent)" && gh pr create ...
+#   . ~/.config/mm-agent/mm-agent/env && gh pr create ...
 #
-# Both rebuild each tool command's shell from a snapshot they took when the
-# session began, and a snapshot taken from the owner's environment carries it:
-# Claude Code's re-applies the PATH it captured, which puts the real gh first;
-# Codex's re-exports every variable it captured, which on the owner's machine
-# includes their gh login token as GH_PACKAGES_TOKEN (from ~/.zshrc). That is
-# the residual: a tool command that does not open with the eval runs as its
-# snapshot has it, and the snapshot files keep whatever was exported when they
-# were taken.
+# A missing env file fails the `.`, and so stops the command; an env file whose
+# shim is gone fails the same way. Only an eval from a commit on
+# marvinamiranda/.github test writes the env file, so it only ever runs merged
+# code; an eval from anywhere else sets up its own shell and leaves it alone.
+#
+# Both CLIs rebuild each tool command's shell from a snapshot they took when
+# the session began, and a snapshot taken from the owner's environment carries
+# it: Claude Code's re-applies the PATH it captured, which puts the real gh
+# first; Codex's re-exports every variable it captured, which on the owner's
+# machine includes their gh login token as GH_PACKAGES_TOKEN (from ~/.zshrc).
+# That is the residual: a tool command that does not open with the env file
+# runs as its snapshot has it; an alias named gh in the snapshot is expanded
+# when the command line is parsed, before the env file can remove it (`command
+# gh` sidesteps one); and the snapshot files keep whatever was exported when
+# they were taken.
 #
 # Everything it prints is exported, so whatever a command starts inherits it:
 # scripts, `bash -c`, and zsh, login or interactive. It sets:
 #   PATH            the identity's gh first: ~/.config/mm-agent/<name>/shim/
 #                   <commit>/bin/gh, a launcher for COPIES of gh-shim.sh and
-#                   app-token.sh taken from this checkout's HEAD commit (below).
+#                   app-token.sh taken from a commit (below).
 #                   Every gh call gets a token minted for it, and fails rather
 #                   than fall back when none can be minted. The shim refuses
 #                   `gh auth` (bar a plain `gh auth status`) and any flag ahead
@@ -51,18 +61,24 @@
 #                   (quit=true) instead of trying another credential or
 #                   prompting when it cannot.
 #
-# The copies are what every gh and git call of the session runs, so they come
-# from a commit, never a working tree: it refuses a checkout whose three
-# identity scripts differ from its HEAD commit (a change hidden from
-# `git status` included), and warns when that commit is not on
-# marvinamiranda/.github test. Each commit gets its own directory, so a session
-# keeps its shim when the checkout changes or goes away, and sessions evaluated
-# from different commits never swap shims under each other.
+# The copies are what every gh and git call runs, so they come from a commit,
+# never a working tree: it refuses a checkout whose three identity scripts
+# differ from its HEAD commit (a change hidden from `git status` included), and
+# warns when that commit is not on marvinamiranda/.github test. Each commit gets
+# its own directory. Which one a shell runs depends on the form:
+#   the eval    installs what the checkout's HEAD is at that moment and switches
+#               that shell to it; the shell keeps it when the checkout changes
+#               or goes away, until it evaluates again.
+#   the env file  runs the commit it names: the last one an eval from a commit
+#               on test installed on this machine. The checkout can change or
+#               go away without touching it.
 #
-# If anything fails, it prints an environment with NO GitHub identity rather
-# than nothing, since `eval ""` would leave the shell on the owner's login: the
-# sentinel, a gh that refuses everything (kept first in zsh the same way), git
-# told to quit, no commit identity, and a status that makes the eval fail.
+# If anything fails once it is running, it prints an environment with NO
+# GitHub identity rather than nothing, since `eval ""` would leave the shell on
+# the owner's login: the sentinel, a gh that refuses everything (kept first in
+# zsh the same way), git told to quit, no commit identity, and a status that
+# makes the eval fail. A script that cannot run at all prints nothing, which
+# is what `|| echo false` is for. A failed run leaves the env file as it was.
 #
 # This is a strong default, not a sandbox. Agents run on the owner's machine,
 # under the owner's user, and the owner's keyring login is one absolute path
@@ -101,6 +117,36 @@ body_lines() {
   printf 'export GIT_CONFIG_COUNT=2\n'
   printf 'export GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0=\n'
   printf 'export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1=%s\n' "$(q "$5")"
+}
+
+# Lines that record the owner's ZDOTDIR, for the zsh startup files to source
+# (empty means their HOME). A ZDOTDIR of ours is a previous eval's, which
+# recorded it already. Run where the environment is set up, so every shell gets
+# its own; valid in sh, bash and zsh.
+owner_zdotdir_lines() {
+  cat <<EOF
+case "\${ZDOTDIR:-}" in $(q "$ROOT") | $(q "$ROOT")/*) ;; *) MM_AGENT_OWNER_ZDOTDIR="\${ZDOTDIR:-}" ;; esac
+case "\${MM_AGENT_OWNER_ZDOTDIR:-}" in $(q "$ROOT") | $(q "$ROOT")/*) MM_AGENT_OWNER_ZDOTDIR= ;; esac
+export MM_AGENT_OWNER_ZDOTDIR
+EOF
+}
+
+# Lines that put $1 first on PATH and drop every other directory of ours (a
+# previous eval's), computed from PATH as it is where they run. sh, bash, zsh.
+path_lines() {
+  cat <<EOF
+_mm_rest="\$PATH:"
+_mm_path=
+while [ -n "\$_mm_rest" ]; do
+  _mm_d="\${_mm_rest%%:*}"
+  _mm_rest="\${_mm_rest#*:}"
+  case "\$_mm_d" in $(q "$ROOT") | $(q "$ROOT")/*) ;; *) _mm_path="\${_mm_path:+\$_mm_path:}\$_mm_d" ;; esac
+done
+PATH=$(q "$1")"\${_mm_path:+:\$_mm_path}"
+export PATH
+unset _mm_rest _mm_path _mm_d
+hash -r 2>/dev/null || true
+EOF
 }
 
 # reassert.zsh: run after each of the owner's startup files. $1 the directory
@@ -208,10 +254,9 @@ locked() {
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
 function gh { echo "gh: refused: this shell has no GitHub identity, because agent-env.sh failed." >&2; return 1; }
+$(owner_zdotdir_lines)
 $lock_body
-export MM_AGENT_OWNER_ZDOTDIR=$(q "${owner_zdotdir-}")
-export PATH=$(q "$LOCK/bin${clean_path:+:$clean_path}")
-hash -r 2>/dev/null || true
+$(path_lines "$LOCK/bin")
 echo $(q "agent-env.sh: $1") >&2
 echo 'agent-env.sh: this shell now has NO GitHub identity: gh, git pushes and commits refuse until agent-env.sh succeeds.' >&2
 false
@@ -235,13 +280,6 @@ for d in ${path_dirs[@]+"${path_dirs[@]}"}; do
   clean_path="${clean_path:+$clean_path:}$d"
   if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then real_gh="$d/gh"; fi
 done
-# The owner's ZDOTDIR (empty means their HOME), whose startup files ours
-# source. A ZDOTDIR of ours is a previous eval's, which recorded the owner's.
-case "${ZDOTDIR:-}" in
-  "$ROOT" | "$ROOT"/*) owner_zdotdir="${MM_AGENT_OWNER_ZDOTDIR:-}" ;;
-  *) owner_zdotdir="${ZDOTDIR:-}" ;;
-esac
-case "$owner_zdotdir" in "$ROOT" | "$ROOT"/*) owner_zdotdir="" ;; esac
 
 [[ $# -eq 1 ]] || locked "usage: agent-env.sh <mm-agent|mm-reviewer>"
 NAME="$1"
@@ -345,7 +383,9 @@ if not re.fullmatch(r"ghp_[A-Za-z0-9]+\n?", text):
     no("does not hold exactly one classic personal access token (ghp_...)")
 PY
 )" || packages_hint="$PACKAGES_TOKEN could not be checked"
-  if [[ -z "$packages_hint" ]]; then packages_line="export GH_PACKAGES_TOKEN=\"\$(cat -- $(q "$PACKAGES_TOKEN"))\""; fi
+  if [[ -z "$packages_hint" ]]; then
+    packages_line="if [ -r $(q "$PACKAGES_TOKEN") ]; then GH_PACKAGES_TOKEN=\"\$(cat -- $(q "$PACKAGES_TOKEN"))\"; export GH_PACKAGES_TOKEN; fi"
+  fi
 fi
 
 # The launcher, the only file in the directory PATH gets, so the helpers stay
@@ -369,9 +409,9 @@ fi
 # Is that commit on marvinamiranda/.github test, as GitHub has it now (its
 # canonical URL, as bootstrap.sh reads it)? "Yes" is remembered for good: a
 # commit on test stays there, since the test-integration ruleset forbids force
-# pushes. Any other answer is remembered for 10 minutes, so an eval, which opens
-# every tool command, asks the network at most that often; each call has a
-# time limit.
+# pushes. Any other answer is asked again at the next eval, which is cheap
+# enough now that an eval only installs or refreshes the identity (the
+# per-command form sources the env file); each call has a time limit.
 provenance() {
   local test_sha
   if ! test_sha="$(with_timeout 10 env GIT_TERMINAL_PROMPT=0 git -C "$HERE" ls-remote "$SELF_URL" refs/heads/test 2>/dev/null | cut -f1)" \
@@ -386,32 +426,57 @@ provenance() {
     echo "commit ${commit:0:12} is not on marvinamiranda/.github test (${test_sha:0:12}): it has not been merged"
   fi
 }
-if [[ ! -e "$SHIM/on-test" ]]; then
-  now="$(date +%s)" checked_at="" why=""
-  if [[ -r "$SHIM/not-on-test" ]]; then { read -r checked_at && read -r why; } <"$SHIM/not-on-test" || true; fi
-  if [[ -z "$why" || ! "$checked_at" =~ ^[0-9]+$ ]] || (( checked_at > now || now - checked_at >= 600 )); then
-    why="$(provenance)" || why="the commit could not be checked against marvinamiranda/.github test"
-    if [[ -n "$why" ]]; then
-      printf '%s\n%s\n' "$now" "$why" | install_file "$SHIM/not-on-test" 600 || true
-    else
-      rm -f "$SHIM/not-on-test"
-    fi
-  fi
+on_test=0
+if [[ -e "$SHIM/on-test" ]]; then
+  on_test=1
+else
+  why="$(provenance)" || why="the commit could not be checked against marvinamiranda/.github test"
   if [[ -n "$why" ]]; then
     echo "agent-env.sh: WARNING: $why. The gh shim and token helper this session runs come from it; eval from a checkout of a merged commit." >&2
   fi
+  if [[ -e "$SHIM/on-test" ]]; then on_test=1; fi
 fi
 if [[ -n "${packages_hint:-}" ]]; then
   echo "agent-env.sh: GH_PACKAGES_TOKEN is not set: ${packages_hint}. Package restores from GitHub Packages will fail (README, \"Packages\")." >&2
 fi
 
-cat <<EOF
+# The environment, as one script that sets it all up or nothing: the eval runs
+# it, and ~/.config/mm-agent/<name>/env holds it for the per-command form,
+#   . ~/.config/mm-agent/<name>/env && gh ...
+# which a missing file stops. The file is written only for a commit on
+# marvinamiranda/.github test, so it only ever runs merged code; an eval from
+# anywhere else sets up its own shell and leaves the file as it was. The script
+# checks that the shim it names is still there, and fails when it is not.
+env_script() {
+  cat <<EOF
+# Written by agent-env.sh for $NAME; each eval from a merged commit rewrites it.
+# Source it at the start of every tool command, joined with &&, so that a
+# missing file, or a missing shim, stops the command:
+#   . ~/.config/mm-agent/$NAME/env && gh pr create ...
+# commit: $commit
+if [ -x $(q "$BIN/gh") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ]; then
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
-${packages_line}
+${packages_line:-: no packages token}
+$(owner_zdotdir_lines)
 $body
-export MM_AGENT_OWNER_ZDOTDIR=$(q "$owner_zdotdir")
-export PATH=$(q "$BIN${clean_path:+:$clean_path}")
-hash -r 2>/dev/null || true
+$(path_lines "$BIN")
+else
+echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is gone ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
+GH_TOKEN=$(q "$SENTINEL"); export GH_TOKEN
+false
+fi
 EOF
+}
+script="$(env_script)"
+ENV_FILE="$DIR/env"
+if [[ $on_test -eq 1 ]]; then
+  printf '%s\n' "$script" | install_file "$ENV_FILE" 600 \
+    || echo "agent-env.sh: WARNING: $ENV_FILE could not be written; the per-command form still runs what it held." >&2
+else
+  was=""
+  if [[ -r "$ENV_FILE" ]]; then was="$(sed -n 's/^# commit: //p' "$ENV_FILE" | head -1)" || was=""; fi
+  echo "agent-env.sh: $ENV_FILE not updated, since commit ${commit:0:12} is not known to be on marvinamiranda/.github test: it ${was:+still runs commit ${was:0:12}}${was:-does not exist yet}. This shell is set up all the same." >&2
+fi
+printf '%s\n' "$script"
 PRINTED=1

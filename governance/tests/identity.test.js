@@ -24,6 +24,8 @@
 // a deliberately broken copy is shown to turn this suite red. IDENTITY_BASH
 // runs every script under that bash (for example /bin/bash, macOS bash 3.2).
 // IDENTITY_REQUIRE_ZSH=1 (CI) makes a missing zsh a failure, not a skip.
+// IDENTITY_README points the check of the documented per-command forms at
+// another copy of README.md.
 
 const { spawnSync, execFileSync } = require('child_process');
 const crypto = require('crypto');
@@ -624,21 +626,16 @@ function zshOrSkip(what) {
   ok('a commit found on test once is remembered, and not asked about again',
     remembered && again.status === 0 && warned(again).length === 0, `remembered=${remembered} ${JSON.stringify(warned(again))}`);
 
-  // Every tool command opens with the eval, so a commit that is NOT on test
-  // must not cost a network call each time: that verdict is kept 10 minutes.
+  // An eval now runs only to install or refresh the identity (the per-command
+  // form sources the env file), so a commit not on test is asked about again
+  // at the next eval: once it is merged, that eval says nothing.
   fresh();
   canonTest('elsewhere');
   agentEnv();
-  canonTest('gone');
-  const cached = agentEnv();
-  ok('a commit found not on test is not asked about again within 10 minutes: the warning is repeated without reading test',
-    cached.status === 0 && warned(cached).length === 1 && /not on marvinamiranda\/\.github test/.test(warned(cached)[0]), JSON.stringify(warned(cached)));
-  const verdict = path.join(SHIM(), 'not-on-test');
-  const [, ...rest] = readOr(verdict).split('\n');
-  try { fs.writeFileSync(verdict, [String(now() - 601), ...rest].join('\n')); } catch (e) { /* no verdict was kept */ }
-  const expired = agentEnv();
-  ok('...and is asked again once 10 minutes have passed',
-    expired.status === 0 && warned(expired).length === 1 && /could not be read/.test(warned(expired)[0]), JSON.stringify(warned(expired)));
+  canonTest('head');
+  const merged = agentEnv();
+  ok('a commit not on test is asked about again at the next eval: once merged, no warning',
+    merged.status === 0 && warned(merged).length === 0, JSON.stringify(warned(merged)));
   canonTest('head');
 })();
 
@@ -658,6 +655,109 @@ function zshOrSkip(what) {
   fs.writeFileSync(ghLog, '');
   const t = inChild(printedA, 'gh api user; echo "gh-rc=$?"');
   ok('...and the first still works after the second eval', rcOf(t.stdout, 'gh-rc') === 0 && ghRuns().length === 1, t.stderr.trim());
+  git(src, 'reset', '-q', '--hard', COMMIT);
+  canonTest('head');
+})();
+
+// ------------------- round 4: the per-command forms fail closed ----
+// Claude Code and Codex run every tool command in a shell rebuilt from a
+// snapshot of the owner's environment: the owner's gh first on PATH, no
+// sentinel, the owner's token exported. Here that is `snapshot`: brew-bin's gh,
+// which hands out OWNER for `gh auth token`, comes first. The command that opens
+// each tool command must stop it whenever it cannot set the identity up, since
+// `eval ""`, which is what a missing script leaves, succeeds.
+(function perCommand() {
+  const README = fs.readFileSync(process.env.IDENTITY_README ? path.resolve(process.env.IDENTITY_README)
+    : path.join(__dirname, '..', '..', 'README.md'), 'utf8');
+  const SHORT = '. ~/.config/mm-agent/mm-agent/env'; // exactly as the README shows it
+  const LONG = (script) => `eval "$(${script} mm-agent || echo false)"`;
+  const ENV_FILE = path.join(DIR, 'env');
+  const snapshot = { PATH: [brewBin, stubBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':'), GH_PACKAGES_TOKEN: OWNER };
+  const shells = [['bash', BASH], ['zsh', 'zsh']];
+  const inShell = (bin, script) => spawnSync(bin, ['-c', script], { env: env(snapshot), encoding: 'utf8', cwd: root });
+  const reachedOwner = (r) => lines(brewLog).length > 0 || (r.stdout + r.stderr).includes(OWNER);
+
+  ok('the README gives the per-command form as the guarded source of the env file, and the long form with || echo false',
+    README.includes(`${SHORT} && gh`) && README.includes('agent-env.sh mm-agent || echo false)" &&')
+      && !/eval "\$\([^)]*agent-env\.sh mm-agent\)" &&/.test(README), '');
+
+  for (const [shell, bin] of shells) {
+    if (shell === 'zsh' && !zshOrSkip('the per-command forms under zsh')) continue;
+    for (const [what, setup, cmd] of [
+      ['the long form, with the script gone', () => {}, `${LONG('/nonexistent/governance/identity/agent-env.sh')} && gh auth token`],
+      ['the long form, relative, from another directory', () => {}, `cd / && ${LONG('governance/identity/agent-env.sh')} && gh auth token`],
+      ['the short form, with no env file', () => {}, `${SHORT} && gh auth token`],
+      ['the short form, with the shim the env file names gone', () => {
+        agentEnv();
+        fs.rmSync(path.join(DIR, 'shim'), { recursive: true, force: true });
+      }, `${SHORT} && gh auth token`],
+    ]) {
+      fresh();
+      setup();
+      fs.writeFileSync(brewLog, '');
+      fs.writeFileSync(ghLog, '');
+      const r = inShell(bin, `${cmd}; echo "rc=$?"`);
+      ok(`${shell}: ${what}: the command is stopped, and neither the owner's gh nor any gh runs`,
+        rcOf(r.stdout, 'rc') !== 0 && !reachedOwner(r) && ghRuns().length === 0,
+        `rc=${rcOf(r.stdout, 'rc')} brew=${JSON.stringify(lines(brewLog))} ${r.stderr.trim().split('\n').slice(-1)}`);
+    }
+
+    // Installed by an eval from a commit on test: the short form sets the identity up.
+    fresh({ tokens: ['ghs_T1'] });
+    const installed = agentEnv();
+    const shimGh = path.join(SHIM(), 'bin', 'gh');
+    fs.writeFileSync(brewLog, '');
+    fs.writeFileSync(ghLog, '');
+    let r = inShell(bin, `${SHORT} && printf 'gh=%s\\ntoken=%s\\npackages=%s\\n' "$(command -v gh)" "\${GH_TOKEN-unset}" "\${GH_PACKAGES_TOKEN-unset}" && gh auth token; echo "rc=$?"`);
+    ok(`${shell}: the short form puts the shim first, sets the sentinel, drops the owner's token, and gh auth token is refused`,
+      installed.status === 0 && field(r.stdout, 'gh') === shimGh && SENTINEL_RE.test(field(r.stdout, 'token') || '')
+        && field(r.stdout, 'packages') === 'unset' && rcOf(r.stdout, 'rc') !== 0 && /refused/.test(r.stderr) && !reachedOwner(r) && ghRuns().length === 0,
+      `${r.stdout.trim().split('\n').join(' | ')} ${r.stderr.trim().split('\n').slice(-1)}`);
+    r = inShell(bin, `${SHORT} && gh api user; echo "rc=$?"`);
+    ok(`${shell}: the short form's gh runs with a minted App token`,
+      rcOf(r.stdout, 'rc') === 0 && ghRuns().length === 1 && ghRuns()[0].token === 'ghs_T1' && !reachedOwner(r), `${r.stderr.trim()}`);
+  }
+
+  // The env file and the printed environment set up the same thing, and hold no token.
+  fresh({ tokens: ['ghs_SECRET2'] });
+  fs.writeFileSync(PACKAGES, `${PKG}\n`, { mode: 0o600 });
+  const printed = agentEnv().stdout;
+  const envText = readOr(ENV_FILE, null);
+  ok('the env file is what the eval printed, holds no token, and reads the packages token from its file',
+    envText !== null && envText.trim() === printed.trim() && !envText.includes(PKG) && !envText.includes('ghs_SECRET2')
+      && envText.includes(`cat -- ${PACKAGES}`), envText === null ? 'no env file' : 'differs or holds a token');
+  ok('the env file is private (0600)', envText !== null && (fs.statSync(ENV_FILE).mode & 0o777) === 0o600, '');
+
+  // Only a commit on test is installed as the env file: an eval from anywhere
+  // else sets up its own shell, and leaves the env file as it was.
+  fresh();
+  canonTest('elsewhere');
+  let e = agentEnv();
+  ok('an eval from a commit not on test sets up its own shell but writes no env file, and says so',
+    e.status === 0 && !fs.existsSync(ENV_FILE) && /env/.test(e.stderr) && /not updated|not written/.test(e.stderr), e.stderr.trim().split('\n').slice(-1).join(''));
+  canonTest('head');
+
+  // The short form keeps the shim of the commit installed last, whatever the
+  // checkout does; the long form takes what the checkout holds now.
+  fresh();
+  agentEnv(); // installs COMMIT, which is on test
+  fs.appendFileSync(path.join(IDENTITY, 'gh-shim.sh'), '# a later commit, not merged\n');
+  git(src, 'commit', '-q', '-am', 'later, not on test');
+  const later = git(src, 'rev-parse', 'HEAD');
+  const longLater = agentEnv(); // the checkout's new commit: not on test
+  const which = (printedOrNull) => spawnSync(BASH, ['-c', printedOrNull === null ? `${SHORT} && command -v gh` : 'eval "$1" && command -v gh', '_', printedOrNull || ''],
+    { env: env(snapshot), encoding: 'utf8' }).stdout.trim();
+  ok('after the checkout moves to a commit not on test, the short form still runs the installed commit, and the long form the new one',
+    which(null) === path.join(SHIM(COMMIT), 'bin', 'gh') && which(longLater.stdout) === path.join(SHIM(later), 'bin', 'gh'),
+    `short=${which(null)} long=${which(longLater.stdout)}`);
+  fs.renameSync(src, `${src}.moved`);
+  fs.writeFileSync(ghLog, '');
+  const gone = spawnSync(BASH, ['-c', `${SHORT} && gh api user; echo "rc=$?"`], { env: env(snapshot), encoding: 'utf8' });
+  fs.renameSync(`${src}.moved`, src);
+  ok('with the checkout gone, the short form still works', rcOf(gone.stdout, 'rc') === 0 && ghRuns().length === 1, gone.stderr.trim());
+  canonTest('head'); // the later commit is merged
+  agentEnv();
+  ok('an eval from the merged later commit moves the env file to it', which(null) === path.join(SHIM(later), 'bin', 'gh'), which(null));
   git(src, 'reset', '-q', '--hard', COMMIT);
   canonTest('head');
 })();

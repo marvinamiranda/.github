@@ -175,24 +175,44 @@ python3 governance/identity/create-app.py mm-reviewer   # posts review/independe
 
 Keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
 
+**Install or refresh an identity** from a checkout of a merged commit, by the
+script's absolute path:
+
 ```bash
-eval "$(governance/identity/agent-env.sh mm-agent)"     # a builder's shell
-eval "$(governance/identity/agent-env.sh mm-reviewer)"  # a reviewer's shell
-governance/identity/post-review.sh owner/repo <sha> success "Matches the Task; tests seen failing first."
+eval "$(<checkout>/governance/identity/agent-env.sh mm-agent || echo false)" && gh auth status
+eval "$(<checkout>/governance/identity/agent-env.sh mm-reviewer || echo false)" && gh auth status
 ```
 
-**Claude Code and Codex: the `eval` must open every tool command**, as in
-`eval "$(<checkout>/governance/identity/agent-env.sh mm-agent)" && gh pr create …`.
-Both rebuild each tool command's shell from a snapshot taken when the session
-began, and a snapshot taken from the owner's environment carries it. Claude
-Code's re-applies the `PATH` it captured, which puts the real `gh` first.
-Codex's re-exports every variable it captured, which on the owner's machine
-includes their `gh` login token as `GH_PACKAGES_TOKEN` (from `~/.zshrc`). That
-is the residual: a tool command that does not open with the `eval` runs as its
-snapshot has it, and the snapshot files keep whatever was exported when they
-were taken (Codex writes them readable by every local user). Only the owner
-can clear those files. An eval costs about 0.07 s once its commit is known to
-be on `test`.
+**Then open every tool command with the env file it installed**, joined with
+`&&`, never `;`:
+
+```bash
+. ~/.config/mm-agent/mm-agent/env && gh pr create …
+. ~/.config/mm-agent/mm-reviewer/env && governance/identity/post-review.sh owner/repo <sha> success "Matches the Task; tests seen failing first."
+```
+
+Both forms stop the command when they cannot set the identity up. A bare
+`eval "$(…/agent-env.sh mm-agent)"` does not: when the script is not there
+(the checkout moved or went away, or a relative path run from another
+directory), it evaluates nothing, succeeds, and the command runs as the owner.
+`|| echo false` turns that into a failing eval. `.` of a missing env file
+fails, and so does an env file whose shim is gone. The env file is written
+only by an eval from a commit on this repository's `test`, so it only ever
+runs merged code; an eval from anywhere else sets up its own shell and leaves
+the file alone. Sourcing it starts no process.
+
+**Claude Code and Codex need the env file on every tool command**: both
+rebuild each command's shell from a snapshot taken when the session began, and
+a snapshot taken from the owner's environment carries it. Claude Code's
+re-applies the `PATH` it captured, which puts the real `gh` first. Codex's
+re-exports every variable it captured, which on the owner's machine includes
+their `gh` login token as `GH_PACKAGES_TOKEN` (from `~/.zshrc`). That is the
+residual: a tool command that does not open with the env file runs as its
+snapshot has it; an alias named `gh` in the snapshot is expanded when the
+command line is parsed, before the env file can remove it (there is none on
+the owner's machine; `command gh` sidesteps one); and the snapshot files keep
+whatever was exported when they were taken (Codex writes them readable by
+every local user). Only the owner can clear those files.
 
 `agent-env.sh` is a strong default, not a sandbox: agents run on the owner's
 machine as the owner's user, and the owner's keyring login stays one absolute
@@ -200,10 +220,14 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
 
 - puts the identity's `gh` first on `PATH`: a launcher in
   `~/.config/mm-agent/<name>/shim/<commit>/bin/`, the only file there, for
-  copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`. The copies are
-  the blobs of the checkout's HEAD commit, so a session keeps its shim when the
-  checkout changes or goes away, and sessions evaluated from different commits
-  never swap shims under each other;
+  copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`, taken from the
+  blobs of a commit. Which commit a shell runs depends on the form:
+  - the eval installs what the checkout's HEAD is at that moment and switches
+    that shell to it. The shell keeps it when the checkout changes or goes
+    away, until it evaluates again;
+  - the env file runs the commit it names: the last one an eval from a commit
+    on `test` installed on this machine. The checkout can change or go away
+    without touching it;
 - refuses a checkout whose three identity scripts differ from its HEAD commit
   (compared by content, so a change hidden from `git status` counts), and
   warns when that commit is not on this repository's `test`. A commit found on
@@ -233,10 +257,12 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
   and tells git to quit rather than fall back when it cannot;
 - sets the App's bot as git author and committer.
 
-If `agent-env.sh` itself fails, it prints an environment with no identity
-(the sentinel, `gh` refusing and kept first in zsh the same way, git told to
-quit, no commit identity, a failing status) instead of nothing, which would
-leave the shell on the owner's login.
+If `agent-env.sh` fails once it is running, it prints an environment with no
+identity (the sentinel, `gh` refusing and kept first in zsh the same way, git
+told to quit, no commit identity, a failing status) instead of nothing, which
+would leave the shell on the owner's login, and it leaves the env file as it
+was. A script that cannot run at all prints nothing: that is what
+`|| echo false` is for.
 
 Bash login shells are not wrapped: on this machine they keep the shim first
 (the owner's bash files do not run `brew shellenv`), but macOS `path_helper`
