@@ -13,12 +13,21 @@
 # The check run is created through the Checks API because a reusable
 # workflow's own job is named "<caller job> / <this job>", which a ruleset
 # cannot require, and only an App can create a check run — here the Actions
-# app, which the rulesets pin the context to.
+# app, which the rulesets pin the context to. That check run carries the
+# verdict; the issue-link job itself does not fail on it, so a failed run left
+# on an older event cannot keep a pull request red after a later run passes.
 #
 # CALLERS PIN THIS FILE BY COMMIT SHA and pass the same SHA as
 # governance-ref, so the code that judges a pull request is a reviewed commit
-# of this repository, never whatever `test` holds at the time. Actions are
-# pinned by SHA for the same reason. No third-party actions.
+# of this repository, never whatever `test` holds at the time. Both jobs check
+# that before they fetch any code of governance-ref: governance-ref must equal
+# job.workflow_sha (the commit of this file that the caller's `uses:` pinned;
+# github.workflow_sha would be the caller's own commit), and that commit must
+# be on marvinamiranda/.github `test` (the compare API says identical or
+# behind), so neither an unmerged pull request commit nor a fork's commit can
+# judge. The check is inline because code fetched at governance-ref cannot
+# vouch for governance-ref; governance/tests/pr-governance.test.js runs it.
+# Actions are pinned by SHA for the same reason. No third-party actions.
 name: PR governance
 
 on:
@@ -31,7 +40,7 @@ on:
       governance-ref:
         description: >-
           Commit SHA of marvinamiranda/.github whose governance/*.js is used —
-          the same SHA the caller pins this workflow to.
+          the same SHA the caller pins this workflow to, and on its test branch.
         type: string
         required: true
 
@@ -47,7 +56,58 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Verify the pin
+        id: pin
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SELF_SHA: ${{ job.workflow_sha }}
+          SELF_REPOSITORY: ${{ job.workflow_repository }}
+          GOVERNANCE_REF: ${{ inputs.governance-ref }}
+        with:
+          script: |
+            // BEGIN verify-pin: the same in both jobs; governance/tests/pr-governance.test.js runs it.
+            async function verifyPin({ github, env }) {
+              const self = env.SELF_SHA || '';
+              const ref = env.GOVERNANCE_REF || '';
+              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'marvinamiranda/.github') {
+                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not marvinamiranda/.github.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(self)) {
+                return 'GitHub did not report the commit this workflow runs from (job.workflow_sha), so the pin cannot be checked.';
+              }
+              if (ref !== self) {
+                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
+              }
+              let status;
+              try {
+                ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: 'marvinamiranda', repo: '.github', basehead: `test...${self}`, per_page: 1 }));
+              } catch (error) {
+                return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
+              }
+              if (status !== 'identical' && status !== 'behind') {
+                return `${self} is not on marvinamiranda/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
+              }
+              return '';
+            }
+            // END verify-pin
+            const problem = await verifyPin({ github, env: process.env });
+            core.setOutput('ok', problem ? 'false' : 'true');
+            if (problem) {
+              const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: context.payload.pull_request.number });
+              await github.rest.checks.create({
+                ...context.repo,
+                name: 'governance/issue-link',
+                head_sha: pr.head.sha,
+                status: 'completed',
+                conclusion: 'failure',
+                output: { title: 'The governance pin is not a merged commit of marvinamiranda/.github', summary: problem },
+              });
+              await core.summary.addHeading('governance/issue-link').addRaw(problem).write();
+            }
+
       - name: Fetch the shared matcher
+        if: steps.pin.outputs.ok == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: marvinamiranda/.github
@@ -58,6 +118,7 @@ jobs:
           persist-credentials: false
 
       - name: Judge the pull request
+        if: steps.pin.outputs.ok == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
@@ -72,8 +133,7 @@ jobs:
               conclusion: v.ok ? 'success' : 'failure',
               output: { title: v.title, summary: v.summary },
             });
-            core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
-            if (!v.ok) core.setFailed(v.summary);
+            await core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
 
   areas:
     name: areas
@@ -83,6 +143,45 @@ jobs:
     permissions:
       contents: read
     steps:
+      # This job has no published check: its own status is the verdict, so a
+      # pin problem fails it (a skipped job would count as passed).
+      - name: Verify the pin
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SELF_SHA: ${{ job.workflow_sha }}
+          SELF_REPOSITORY: ${{ job.workflow_repository }}
+          GOVERNANCE_REF: ${{ inputs.governance-ref }}
+        with:
+          script: |
+            // BEGIN verify-pin: the same in both jobs; governance/tests/pr-governance.test.js runs it.
+            async function verifyPin({ github, env }) {
+              const self = env.SELF_SHA || '';
+              const ref = env.GOVERNANCE_REF || '';
+              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'marvinamiranda/.github') {
+                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not marvinamiranda/.github.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(self)) {
+                return 'GitHub did not report the commit this workflow runs from (job.workflow_sha), so the pin cannot be checked.';
+              }
+              if (ref !== self) {
+                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
+              }
+              let status;
+              try {
+                ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: 'marvinamiranda', repo: '.github', basehead: `test...${self}`, per_page: 1 }));
+              } catch (error) {
+                return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
+              }
+              if (status !== 'identical' && status !== 'behind') {
+                return `${self} is not on marvinamiranda/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
+              }
+              return '';
+            }
+            // END verify-pin
+            const problem = await verifyPin({ github, env: process.env });
+            if (problem) core.setFailed(problem);
+
       # pull_request: the merge of the head into the base, which is what will
       # land — so a pull request that adds a path and its areas.txt rule in the
       # same change passes. Under pull_request_target this is the base.
