@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # Bootstrap the delivery standard (DELIVERY §14) for the marvinamiranda organisation.
 #
-# In this order, each run from a merged commit (below):
+# FIRST, ONCE, straight after this repository's own pull request merges into
+# its test, and before any product repository moves its pin to that commit:
+#   governance/bootstrap.sh --self-only                   # dry run
+#   governance/bootstrap.sh --self-only --probe --apply   # this repository's rulesets
+# Until then marvinamiranda/.github, whose code every other repository's
+# required checks run, has no ruleset: "on test" means only "pushed".
+#
+# THEN, FOR EACH PRODUCT REPOSITORY, in this order, and only AFTER its adoption
+# pull request has merged into its test: every step reads that repository's
+# .github/governance/ from test (a dry run can read an unmerged one with
+# --config-dir). Each run from a merged commit (below):
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops                                # 1. dry run
-#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply          # 2. stage an adoption
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply          # 2. default branch, labels
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops --probe --no-rulesets --apply  # 3. Reviewer App probe
 #   4. one Agent App squash-merge into test: under the rulesets a passing pull
 #      request is the only way in, and the Agent App merges agents' ones.
@@ -23,6 +33,32 @@
 # change something is printed instead. `--apply` executes them. Idempotent:
 # each step reads the current state first and changes only what differs.
 #
+# THE CREDENTIAL FOR --apply: a fine-grained personal access token of the
+# owner's, expiring the next day, passed as GH_TOKEN for that run only. Never
+# add admin:org to the gh keyring login: agents on this machine can reach that
+# login (DELIVERY §9), admin:org can disable the rulesets, and a scope removed
+# again with `gh auth refresh --remove-scopes` stays on the token already
+# issued (cli/cli#9233). Create it at github.com/settings/personal-access-tokens:
+#   Resource owner: marvinamiranda. Expiration: custom, the next day.
+#   Repository access: marvinamiranda/.github and each --repo (or all).
+#   Organization permissions:
+#     Issue Types: read and write      a) Epic, Decision, Spike
+#     Projects: read and write         f) only with --project
+#   Repository permissions:
+#     Administration: read and write   b) the default branch; e) rulesets
+#     Contents: read                   each repository's .github/governance/ and test
+#     Issues: read and write           c) labels
+#     Metadata: read                   always included: repositories, ruleset lists
+#   d) the probe needs none of these: it posts with the Reviewer App's own token.
+#   --self-only needs Administration and Metadata on marvinamiranda/.github alone.
+# The organisation may have to approve the token first (its settings, Personal
+# access tokens). Pass it without leaving it in the shell history:
+#   read -rs GH_TOKEN && export GH_TOKEN       # paste it; nothing is echoed
+#   governance/bootstrap.sh ... --apply
+#   unset GH_TOKEN
+# GitHub reports no permissions for a fine-grained token, so none is checked in
+# advance: a step that lacks one fails, and nothing after it runs.
+#
 # Product structure lives in each product repository, never here (DELIVERY §6):
 # it reads .github/governance/{areas.txt, required-checks.txt,
 # required-checks.main.txt} from each repo's `test` branch, or from
@@ -37,12 +73,13 @@
 #   d) with --probe: the Reviewer App posts a neutral review/independent check
 #      on each repo's test head, proving it can post there before a ruleset
 #      pins the check to it
-#   e) rulesets `test-integration`, `main-owner-only` and `main-checks` on each
-#      repo AND on marvinamiranda/.github itself, created or updated by name
-#      (DELIVERY §9, §10); legacy rulesets on test or main are set to
-#      enforcement `disabled` (never deleted). They need the Reviewer App's id:
-#      without it the run stops before it changes anything. Skipped with
-#      --no-rulesets.
+#   e) rulesets `test-integration`, `main-owner-only` and `main-checks` on
+#      marvinamiranda/.github itself first, then on each repo, created or
+#      updated by name (DELIVERY §9, §10); legacy rulesets on test or main are
+#      set to enforcement `disabled` (never deleted). They need the Reviewer
+#      App's id: without it the run stops before it changes anything. Skipped
+#      with --no-rulesets. With --self-only, d) and e) for this repository are
+#      all that runs.
 #   f) with --project: the Project, its Status/Priority/Size fields, and a link
 #      to each repo
 #
@@ -51,8 +88,8 @@
 # owner can retire it deliberately. Identities are GitHub Apps, created and
 # installed by the owner (governance/identity/, DELIVERY Appendix A).
 #
-# Needs: gh (for --apply: an organisation owner with admin:org, repo and
-# project scopes), git, jq, and bash 3.2 or later.
+# Needs: gh (for --apply, the owner's fine-grained token above), git, jq, and
+# bash 3.2 or later.
 set -euo pipefail
 
 ORG="marvinamiranda"
@@ -60,6 +97,7 @@ APPLY=0
 REPOS=()
 WANT_PROJECT=0
 SKIP_RULESETS=0
+SELF_ONLY=0
 PROJECT_TITLE=""
 PROBE=0
 # The one identity that may move main, through a pull request only (DELIVERY
@@ -90,10 +128,16 @@ usage() {
   cat <<EOF
 
 Options:
-  --repo <name>            Repository in $ORG to configure. Repeatable. Required.
+  --repo <name>            Repository in $ORG to configure. Repeatable. Required,
+                           except with --self-only.
+  --self-only              Only $ORG/$SELF_REPO's own rulesets (with --probe, its
+                           probe too); takes no --repo. The first run, once this
+                           repository's own pull request has merged.
   --apply                  Execute the changes. Without it nothing is written.
-  --no-rulesets            Everything except rulesets: stage an adoption, and
-                           apply rulesets once the adoption PR has merged.
+  --no-rulesets            Everything except rulesets. Like every step for a product
+                           repository it runs after that repository's adoption pull
+                           request has merged, since it reads its .github/governance/
+                           from $CONFIG_REF. The rulesets follow in a run without it.
   --probe                  Have the Reviewer App post a neutral review/independent
                            check on each repo's test head (needs its key). Pair it
                            with --no-rulesets, or the same run applies the rulesets.
@@ -114,6 +158,7 @@ while [[ $# -gt 0 ]]; do
     --repo) [[ $# -ge 2 ]] || { echo "--repo needs a value" >&2; exit 2; }; REPOS+=("$2"); shift ;;
     --project) WANT_PROJECT=1 ;;
     --no-rulesets) SKIP_RULESETS=1 ;;
+    --self-only) SELF_ONLY=1 ;;
     --probe) PROBE=1 ;;
     --project-title) [[ $# -ge 2 ]] || { echo "--project-title needs a value" >&2; exit 2; }; PROJECT_TITLE="$2"; shift ;;
     --reviewer-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--reviewer-app-id needs a numeric id" >&2; exit 2; }; REVIEWER_APP_ID="$2"; shift ;;
@@ -125,7 +170,13 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ ${#REPOS[@]} -gt 0 ]] || { echo "At least one --repo is required." >&2; usage >&2; exit 2; }
+if (( SELF_ONLY )); then
+  [[ ${#REPOS[@]} -eq 0 ]] || { echo "--self-only applies only $ORG/$SELF_REPO's own rulesets: it takes no --repo." >&2; exit 2; }
+  (( ! SKIP_RULESETS )) || { echo "--self-only applies rulesets, so --no-rulesets would leave it nothing to do." >&2; exit 2; }
+  (( ! WANT_PROJECT )) || { echo "--self-only takes no --project." >&2; exit 2; }
+else
+  [[ ${#REPOS[@]} -gt 0 ]] || { echo "At least one --repo is required, or --self-only for $ORG/$SELF_REPO's own rulesets." >&2; usage >&2; exit 2; }
+fi
 if [[ $WANT_PROJECT -eq 1 && -z "$PROJECT_TITLE" ]]; then echo "--project needs --project-title." >&2; exit 2; fi
 for r in ${REPOS[@]+"${REPOS[@]}"}; do
   [[ "$r" != "$SELF_REPO" ]] || { echo "$SELF_REPO gets its rulesets automatically; do not pass it as --repo." >&2; exit 2; }
@@ -211,8 +262,14 @@ else
   info "Mode: DRY RUN — read calls only; mutating calls are printed."
 fi
 info "Organisation: $ORG"
-info "Repositories: ${REPOS[*]}"
-if [[ -n "$CONFIG_DIR" ]]; then
+if (( SELF_ONLY )); then
+  info "Repositories: none (--self-only: only $ORG/$SELF_REPO's own rulesets)"
+else
+  info "Repositories: ${REPOS[*]}"
+fi
+if (( SELF_ONLY )); then
+  :
+elif [[ -n "$CONFIG_DIR" ]]; then
   info "Product config: $CONFIG_DIR/<repo>/ (local override)"
 else
   info "Product config: each repo's .github/governance/ on $CONFIG_REF"
@@ -277,14 +334,22 @@ owner_login="$(gh api "user/$OWNER_USER_ID" --jq .login)"
 info "main may be moved only by: $owner_login (user id $OWNER_USER_ID), through a pull request"
 viewer="$(gh api user --jq .login)"
 info "Authenticated as: $viewer"
-scopes="$(gh auth status 2>&1 | sed -n "s/.*Token scopes: //p" | head -1)"
-info "Token scopes: ${scopes:-unknown}"
-if [[ "$scopes" != *"admin:org"* ]]; then
-  warn "token lacks admin:org — --apply will fail on the organisation issue types."
-  warn "grant it with: gh auth refresh -h github.com -s admin:org"
-fi
-if [[ $WANT_PROJECT -eq 1 && "$scopes" != *"project"* ]]; then
-  warn "token lacks the project scope — --apply will fail on the Project."
+# Which credential this run uses. No scope is checked: a fine-grained token has
+# none, and GitHub reports no permissions for it, so a step that lacks one
+# fails, and nothing after it runs (the header lists what each step needs).
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  if [[ "$GH_TOKEN" == github_pat_* ]]; then
+    info "Credential: a fine-grained token, from GH_TOKEN."
+  else
+    info "Credential: GH_TOKEN."
+  fi
+elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  info "Credential: GITHUB_TOKEN."
+else
+  info "Credential: your gh login."
+  if [[ $APPLY -eq 1 ]]; then
+    warn "--apply on your gh login, from the keyring. Run it with a one-day fine-grained token as GH_TOKEN instead (--help lists its permissions), and never add admin:org to the keyring login: agents on this machine can reach it, and admin:org can disable the rulesets."
+  fi
 fi
 
 # Materialise each repo's product config into $WORK/cfg/<repo>/.
@@ -323,6 +388,9 @@ done
 
 # ------------------------------------------------------ a) issue types ----
 section "a) Organisation issue types"
+if (( SELF_ONLY )); then
+  info "skipped (--self-only)"
+else
 fetch "orgs/$ORG/issue-types"
 types_json="$BODY"
 info "Existing: $(jq -r '[.[] | .name + (if .is_enabled then "" else " (disabled)" end)] | join(", ")' <<<"$types_json")"
@@ -348,9 +416,11 @@ ensure_issue_type() {
 ensure_issue_type Epic purple "One capability a user recognises; 3-12 Tasks as sub-issues"
 ensure_issue_type Decision orange "A question only the owner may answer (DECISION: <the question>)"
 ensure_issue_type Spike green "A time-boxed investigation, at most a day, whose output is a written finding"
+fi
 
 # ---------------------------------------------------- b) default branch ----
 section "b) Default branch"
+(( ! SELF_ONLY )) || info "skipped (--self-only)"
 for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   fetch "repos/$ORG/$repo"
   current_default="$(jq -r .default_branch <<<"$BODY")"
@@ -377,6 +447,7 @@ STANDARD_LABELS=(
 AREA_COLOR="1d76db"
 
 section "c) Labels"
+(( ! SELF_ONLY )) || info "skipped (--self-only)"
 for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   info "[$repo]"
   current="$(get_all "repos/$ORG/$repo/labels?per_page=100")"
@@ -549,10 +620,11 @@ fi
 
 # --------------------------------------------------------- e) rulesets ----
 section "e) Rulesets"
-# --no-rulesets: stage an adoption. Rulesets require checks that only exist once
-# the repository's adoption PR has merged; applying them first blocks every PR,
-# including that one.
-if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=(${REPOS[@]+"${REPOS[@]}"} "$SELF_REPO"); fi
+# --no-rulesets: everything but the rulesets, so that the Reviewer App probe and
+# one Agent App merge into test are proven before the rulesets make a passing
+# pull request the only way into test.
+# This repository first: it holds the code every other repository's checks run.
+if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=("$SELF_REPO" ${REPOS[@]+"${REPOS[@]}"}); fi
 OURS=" test-integration main-owner-only main-checks "
 for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
   info "[$repo]"

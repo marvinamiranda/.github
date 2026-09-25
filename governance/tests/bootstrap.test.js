@@ -58,7 +58,7 @@ const log = (kind) => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(
 const fixtures = JSON.parse(fs.readFileSync(process.env.FAKE_GH_FIXTURES, 'utf8'));
 if (args[0] === 'auth' && args[1] === 'status') {
   log('read');
-  process.stderr.write("github.com\\n  - Token scopes: 'admin:org', 'project', 'repo', 'workflow'\\n");
+  process.stderr.write("github.com\\n  - Token scopes: " + (process.env.FAKE_GH_SCOPES || "'admin:org', 'project', 'repo', 'workflow'") + "\\n");
   process.exit(0);
 }
 if (args[0] !== 'api') { log('write'); process.exit(99); }
@@ -136,13 +136,15 @@ function checkout(on) {
   return { script: path.join(work, 'governance', 'bootstrap.sh'), canon, work };
 }
 
-function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null } = {}) {
+// `repo: false` runs without the default `--repo prod --config-dir <cfg>`.
+function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null, repo = true, extraEnv = {} } = {}) {
   const co = where || checkout(on);
   fs.writeFileSync(fixtureFile, JSON.stringify(fx));
   fs.writeFileSync(ghLog, '');
-  const r = spawnSync(BASH, [co.script, '--repo', 'prod', '--config-dir', cfg, ...args], {
+  const r = spawnSync(BASH, [co.script, ...(repo ? ['--repo', 'prod', '--config-dir', cfg] : []), ...args], {
     encoding: 'utf8',
     env: {
+      ...extraEnv,
       PATH: [stubBin, process.env.PATH].join(':'),
       HOME: path.join(root, 'home'),
       TMPDIR: root,
@@ -257,6 +259,91 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
     r.status === 0 && /would post, as the Reviewer App \(5075711\): review\/independent=neutral on prod/.test(r.stdout)
       && /would post, as the Reviewer App \(5075711\): review\/independent=neutral on \.github/.test(r.stdout)
       && /== e\) Rulesets\n\s+skipped \(--no-rulesets\)/.test(r.stdout) && Object.keys(planned(r.stdout)).length === 0, tail(r));
+}
+
+// ------------------------------- R4: this repository's rulesets, on their own ----
+{
+  const touchesProd = (r) => r.calls.some((c) => c.args.some((a) => /\/prod(\/|$|\?)/.test(a)));
+  let r = bootstrap(['--self-only'], { repo: false });
+  const plan = planned(r.stdout);
+  ok('--self-only needs no --repo and plans exactly this repository\'s three rulesets',
+    r.status === 0 && JSON.stringify(Object.keys(plan).sort()) === JSON.stringify(['.github/main-checks', '.github/main-owner-only', '.github/test-integration']),
+    `${tail(r)} planned=${Object.keys(plan)}`);
+  ok('--self-only reads no product repository and skips issue types, default branches and labels',
+    r.status === 0 && !touchesProd(r) && !r.calls.some((c) => c.args.includes(`orgs/${ORG}/issue-types`))
+      && /== a\) Organisation issue types\n\s+skipped \(--self-only\)/.test(r.stdout),
+    `${tail(r)} calls=${JSON.stringify(r.calls.map((c) => c.args.join(' ')))}`);
+  const self = plan['.github/test-integration'];
+  ok('--self-only: test-integration requires governance tests and review/independent from the Reviewer App',
+    self && checks(self.body).some((c) => c.context === 'governance tests' && c.integration_id === 15368)
+      && checks(self.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID), self && JSON.stringify(checks(self.body)));
+
+  for (const [what, args, says] of [
+    ['--self-only with a --repo', ['--self-only', '--repo', 'prod'], /--self-only .*takes no --repo/],
+    ['--self-only with --no-rulesets', ['--self-only', '--no-rulesets'], /--self-only applies rulesets/],
+    ['--self-only with --project', ['--self-only', '--project', '--project-title', 'x'], /--self-only takes no --project/],
+  ]) {
+    r = bootstrap(args, { repo: false });
+    ok(`${what} is a usage error, before any gh call`, r.status === 2 && says.test(r.stderr) && !/Unknown argument/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+  r = bootstrap([], { repo: false });
+  ok('no --repo and no --self-only is a usage error that names --self-only',
+    r.status === 2 && /At least one --repo is required, or --self-only/.test(r.stderr) && r.calls.length === 0, tail(r));
+  r = bootstrap(['--self-only'], { repo: false, reviewer: false });
+  ok('--self-only without a Reviewer App id aborts before any gh call',
+    r.status === 1 && /No Reviewer App id, so no rulesets/.test(r.stderr) && !/Unknown argument/.test(r.stderr) && r.calls.length === 0, tail(r));
+  r = bootstrap(['--self-only', '--apply'], { repo: false, on: 'elsewhere' });
+  ok('--self-only --apply refuses a commit that is not on test, before any gh call',
+    r.status !== 0 && /Refusing --apply/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+  // --apply once this repository's rulesets are as planned: nothing to write.
+  const listed = [];
+  const extra = {};
+  Object.values(plan).forEach(({ body }, i) => {
+    listed.push({ id: 100 + i, name: body.name, source_type: 'Repository' });
+    extra[`repos/${ORG}/.github/rulesets/${100 + i}`] = { ...body, id: 100 + i, source_type: 'Repository' };
+  });
+  extra[`repos/${ORG}/.github/rulesets?includes_parents=true&per_page=100`] = listed;
+  r = bootstrap(['--self-only', '--apply'], { repo: false, fx: fixtures(extra) });
+  ok('--self-only --apply from a commit on test, with the rulesets in place: up to date, nothing written',
+    r.status === 0 && /0 change\(s\) applied/.test(r.stdout) && r.writes.length === 0 && (r.stdout.match(/up to date\./g) || []).length === 3, tail(r));
+
+  r = bootstrap(['--self-only', '--probe'], { repo: false });
+  ok('--self-only --probe plans the probe on this repository alone',
+    r.status === 0 && /review\/independent=neutral on \.github/.test(r.stdout) && !/neutral on prod/.test(r.stdout), tail(r));
+
+  // In a run with --repo too, this repository's rulesets come first.
+  r = bootstrap([]);
+  const order = [...r.stdout.matchAll(/^\s+\[([^\]]+)\]$/gm)].map((m) => m[1]);
+  const rulesetsAt = r.stdout.indexOf('== e) Rulesets');
+  const inE = [...r.stdout.slice(rulesetsAt).matchAll(/^\s+\[([^\]]+)\]$/gm)].map((m) => m[1]);
+  ok('a run with --repo applies this repository\'s rulesets before any product repository\'s',
+    r.status === 0 && inE[0] === '.github' && inE.includes('prod'), `${tail(r)} order=${JSON.stringify(inE)} all=${JSON.stringify(order)}`);
+}
+
+// -------------------------------------- the credential for --apply ----
+{
+  // Advice to ADD a scope to the gh login (gh auth refresh ... -s <scope>).
+  const addsScope = /gh auth refresh\b[^\n]*\s-s\s/;
+  const noRefresh = (r) => !addsScope.test(r.stdout + r.stderr);
+  let r = bootstrap(['--no-rulesets'], { extraEnv: { GH_TOKEN: 'github_pat_FAKE' } });
+  ok('a fine-grained token in GH_TOKEN is named as such, with no scope warning (it has no scopes)',
+    r.status === 0 && /fine-grained/.test(r.stdout) && !/WARNING/.test(r.stdout) && noRefresh(r), tail(r));
+  r = bootstrap(['--no-rulesets', '--apply']);
+  ok('--apply on the keyring login warns: a one-day fine-grained token as GH_TOKEN, never admin:org on the keyring login',
+    r.status === 0 && /WARNING: .*keyring/.test(r.stdout) && /fine-grained/.test(r.stdout) && /admin:org/.test(r.stdout) && noRefresh(r), tail(r));
+  r = bootstrap(['--no-rulesets'], { extraEnv: { FAKE_GH_SCOPES: "'repo'" } });
+  ok('a dry run never advises adding admin:org to the gh login', r.status === 0 && noRefresh(r), tail(r));
+
+  const help = spawnSync(BASH, [SCRIPT, '--help'], { encoding: 'utf8' });
+  const text = help.stdout;
+  ok('--help lists the fine-grained token\'s permissions for each step',
+    help.status === 0 && /fine-grained/i.test(text) && /Issue Types: read and write/.test(text) && /Administration: read and write/.test(text)
+      && /Contents: read/.test(text) && /Issues: read and write/.test(text) && /Projects: read and write/.test(text) && /Metadata: read/.test(text)
+      && /Reviewer App/.test(text) && !addsScope.test(text), text.slice(0, 200));
+  ok('--help says --no-rulesets (and every product step) runs after the adoption pull request has merged, and names --self-only',
+    /--no-rulesets[\s\S]{0,300}after[\s\S]{0,60}adoption\s+pull\s+request\s+has\s+merged/.test(text) && /--self-only/.test(text)
+      && !/stage an adoption/.test(text), '');
 }
 
 fs.rmSync(root, { recursive: true, force: true });
