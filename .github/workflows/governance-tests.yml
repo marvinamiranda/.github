@@ -23,6 +23,12 @@ jobs:
         run: node governance/tests/issue-link.test.js
       - name: areas checker
         run: node governance/tests/areas-check.test.js
+      - name: PR governance pin check
+        run: node governance/tests/pr-governance.test.js
+      - name: bootstrap (stub gh, no network)
+        run: node governance/tests/bootstrap.test.js
+      - name: agent identity (stub curl and gh, no network)
+        run: node governance/tests/identity.test.js
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
       - name: identity manifests parse
