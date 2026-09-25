@@ -1,0 +1,40 @@
+name: "Spike"
+description: "A time-boxed investigation (at most one day) whose output is a written finding committed to the docs."
+type: Spike
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: The one question this Spike answers.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: timebox
+    attributes:
+      label: Timebox
+      description: A Spike is at most one day. If it cannot be answered in that, the finding says so and what would.
+      options:
+        - "2 hours"
+        - "Half a day"
+        - "1 day"
+    validations:
+      required: true
+
+  - type: input
+    id: output
+    attributes:
+      label: Output document path
+      description: Where the finding will be committed in the docs.
+      placeholder: "docs-new/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: feeds
+    attributes:
+      label: Decision it feeds
+      description: The Decision issue, ADR or Task this finding unblocks, as a full URL.
+    validations:
+      required: true

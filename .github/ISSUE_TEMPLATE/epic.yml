@@ -1,0 +1,66 @@
+name: "Epic"
+description: "One capability a user recognises. Owns the why; its 3–12 Tasks own the exactly-what."
+type: Epic
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An Epic holds 3–12 Tasks as native sub-issues. More means split. Its first Task is the **spec Task** that brings the linked note up to buildable.
+        It closes when all its Tasks are done and its demo has been walked.
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What a user can do when this Epic is done, in their words.
+    validations:
+      required: true
+
+  - type: input
+    id: spec-note
+    attributes:
+      label: Spec note
+      description: Link to the documentation note this Epic delivers.
+      placeholder: "https://github.com/<owner>/<repo>/blob/test/docs-new/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: in-scope
+    attributes:
+      label: In scope
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What a reasonable person might expect here and will not get.
+    validations:
+      required: true
+
+  - type: textarea
+    id: demo
+    attributes:
+      label: Demo script
+      description: How the owner sees it working on the test environment — who signs in, where they go, what they do, what they see.
+      placeholder: |
+        1. Sign in as ... at ...
+        2. Open ...
+        3. Do ...
+        4. See ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: exit
+    attributes:
+      label: Exit criteria
+      description: One checkbox each. The Epic closes when every one is true and the demo has been walked.
+      placeholder: |
+        - [ ] All sub-issue Tasks merged to `test`
+        - [ ] Demo walked on the test environment and recorded
+        - [ ] Spec note reflects what shipped
+    validations:
+      required: true

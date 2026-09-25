@@ -1,0 +1,155 @@
+name: "Task"
+description: "Exactly one pull request. A work order a capable engineer can finish without asking a question."
+type: Task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A Task is **one pull request**, at most ~400 changed lines excluding generated code, snapshots and lockfiles. Bigger means split.
+        Fill every section. None may say "TBD". Write `None` where a section genuinely has nothing.
+        Before marking it Ready, also set exactly one `area:` label and the `tier:` label that matches the dropdown below, and link blockers with native *blocked by*.
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: One sentence, from the user's side.
+      placeholder: "A buyer can add a supplier with payment terms and find it again by name."
+    validations:
+      required: true
+
+  - type: input
+    id: parent-epic
+    attributes:
+      label: Parent Epic
+      description: Link to the parent Epic (also set it as the native parent issue). Write `None — standalone` for a small change with no Epic.
+      placeholder: "https://github.com/<owner>/<repo>/issues/<n>"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: existing-code-case
+    attributes:
+      label: Existing code — which case applies
+      description: The survey of what already exists comes before any code.
+      options:
+        - "Already built — validate it"
+        - "Built but unproven — add tests"
+        - "Built but unreachable or wrong — change the smallest thing"
+        - "Absent — build it"
+    validations:
+      required: true
+
+  - type: textarea
+    id: existing-code
+    attributes:
+      label: Existing code
+      description: What the survey found, with paths. Search for the behaviour, not this Task's vocabulary.
+      placeholder: |
+        - `src/...` — what it does today
+        - Reachable from: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: spec
+    attributes:
+      label: Spec
+      description: Links to the documentation note(s), and the old sources mined, if any.
+    validations:
+      required: true
+
+  - type: textarea
+    id: write-surface
+    attributes:
+      label: Write surface
+      description: The folders and files this Task may change. Anything else is out of bounds.
+      placeholder: |
+        - `src/Modules/.../Suppliers/**`
+        - `src/Tests/.../SupplierTests.cs` (new)
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What a reasonable person might add and must not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract
+    attributes:
+      label: Contract
+      description: The API route, request/response shape, schema change, event or component props this Task introduces or changes — written out, not described. `None` if it changes no contract.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Given / When / Then, one checkbox each, copied from the spec and frozen here.
+      placeholder: |
+        - [ ] Given ..., when ..., then ...
+        - [ ] Given ..., when ..., then ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Tests required
+      description: The test classes or files to add, and at which level (unit, integration, end-to-end, browser, widget, golden). Each new behaviour needs a test seen failing first.
+    validations:
+      required: true
+
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression surface
+      description: Other areas that could break, and the exact commands that prove they did not.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: blocked-by
+    attributes:
+      label: Blocked by
+      description: Mirror of the native *blocked by* links, as full URLs. `None` if nothing blocks it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes for the worker
+      description: Pitfalls, the golden example to copy, the pattern to follow.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Tier
+      description: "Who can execute it. Set the matching `tier:` label too. Senior = security, tenancy/RLS, live-data migrations, money, concurrency, offline sync, cross-repository contracts, deployment."
+      options:
+        - mechanical
+        - standard
+        - senior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: "S ≲ 150 changed lines, M ≲ 400. An L is split before it can be Ready, so it is not offered."
+      options:
+        - S
+        - M
+    validations:
+      required: true
