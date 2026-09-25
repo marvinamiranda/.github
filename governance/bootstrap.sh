@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Bootstrap the delivery standard (DELIVERY §14) for the marvinamiranda organisation.
 #
-#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --project          # dry run
-#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --project --apply  # owner only
-#   … --no-rulesets   # stage an adoption: everything except rulesets (apply those after the adoption PR merges)
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops                       # dry run
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply # stage an adoption
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --probe --apply       # owner only
+#
+# RUN IT FROM A REVIEWED COMMIT: check this repository out by the SHA of a
+# merged commit (`git checkout <sha>`), never from a branch tip — not even
+# `test`. With --apply it refuses to run from a checkout with uncommitted
+# changes, and it prints the commit it runs from.
 #
 # DRY RUN BY DEFAULT: only read calls are made, and every call that would
 # change something is printed instead. `--apply` executes them. Idempotent:
@@ -20,10 +25,18 @@
 #   b) per repo: default branch -> test (closing keywords only act on merges
 #      into the default branch, DELIVERY §4)
 #   c) per repo: the §11 labels, plus area:* labels from areas.txt
-#   d) per repo: rulesets `test-integration`, `main-owner-only` and
-#      `main-checks`, created or updated by name (DELIVERY §9, §10)
-#   e) with --project: the Project, its Status/Priority/Size fields, and a link
+#   d) with --probe: the Reviewer App posts a neutral review/independent check
+#      on each repo's test head, proving it can post there before a ruleset
+#      pins the check to it
+#   e) rulesets `test-integration`, `main-owner-only` and `main-checks` on each
+#      repo AND on marvinamiranda/.github itself, created or updated by name
+#      (DELIVERY §9, §10); legacy rulesets on test or main are set to
+#      enforcement `disabled` (never deleted). Skipped with --no-rulesets.
+#   f) with --project: the Project, its Status/Priority/Size fields, and a link
 #      to each repo
+#
+# Before the first --apply with rulesets, prove one Agent App squash-merge into
+# test on a throwaway pull request: the rulesets allow nothing else.
 #
 # What it never does: delete a label, a ruleset, a field, a field option or an
 # issue. Anything that exists and is not in the standard is REPORTED so the
@@ -31,7 +44,7 @@
 # installed by the owner (governance/identity/, DELIVERY Appendix A).
 #
 # Needs: gh (for --apply: an organisation owner with admin:org, repo and
-# project scopes) and jq.
+# project scopes), jq, and bash 3.2 or later.
 set -euo pipefail
 
 ORG="marvinamiranda"
@@ -39,7 +52,15 @@ APPLY=0
 REPOS=()
 WANT_PROJECT=0
 SKIP_RULESETS=0
-PROJECT_TITLE="Omni237 Delivery"
+PROJECT_TITLE=""
+PROBE=0
+# The one identity that may move main, through a pull request only (DELIVERY
+# §9): the owner's user account. `gh api users/rodrigolmiranda --jq .id`.
+OWNER_USER_ID=1245936
+# This repository. Its own test and main get rulesets too: it holds the code
+# every other repository's required checks run.
+SELF_REPO=".github"
+SELF_CHECKS="governance tests"
 CONFIG_DIR=""
 CONFIG_REF="test"
 STRICT_UP_TO_DATE=false
@@ -55,14 +76,18 @@ REVIEWER_APP_JSON="${MM_REVIEWER_APP_JSON:-$HOME/.config/mm-agent/mm-reviewer/ap
 ACTIONS_APP_ID=15368
 
 usage() {
-  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Options:
   --repo <name>            Repository in $ORG to configure. Repeatable. Required.
   --apply                  Execute the changes. Without it nothing is written.
+  --no-rulesets            Everything except rulesets: stage an adoption, and
+                           apply rulesets once the adoption PR has merged.
+  --probe                  Have the Reviewer App post a neutral review/independent
+                           check on each repo's test head (needs its key).
   --project                Also ensure the Project and link the repos to it.
-  --project-title <t>      Project title (default: "$PROJECT_TITLE").
+  --project-title <t>      Project title. Required with --project.
   --reviewer-app-id <id>   The Reviewer App's id, which review/independent is pinned to.
                            Default: "id" in $REVIEWER_APP_JSON.
   --config-dir <dir>       Read <dir>/<repo>/areas.txt etc. instead of the repo's
@@ -78,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --repo) [[ $# -ge 2 ]] || { echo "--repo needs a value" >&2; exit 2; }; REPOS+=("$2"); shift ;;
     --project) WANT_PROJECT=1 ;;
     --no-rulesets) SKIP_RULESETS=1 ;;
+    --probe) PROBE=1 ;;
     --project-title) [[ $# -ge 2 ]] || { echo "--project-title needs a value" >&2; exit 2; }; PROJECT_TITLE="$2"; shift ;;
     --reviewer-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--reviewer-app-id needs a numeric id" >&2; exit 2; }; REVIEWER_APP_ID="$2"; shift ;;
     --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$2" && pwd)"; shift ;;
@@ -89,11 +115,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ ${#REPOS[@]} -gt 0 ]] || { echo "At least one --repo is required." >&2; usage >&2; exit 2; }
+if [[ $WANT_PROJECT -eq 1 && -z "$PROJECT_TITLE" ]]; then echo "--project needs --project-title." >&2; exit 2; fi
+for r in ${REPOS[@]+"${REPOS[@]}"}; do
+  [[ "$r" != "$SELF_REPO" ]] || { echo "$SELF_REPO gets its rulesets automatically; do not pass it as --repo." >&2; exit 2; }
+done
 command -v gh >/dev/null || { echo "gh is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mm-bootstrap.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# Keep the payloads when anything fails, so the call that failed can be read.
+on_exit() {
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "Exit $rc. Payloads and responses kept in $WORK" >&2; fi
+}
+trap on_exit EXIT
 
 # ---------------------------------------------------------------- output ----
 section() { printf '\n== %s\n' "$*"; }
@@ -117,8 +152,9 @@ mutate_json() {
   local method="$1" path="$2" file="$3"
   PLANNED=$((PLANNED + 1))
   if [[ $APPLY -eq 1 ]]; then
-    printf '   APPLY: gh api -X %s %s --input <payload>\n' "$method" "$path"
-    gh api -X "$method" "$path" --input "$file" >/dev/null
+    printf '   APPLY: gh api -X %s %s --input %s\n' "$method" "$path" "$file"
+    gh api -X "$method" "$path" --input "$file" >/dev/null \
+      || { echo "FAILED: $method $path — payload: $file" >&2; exit 1; }
   else
     printf '   DRY-RUN would run: gh api -X %s %s --input - <<JSON\n' "$method" "$path"
     jq . "$file" | sed 's/^/      /'
@@ -170,6 +206,21 @@ if [[ -n "$CONFIG_DIR" ]]; then
 else
   info "Product config: each repo's .github/governance/ on $CONFIG_REF"
 fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  info "Running from marvinamiranda/.github commit $(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- .)" ]]; then
+    if [[ $APPLY -eq 1 ]]; then
+      echo "Refusing --apply: this checkout has uncommitted changes. Check out a reviewed commit by SHA." >&2
+      exit 1
+    fi
+    warn "this checkout has uncommitted changes; --apply would refuse to run."
+  fi
+else
+  warn "not running from a git checkout; the commit cannot be shown."
+fi
+owner_login="$(gh api "user/$OWNER_USER_ID" --jq .login)"
+info "main may be moved only by: $owner_login (user id $OWNER_USER_ID), through a pull request"
 viewer="$(gh api user --jq .login)"
 info "Authenticated as: $viewer"
 scopes="$(gh auth status 2>&1 | sed -n "s/.*Token scopes: //p" | head -1)"
@@ -227,7 +278,7 @@ load_config() {
   : >"$dest"
 }
 
-for repo in "${REPOS[@]}"; do
+for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   fetch "repos/$ORG/$repo" || { echo "Repository $ORG/$repo not found" >&2; exit 1; }
   load_config "$repo" areas.txt required
   load_config "$repo" required-checks.txt required
@@ -265,7 +316,7 @@ ensure_issue_type Spike green "A time-boxed investigation, at most a day, whose 
 
 # ---------------------------------------------------- b) default branch ----
 section "b) Default branch"
-for repo in "${REPOS[@]}"; do
+for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   fetch "repos/$ORG/$repo"
   current_default="$(jq -r .default_branch <<<"$BODY")"
   if [[ "$current_default" == "test" ]]; then
@@ -291,7 +342,7 @@ STANDARD_LABELS=(
 AREA_COLOR="1d76db"
 
 section "c) Labels"
-for repo in "${REPOS[@]}"; do
+for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   info "[$repo]"
   current="$(get_all "repos/$ORG/$repo/labels?per_page=100")"
   wanted="$WORK/labels-$repo.tsv"
@@ -331,10 +382,11 @@ done
 # required_status_checks entries: every Actions check pinned to the Actions app,
 # plus review/independent pinned to the Reviewer App when its id is known.
 required_checks_json() {
-  local with_review="$1"; shift
+  # $1: review | none    $2: issue-link | none    $3...: check list files
+  local with_review="$1" with_link="$2"; shift 2
   {
     for f in "$@"; do config_lines "$f"; done
-    echo "governance/issue-link"
+    if [[ "$with_link" == "issue-link" ]]; then echo "governance/issue-link"; fi
   } | awk '!seen[$0]++' | jq -R -s --argjson app "$ACTIONS_APP_ID" '
       split("\n") | map(select(length > 0) | {context: ., integration_id: $app})' >"$WORK/checks.json"
   if [[ "$with_review" == "review" && -n "$REVIEWER_APP_ID" ]]; then
@@ -358,7 +410,9 @@ test_ruleset() {
       {type: "pull_request", parameters: {
         required_approving_review_count: 0, dismiss_stale_reviews_on_push: true,
         require_code_owner_review: false, require_last_push_approval: false,
-        required_review_thread_resolution: false, allowed_merge_methods: ["squash"]}},
+        required_review_thread_resolution: false,
+        require_extra_approval_for_unattributed_changes: false,
+        allowed_merge_methods: ["squash"]}},
       {type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: $strict, do_not_enforce_on_create: false,
         required_status_checks: $checks}}
@@ -369,13 +423,15 @@ test_ruleset() {
 # reach the checks (DELIVERY §9). A bypass actor bypasses every rule of the
 # ruleset it is listed on, so the one bypass lives alone:
 #
-# main-owner-only: nobody may update main except an organisation admin, and
-# only through a pull request — `update` (restrict updates) with the
-# OrganizationAdmin role as the only bypass, in pull_request mode. Nothing else.
+# main-owner-only: nobody may update main except the owner's own account, and
+# only through a pull request — `update` (restrict updates) with that one user
+# as the only bypass, in pull_request mode. Nothing else. A user, not the
+# organisation-admin role: the role would extend to any future admin, and to
+# anything acting with an admin's credentials.
 main_owner_ruleset() {
-  jq -n '{
+  jq -n --argjson owner "$OWNER_USER_ID" '{
     name: "main-owner-only", target: "branch", enforcement: "active",
-    bypass_actors: [{actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "pull_request"}],
+    bypass_actors: [{actor_id: $owner, actor_type: "User", bypass_mode: "pull_request"}],
     conditions: {ref_name: {include: ["refs/heads/main"], exclude: []}},
     rules: [
       {type: "update", parameters: {update_allows_fetch_and_merge: false}}
@@ -398,7 +454,9 @@ main_checks_ruleset() {
       {type: "pull_request", parameters: {
         required_approving_review_count: 0, dismiss_stale_reviews_on_push: true,
         require_code_owner_review: false, require_last_push_approval: false,
-        required_review_thread_resolution: false, allowed_merge_methods: ["merge"]}},
+        required_review_thread_resolution: false,
+        require_extra_approval_for_unattributed_changes: false,
+        allowed_merge_methods: ["merge"]}},
       {type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: $strict, do_not_enforce_on_create: false,
         required_status_checks: $checks}}
@@ -408,42 +466,88 @@ main_checks_ruleset() {
 # Normalises a ruleset (desired or fetched) so the two can be diffed.
 normalise_ruleset() {
   jq -S '{name, target, enforcement,
-          bypass_actors: (.bypass_actors // [] | map({actor_type, bypass_mode} + (if .actor_type == "OrganizationAdmin" then {} else {actor_id} end))),
+          bypass_actors: (.bypass_actors // [] | map({actor_id, actor_type, bypass_mode}) | sort_by(.actor_type, .actor_id)),
           conditions: {ref_name: .conditions.ref_name},
           rules: (.rules | map(
-            if .type == "pull_request" then {type, parameters: (.parameters | {required_approving_review_count, dismiss_stale_reviews_on_push, require_code_owner_review, require_last_push_approval, required_review_thread_resolution, allowed_merge_methods: (.allowed_merge_methods | sort)})}
+            if .type == "pull_request" then {type, parameters: (.parameters | {required_approving_review_count, dismiss_stale_reviews_on_push, require_code_owner_review, require_last_push_approval, required_review_thread_resolution, require_extra_approval_for_unattributed_changes: (.require_extra_approval_for_unattributed_changes // false), allowed_merge_methods: (.allowed_merge_methods | sort)})}
             elif .type == "required_status_checks" then {type, parameters: (.parameters | {strict_required_status_checks_policy, do_not_enforce_on_create: (.do_not_enforce_on_create // false), required_status_checks: (.required_status_checks | map({context} + (if .integration_id then {integration_id} else {} end)) | sort_by(.context))})}
             elif .type == "update" then {type, parameters: {update_allows_fetch_and_merge: (.parameters.update_allows_fetch_and_merge // false)}}
             else {type} end) | sort_by(.type))}'
 }
 
-section "d) Rulesets"
+# ------------------------------------------------------------ d) probe ----
+# The Reviewer App posts a neutral review/independent check on each repo's test
+# head, so the check context has been seen from that App before a ruleset pins
+# it — and so a missing installation is found now, not by the first blocked PR.
+section "d) Reviewer App probe"
+if (( PROBE )); then
+  if [[ -z "$REVIEWER_APP_ID" ]]; then
+    warn "no Reviewer App id; nothing to probe."
+  else
+    for repo in ${REPOS[@]+"${REPOS[@]}"} "$SELF_REPO"; do
+      fetch "repos/$ORG/$repo/branches/test" || { warn "$repo has no test branch; not probed."; continue; }
+      head_sha="$(jq -r .commit.sha <<<"$BODY")"
+      jq -n --arg sha "$head_sha" '{name: "review/independent", head_sha: $sha, status: "completed",
+        conclusion: "neutral", output: {title: "Probe: the Reviewer App can post here",
+        summary: "Posted by governance/bootstrap.sh --probe before the rulesets pin review/independent to this App. It reviews nothing."}}' \
+        >"$WORK/probe-$repo.json"
+      PLANNED=$((PLANNED + 1))
+      if [[ $APPLY -eq 1 ]]; then
+        printf '   APPLY: as the Reviewer App: POST repos/%s/%s/check-runs on test %s\n' "$ORG" "$repo" "${head_sha:0:12}"
+        reviewer_token="$("$SCRIPT_DIR/identity/app-token.sh" mm-reviewer)"
+        GH_TOKEN="$reviewer_token" gh api -X POST "repos/$ORG/$repo/check-runs" --input "$WORK/probe-$repo.json" \
+          --jq '"   posted by app \(.app.id) (\(.app.slug))"' \
+          || { echo "FAILED: probe on $repo — payload: $WORK/probe-$repo.json" >&2; exit 1; }
+      else
+        printf '   DRY-RUN would post, as the Reviewer App (%s): review/independent=neutral on %s test %s\n' "$REVIEWER_APP_ID" "$repo" "${head_sha:0:12}"
+      fi
+    done
+  fi
+else
+  info "skipped (pass --probe)"
+fi
+
+# --------------------------------------------------------- e) rulesets ----
+section "e) Rulesets"
 # --no-rulesets: stage an adoption. Rulesets require checks that only exist once
 # the repository's adoption PR has merged; applying them first blocks every PR,
 # including that one.
-if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=("${REPOS[@]}"); fi
-for repo in "${RULESET_REPOS[@]}"; do
+if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=(${REPOS[@]+"${REPOS[@]}"} "$SELF_REPO"); fi
+OURS=" test-integration main-owner-only main-checks "
+for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
   info "[$repo]"
   existing="$(get_all "repos/$ORG/$repo/rulesets?includes_parents=true&per_page=100")"
   info "Existing rulesets (as they are now):"
   if [[ "$(jq length <<<"$existing")" -eq 0 ]]; then
     info "  none"
   fi
+  : >"$WORK/legacy-$repo"
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     fetch "repos/$ORG/$repo/rulesets/$id"
     detail="$BODY"
     jq '{id, name, source_type, enforcement, conditions, bypass_actors, rules}' <<<"$detail" | sed 's/^/      /'
     rs_name="$(jq -r .name <<<"$detail")"
-    if [[ "$rs_name" != "test-integration" && "$rs_name" != "main-owner-only" && "$rs_name" != "main-checks" ]] && jq -e '.bypass_actors | length > 0' <<<"$detail" >/dev/null; then
-      warn "ruleset '$rs_name' has bypass actors. Rulesets layer, so it cannot weaken the ones below, but it is not the standard; retire it deliberately."
+    case "$OURS" in *" $rs_name "*) continue ;; esac
+    # A repository ruleset of ours-to-replace: active on test or main.
+    if jq -e '.source_type == "Repository" and .enforcement != "disabled"
+        and ([.conditions.ref_name.include[]?] | any(. == "refs/heads/test" or . == "refs/heads/main" or . == "~DEFAULT_BRANCH" or . == "~ALL"))' \
+        <<<"$detail" >/dev/null; then
+      printf '%s\t%s\n' "$id" "$rs_name" >>"$WORK/legacy-$repo"
     fi
   done < <(jq -r '.[].id' <<<"$existing")
 
-  cfg="$WORK/cfg/$repo"
-  test_ruleset "$(required_checks_json review "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
+  if [[ "$repo" == "$SELF_REPO" ]]; then
+    # This repository runs no PR governance on itself; its own tests are the check.
+    printf '%s\n' "$SELF_CHECKS" >"$WORK/self-checks.txt"
+    test_ruleset "$(required_checks_json review none "$WORK/self-checks.txt")" >"$WORK/rs-test-$repo.json"
+    main_checks_ruleset "$(required_checks_json none none "$WORK/self-checks.txt")" >"$WORK/rs-main-checks-$repo.json"
+  else
+    cfg="$WORK/cfg/$repo"
+    test_ruleset "$(required_checks_json review issue-link "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
+    main_checks_ruleset "$(required_checks_json none issue-link "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
+  fi
   main_owner_ruleset >"$WORK/rs-main-owner-$repo.json"
-  main_checks_ruleset "$(required_checks_json none "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
   if [[ -z "$REVIEWER_APP_ID" ]]; then
     warn "$repo test-integration: review/independent OMITTED (no Reviewer App id) — independent review is not enforced."
   fi
@@ -467,11 +571,20 @@ for repo in "${RULESET_REPOS[@]}"; do
       fi
     fi
   done
+
+  # Only after ours exist: legacy rulesets on test or main are disabled, never
+  # deleted, so their history and settings stay readable.
+  while IFS="$(printf '\t')" read -r id rs_name; do
+    [[ -n "$id" ]] || continue
+    warn "legacy ruleset '$rs_name' (id $id) on test/main: set to enforcement disabled (not deleted)."
+    printf '{"enforcement":"disabled"}\n' >"$WORK/disable-$repo-$id.json"
+    mutate_json PUT "repos/$ORG/$repo/rulesets/$id" "$WORK/disable-$repo-$id.json"
+  done <"$WORK/legacy-$repo"
 done
 
-# --------------------------------------------------------- e) project ----
+# --------------------------------------------------------- f) project ----
 if [[ $WANT_PROJECT -eq 1 ]]; then
-  section "e) Project \"$PROJECT_TITLE\""
+  section "f) Project \"$PROJECT_TITLE\""
   projects="$(gh project list --owner "$ORG" --limit 200 --format json)"
   number="$(jq -r --arg t "$PROJECT_TITLE" '[.projects[] | select(.title == $t and (.closed | not))] | first | .number // empty' <<<"$projects")"
   created=0
@@ -532,7 +645,7 @@ if [[ $WANT_PROJECT -eq 1 ]]; then
 
     # shellcheck disable=SC2016  # GraphQL variables, not shell
     linked="$(gh api graphql -f query='query($o:String!,$n:Int!){organization(login:$o){projectV2(number:$n){repositories(first:100){nodes{name}}}}}' -f o="$ORG" -F n="$number" --jq '[.data.organization.projectV2.repositories.nodes[].name]')"
-    for repo in "${REPOS[@]}"; do
+    for repo in ${REPOS[@]+"${REPOS[@]}"}; do
       if jq -e --arg r "$repo" 'index($r) != null' <<<"$linked" >/dev/null; then
         info "$repo: linked"
       else
@@ -541,11 +654,11 @@ if [[ $WANT_PROJECT -eq 1 ]]; then
     done
   else
     info "Fields: Status ($STATUS_OPTIONS), Priority (P0,P1,P2), Size (S,M,L) would be set on the new project."
-    for repo in "${REPOS[@]}"; do
+    for repo in ${REPOS[@]+"${REPOS[@]}"}; do
       info "DRY-RUN would run: gh project link <new> --owner $ORG --repo $ORG/$repo"
     done
   fi
-  info "Views (Frontier, By milestone, By Epic, In flight, Decisions) have no API; create them in the Project UI."
+  info "Views (Frontier, By milestone, By Epic, In flight, Decisions) are not managed here: POST orgs/$ORG/projectsV2/<n>/views creates them once."
 fi
 
 section "Summary"
