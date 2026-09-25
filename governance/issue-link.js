@@ -4,10 +4,20 @@
 // (DELIVERY §9: "One Task, one PR — the PR body says `Closes #n`").
 //
 // One file, two callers: `.github/workflows/pr-governance.yml` requires it
-// through actions/github-script, and `governance/tests/issue-link.test.js`
-// feeds it sample bodies. Nothing here touches the network; the one question
-// that needs the API (is the linked issue a Bug?) is asked by the workflow,
-// using `isBug` below on the issue it fetched.
+// through actions/github-script and calls `judge`, and
+// `governance/tests/issue-link.test.js` drives both the text matcher and
+// `judge` (with a fake API client).
+//
+// Two layers, deliberately:
+//   - `evaluate`: the regex. Fast, offline, and the only thing a local test
+//     can run. It is NOT the authority for pull requests into the default
+//     branch.
+//   - `judge`: what the check publishes. For a pull request into the default
+//     branch it asks GitHub itself (GraphQL `closingIssuesReferences`) — the
+//     same parser that will close the issue on merge — so a reference the
+//     regex accepts but GitHub does not (a pull request number, an issue that
+//     does not exist, a repository it cannot see) fails here instead of
+//     merging and closing nothing.
 
 // GitHub's closing keywords, case-insensitive. Nothing else closes an issue.
 const KEYWORD = '(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)';
@@ -120,7 +130,84 @@ function isBug(issue) {
   return Boolean(issue && !issue.pull_request && issue.type && issue.type.name === 'Bug');
 }
 
-module.exports = { CLOSING_REF, stripNonProse, findClosingRefs, isReleasePullRequest, isHotfix, evaluate, isBug };
+const CLOSING_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      closingIssuesReferences(first: 50) {
+        totalCount
+        nodes { number repository { nameWithOwner } }
+      }
+    }
+  }
+}`;
+
+// The verdict the `governance/issue-link` check publishes.
+//   github:  an Octokit client (actions/github-script's `github`)
+//   context: the Actions context of a pull_request event
+// Returns { ok, title, summary, headSha }.
+async function judge({ github, context }) {
+  const { owner, repo } = context.repo;
+  const repository = `${owner}/${repo}`;
+  const number = context.payload.pull_request.number;
+  // Read the pull request NOW, not from the event payload: the body may have
+  // been edited, or the head pushed, since the event that started this run.
+  const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+  const headSha = pr.head.sha;
+  const done = (ok, title, summary) => ({ ok, title: title.slice(0, 255), summary, headSha });
+
+  const verdict = evaluate({ body: pr.body || '', headRef: pr.head.ref, baseRef: pr.base.ref, repository });
+  if (verdict.status === 'exempt') return done(true, 'Release pull request: exempt', verdict.message);
+  if (verdict.status === 'fail') return done(false, 'No closing issue link', verdict.message);
+
+  // A pull request cannot close itself.
+  const isSelf = (r) => `${r.owner}/${r.repo}`.toLowerCase() === repository.toLowerCase() && r.number === number;
+  const refs = verdict.refs.filter((r) => !isSelf(r));
+  if (refs.length === 0) {
+    return done(false, 'The pull request only references itself',
+      `#${number} is this pull request. Close the Task or Bug it delivers instead.`);
+  }
+
+  const lines = [];
+  const { data: repoData } = await github.rest.repos.get({ owner, repo });
+  if (pr.base.ref === repoData.default_branch) {
+    // GitHub's own parsing is the authority: it is what closes the issue.
+    const result = await github.graphql(CLOSING_QUERY, { owner, repo, number });
+    const closing = result.repository.pullRequest.closingIssuesReferences;
+    if (!closing || closing.totalCount === 0) {
+      return done(false, 'GitHub sees no issue this pull request closes',
+        `The body mentions ${refs.map((r) => r.key).join(', ')}, but GitHub links no issue to close on merge. ` +
+        'Check the number is an issue (not a pull request), that it exists, and that the keyword and reference are written as in the template.');
+    }
+    lines.push(`GitHub will close: ${closing.nodes.map((n) => `${n.repository.nameWithOwner}#${n.number}`).join(', ') || `${closing.totalCount} issue(s)`}`);
+  } else {
+    lines.push(`Closes ${refs.map((r) => r.key).join(', ')} (base ${pr.base.ref} is not the default branch, so GitHub will not close it on merge)`);
+  }
+
+  if (verdict.requireBug) {
+    // Only issues in this repository: the workflow token can read nothing else,
+    // and a hotfix's Bug belongs where the fix lands.
+    const local = refs.filter((r) => `${r.owner}/${r.repo}`.toLowerCase() === repository.toLowerCase());
+    const notes = [];
+    let bug = null;
+    for (const r of local) {
+      try {
+        const { data } = await github.rest.issues.get({ owner, repo, issue_number: r.number });
+        if (isBug(data)) { bug = r; break; }
+        notes.push(`${r.key} is ${data.pull_request ? 'a pull request' : `of type ${data.type ? data.type.name : 'none'}`}`);
+      } catch (error) {
+        notes.push(`${r.key} could not be read (HTTP ${error.status || '?'})`);
+      }
+    }
+    if (!bug) {
+      return done(false, 'A hotfix must close a Bug in this repository',
+        `A hotfix/* pull request must close an issue of type Bug in ${repository}. ${notes.join('; ') || 'No reference to this repository.'}`);
+    }
+    lines.push(`Hotfix closes Bug ${bug.key}`);
+  }
+  return done(true, lines[0], lines.join('\n'));
+}
+
+module.exports = { CLOSING_REF, CLOSING_QUERY, stripNonProse, findClosingRefs, isReleasePullRequest, isHotfix, evaluate, isBug, judge };
 
 // CLI, for local use:  node governance/issue-link.js --head <ref> --base <ref> --repo owner/repo < body.md
 if (require.main === module) {

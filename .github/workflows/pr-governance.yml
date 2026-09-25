@@ -1,36 +1,39 @@
-# governance/issue-link — DELIVERY §9: one Task, one pull request, and the pull
-# request body says which issue it closes.
+# PR governance — DELIVERY §9 and §6. Called from each adopted repository.
 #
-# Called from each adopted repository (see README, "PR governance"). It
-# publishes a check run named exactly `governance/issue-link` through the
-# Checks API, because a reusable workflow's own job appears as
-# "<caller job> / <this job>" and a ruleset cannot require a name that varies
-# with the caller. A check run can only be created by a GitHub App — here the
-# Actions app, through GITHUB_TOKEN — so a personal token cannot forge it, and
-# rulesets pin the context to that app.
+#   issue-link  publishes a check run named exactly `governance/issue-link`:
+#               the pull request closes an issue. For a pull request into the
+#               default branch the authority is GitHub's own parsing (GraphQL
+#               closingIssuesReferences), the same parser that closes the issue
+#               on merge; the regex in governance/issue-link.js is only the
+#               fast offline layer. Release pull requests (test -> main) are
+#               exempt; hotfix/* must close a Bug in the same repository.
+#   areas       proves .github/governance/areas.txt still gives every tracked
+#               file exactly one area.
 #
-# The matching logic lives in governance/issue-link.js, shared with
-# governance/tests/issue-link.test.js. No third-party actions.
+# The check run is created through the Checks API because a reusable
+# workflow's own job is named "<caller job> / <this job>", which a ruleset
+# cannot require, and only an App can create a check run — here the Actions
+# app, which the rulesets pin the context to.
 #
-# A second job, `areas`, proves the calling repository's
-# .github/governance/areas.txt still gives every tracked file exactly one area
-# (DELIVERY §6), using governance/areas-check.js from this repository.
+# CALLERS PIN THIS FILE BY COMMIT SHA and pass the same SHA as
+# governance-ref, so the code that judges a pull request is a reviewed commit
+# of this repository, never whatever `test` holds at the time. Actions are
+# pinned by SHA for the same reason. No third-party actions.
 name: PR governance
 
 on:
   workflow_call:
     inputs:
       runs-on:
-        description: >-
-          Runner for the job, as JSON: '"ubuntu-latest"' or '["self-hosted","pool-linux"]'.
-          Required, because a check a ruleset requires must land on a runner that exists.
+        description: Runner for the jobs, as JSON (a label string or a list of labels).
         type: string
         required: true
       governance-ref:
-        description: Ref of marvinamiranda/.github whose governance/*.js is used.
+        description: >-
+          Commit SHA of marvinamiranda/.github whose governance/*.js is used —
+          the same SHA the caller pins this workflow to.
         type: string
-        required: false
-        default: test
+        required: true
 
 jobs:
   issue-link:
@@ -42,9 +45,10 @@ jobs:
       checks: write
       contents: read
       issues: read
+      pull-requests: read
     steps:
       - name: Fetch the shared matcher
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: marvinamiranda/.github
           ref: ${{ inputs.governance-ref }}
@@ -53,55 +57,23 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Judge the pull request body
-        uses: actions/github-script@v7
+      - name: Judge the pull request
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const lib = require('./.org-governance/governance/issue-link.js');
-            const pr = context.payload.pull_request;
-            const repository = `${context.repo.owner}/${context.repo.repo}`;
-            let verdict = lib.evaluate({
-              body: pr.body || '',
-              headRef: pr.head.ref,
-              baseRef: pr.base.ref,
-              repository,
-            });
-
-            // hotfix/* must close a Bug. Only the API knows an issue's type.
-            if (verdict.status === 'pass' && verdict.requireBug) {
-              const notes = [];
-              let bug = null;
-              for (const ref of verdict.refs) {
-                try {
-                  const { data } = await github.rest.issues.get({
-                    owner: ref.owner, repo: ref.repo, issue_number: ref.number,
-                  });
-                  if (lib.isBug(data)) { bug = ref; break; }
-                  notes.push(`${ref.key} is ${data.pull_request ? 'a pull request' : `of type ${data.type ? data.type.name : 'none'}`}`);
-                } catch (error) {
-                  notes.push(`${ref.key} could not be read (HTTP ${error.status || '?'}); link a Bug in this repository`);
-                }
-              }
-              verdict = bug
-                ? { ...verdict, message: `Hotfix closes Bug ${bug.key}` }
-                : { ...verdict, status: 'fail', message: `A hotfix/* pull request must close a Bug. ${notes.join('; ')}.` };
-            }
-
-            const ok = verdict.status !== 'fail';
-            const title = verdict.status === 'exempt'
-              ? 'Release pull request: exempt'
-              : ok ? verdict.message : 'No closing issue link';
+            const v = await lib.judge({ github, context });
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               name: 'governance/issue-link',
-              head_sha: pr.head.sha,
+              head_sha: v.headSha,
               status: 'completed',
-              conclusion: ok ? 'success' : 'failure',
-              output: { title: title.slice(0, 255), summary: verdict.message },
+              conclusion: v.ok ? 'success' : 'failure',
+              output: { title: v.title, summary: v.summary },
             });
-            core.summary.addHeading('governance/issue-link').addRaw(verdict.message).write();
-            if (!ok) core.setFailed(verdict.message);
+            core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
+            if (!v.ok) core.setFailed(v.summary);
 
   areas:
     name: areas
@@ -112,16 +84,16 @@ jobs:
       contents: read
     steps:
       # pull_request: the merge of the head into the base, which is what will
-      # land. Under pull_request_target this is the base; the check then proves
-      # the base, which is harmless and never executes pull request code.
+      # land — so a pull request that adds a path and its areas.txt rule in the
+      # same change passes. Under pull_request_target this is the base.
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: product
           persist-credentials: false
 
       - name: Fetch the shared checker
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: marvinamiranda/.github
           ref: ${{ inputs.governance-ref }}
@@ -131,10 +103,10 @@ jobs:
           persist-credentials: false
 
       - name: Every tracked file has exactly one area
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const { checkAreas } = require('./.org-governance/governance/areas-check.js');
             const { ok, report } = checkAreas({ checkout: 'product', ref: 'HEAD' });
             console.log(report);
-            if (!ok) core.setFailed('areas.txt no longer partitions this repository; see the log above.');
+            if (!ok) core.setFailed('areas.txt no longer gives every tracked file exactly one area. Add or fix the rule in .github/governance/areas.txt in this same pull request.');

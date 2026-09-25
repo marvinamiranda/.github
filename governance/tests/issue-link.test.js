@@ -15,7 +15,7 @@ const fs = require('fs');
 const modulePath = process.env.ISSUE_LINK_MODULE
   ? path.resolve(process.env.ISSUE_LINK_MODULE)
   : path.join(__dirname, '..', 'issue-link.js');
-const { evaluate, isBug } = require(modulePath);
+const { evaluate, isBug, judge } = require(modulePath);
 
 const REPO = 'marvinamiranda/omni237';
 const template = fs.readFileSync(path.join(__dirname, '..', '..', '.github', 'pull_request_template.md'), 'utf8');
@@ -104,6 +104,66 @@ for (const [name, issue, expected] of bugCases) {
   }
 }
 
-const total = cases.length + bugCases.length;
-console.log(`\n${total - failed}/${total} passed`);
-process.exit(failed ? 1 : 0);
+// judge: the published verdict, against a fake API client.
+function fakeGitHub({ body, head = '742-supplier-list', base = 'test', number = 761, defaultBranch = 'test',
+  closing = [], issues = {} }) {
+  const calls = [];
+  return {
+    calls,
+    rest: {
+      pulls: { get: async (a) => { calls.push(['pulls.get', a.pull_number]);
+        return { data: { number, body, head: { ref: head, sha: 'a'.repeat(40) }, base: { ref: base } } }; } },
+      repos: { get: async () => { calls.push(['repos.get']); return { data: { default_branch: defaultBranch } }; } },
+      issues: { get: async (a) => { calls.push(['issues.get', a.owner, a.repo, a.issue_number]);
+        const issue = issues[a.issue_number];
+        if (!issue) { const e = new Error('Not Found'); e.status = 404; throw e; }
+        return { data: issue }; } },
+    },
+    graphql: async (query, vars) => { calls.push(['graphql', vars.number]);
+      return { repository: { pullRequest: { closingIssuesReferences: {
+        totalCount: closing.length,
+        nodes: closing.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }; },
+  };
+}
+const ctx = (number = 761) => ({ repo: { owner: 'marvinamiranda', repo: 'omni237' }, payload: { pull_request: { number, body: 'STALE' } } });
+
+// [name, fake options, expected ok, extra assertion(verdict, gh) -> problem string or '']
+const judgeCases = [
+  ['default branch: GitHub confirms the link', { body: 'Closes #742', closing: [742] }, true,
+    (v, gh) => (gh.calls.some((c) => c[0] === 'graphql') ? '' : 'did not ask GitHub')],
+  ['default branch: regex matches but GitHub sees nothing (e.g. a PR number)', { body: 'Closes #740', closing: [] }, false, () => ''],
+  ['the body is read at run time, not from the event payload', { body: 'Closes #742', closing: [742] }, true,
+    (v, gh) => (gh.calls[0][0] === 'pulls.get' ? '' : 'payload body used')],
+  ['a pull request cannot close itself', { body: 'Closes #761', closing: [] }, false,
+    (v, gh) => (/itself/.test(v.title) && !gh.calls.some((c) => c[0] === 'graphql') ? '' : v.title)],
+  ['own number alongside a real issue passes on the real one', { body: 'Closes #761\nCloses #742', closing: [742] }, true, () => ''],
+  ['no link fails before any GraphQL', { body: 'nothing', closing: [742] }, false,
+    (v, gh) => (gh.calls.some((c) => c[0] === 'graphql') ? 'asked GitHub needlessly' : '')],
+  ['release test -> main is exempt', { body: '', head: 'test', base: 'main' }, true, () => ''],
+  ['non-default base uses the regex (GitHub would not close anyway)', { body: 'Closes #5', base: 'main', head: 'x' }, true,
+    (v, gh) => (gh.calls.some((c) => c[0] === 'graphql') ? 'asked GitHub on a non-default base' : '')],
+  ['hotfix closes a Bug in this repo', { body: 'Fixes #901', head: 'hotfix/till', base: 'main', issues: { 901: { type: { name: 'Bug' } } } }, true, () => ''],
+  ['hotfix: a Task is not a Bug', { body: 'Fixes #902', head: 'hotfix/till', base: 'main', issues: { 902: { type: { name: 'Task' } } } }, false, () => ''],
+  ['hotfix: a pull request typed Bug is not an issue', { body: 'Fixes #903', head: 'hotfix/till', base: 'main', issues: { 903: { type: { name: 'Bug' }, pull_request: {} } } }, false, () => ''],
+  ['hotfix: a Bug in another repository is never looked up', { body: 'Fixes marvinamiranda/sm360#9', head: 'hotfix/till', base: 'main' }, false,
+    (v, gh) => (gh.calls.some((c) => c[0] === 'issues.get') ? 'looked outside the repository' : '')],
+];
+
+(async () => {
+  for (const [name, opts, expectedOk, extra] of judgeCases) {
+    const gh = fakeGitHub(opts);
+    let problem = '';
+    try {
+      const v = await judge({ github: gh, context: ctx(opts.number) });
+      if (v.ok !== expectedOk) problem = `ok ${v.ok}, expected ${expectedOk} (${v.title})`;
+      else if (v.headSha !== 'a'.repeat(40)) problem = 'check not attached to the current head';
+      else problem = extra(v, gh);
+    } catch (e) {
+      problem = `threw ${e.message}`;
+    }
+    if (problem) { failed += 1; console.log(`not ok - judge ${name}: ${problem}`); } else console.log(`ok - judge ${name}`);
+  }
+  const total = cases.length + bugCases.length + judgeCases.length;
+  console.log(`\n${total - failed}/${total} passed`);
+  process.exit(failed ? 1 : 0);
+})();
