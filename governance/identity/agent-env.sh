@@ -5,68 +5,202 @@
 #   eval "$(governance/identity/agent-env.sh mm-agent)"      # a builder's shell
 #   eval "$(governance/identity/agent-env.sh mm-reviewer)"   # a reviewer's shell
 #
-# Everything it sets is exported, so every child process inherits it. An agent
-# CLI that starts a fresh shell for each tool call (Claude Code does) needs the
-# eval in every call, or must be started from a shell that has run it.
+# CLAUDE CODE AND CODEX: THE EVAL MUST OPEN EVERY TOOL COMMAND, as in
 #
-# What it sets, and why:
-#   PATH            the identity's gh first: ~/.config/mm-agent/<name>/bin/gh,
-#                   a launcher for gh-shim.sh. Every gh call, in this shell or
-#                   any child, gets a token minted for it, and fails rather
-#                   than fall back when none can be minted. It refuses
-#                   `gh auth` (bar a plain `gh auth status`), so no command
-#                   hands out a raw token.
-#   GH_TOKEN, GITHUB_TOKEN, GH_PACKAGES_TOKEN
-#                   unset. Nothing here exports a token, and one inherited from
-#                   the owner's shell must not survive the eval.
-#   GH_CONFIG_DIR   an EMPTY directory of this identity's, so the real gh, run
-#                   by its absolute path, finds no stored login.
+#   eval "$(<checkout>/governance/identity/agent-env.sh mm-agent)" && gh pr create ...
+#
+# Both rebuild each tool command's shell from a snapshot they took when the
+# session began, and a snapshot taken from the owner's environment carries it:
+# Claude Code's re-applies the PATH it captured, which puts the real gh first;
+# Codex's re-exports every variable it captured, which on the owner's machine
+# includes their gh login token as GH_PACKAGES_TOKEN (from ~/.zshrc). That is
+# the residual: a tool command that does not open with the eval runs as its
+# snapshot has it, and the snapshot files keep whatever was exported when they
+# were taken.
+#
+# Everything it prints is exported, so whatever a command starts inherits it:
+# scripts, `bash -c`, and zsh, login or interactive. It sets:
+#   PATH            the identity's gh first: ~/.config/mm-agent/<name>/shim/
+#                   <commit>/bin/gh, a launcher for COPIES of gh-shim.sh and
+#                   app-token.sh taken from this checkout's HEAD commit (below).
+#                   Every gh call gets a token minted for it, and fails rather
+#                   than fall back when none can be minted. The shim refuses
+#                   `gh auth` (bar a plain `gh auth status`) and any flag ahead
+#                   of the command, so no command hands out a raw token.
+#   ZDOTDIR         zsh startup files of the identity's that source the owner's
+#                   own (~/.zshenv, ~/.zprofile, ~/.zshrc, ~/.zlogin), then put
+#                   the shim first again and these variables back. The owner's
+#                   ~/.zprofile runs `brew shellenv`, which would otherwise put
+#                   the real gh first in every login zsh. The owner's files are
+#                   read, never edited.
+#   GH_TOKEN        a sentinel, not a token; the shim replaces it on every call.
+#                   A real gh reached some other way, such as a PATH that puts
+#                   it first, answers `gh auth token` with the sentinel instead
+#                   of the keyring login, and GitHub refuses the sentinel.
+#   GITHUB_TOKEN    unset: nothing inherited from the owner's shell survives.
+#   GH_PACKAGES_TOKEN  read from ~/.config/mm-agent/packages-token, which the
+#                   owner creates (a classic token, read:packages only, mode
+#                   0600), because GitHub Packages takes no App token. Unset,
+#                   with a one-line hint, when that file is missing, open to
+#                   anyone else, or holds anything but one classic token.
+#   GH_CONFIG_DIR   an EMPTY directory of this identity's, so the real gh finds
+#                   no stored login.
 #   git identity    author and committer are the App's bot user.
 #   git credentials for github.com: the helper list is reset, then one helper
 #                   mints a token for each operation, and tells git to stop
 #                   (quit=true) instead of trying another credential or
 #                   prompting when it cannot.
 #
+# The copies are what every gh and git call of the session runs, so they come
+# from a commit, never a working tree: it refuses a checkout whose three
+# identity scripts differ from its HEAD commit (a change hidden from
+# `git status` included), and warns when that commit is not on
+# marvinamiranda/.github test. Each commit gets its own directory, so a session
+# keeps its shim when the checkout changes or goes away, and sessions evaluated
+# from different commits never swap shims under each other.
+#
 # If anything fails, it prints an environment with NO GitHub identity rather
-# than nothing, since `eval ""` would leave the shell on the owner's login:
-# tokens unset, a gh that refuses everything, git told to quit, no commit
-# identity, and a status that makes the eval fail.
+# than nothing, since `eval ""` would leave the shell on the owner's login: the
+# sentinel, a gh that refuses everything (kept first in zsh the same way), git
+# told to quit, no commit identity, and a status that makes the eval fail.
 #
 # This is a strong default, not a sandbox. Agents run on the owner's machine,
 # under the owner's user, and the owner's keyring login is one absolute path
-# away (`/opt/homebrew/bin/gh auth token`). The rulesets are the backstop
-# (DELIVERY §9).
+# away (`/opt/homebrew/bin/gh auth token --user <owner>`). The rulesets are the
+# backstop (DELIVERY §9).
 set -euo pipefail
 
 ROOT="$HOME/.config/mm-agent"
 LOCK="$ROOT/locked"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_URL="https://github.com/marvinamiranda/.github.git"
+SENTINEL="mm-agent-sentinel-not-a-token"
+PACKAGES_TOKEN="$ROOT/packages-token"
 q() { printf '%q' "$1"; }
 
-# PATH without any directory of ours (a previous eval's shim), so evals do not
-# stack, and the gh found here is the real one, never a shim.
-clean_path=""
-real_gh=""
-IFS=: read -r -a path_dirs <<<"$PATH"
-for d in ${path_dirs[@]+"${path_dirs[@]}"}; do
-  case "$d" in "$ROOT" | "$ROOT"/*) continue ;; esac
-  clean_path="${clean_path:+$clean_path:}$d"
-  if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then real_gh="$d/gh"; fi
-done
+# Replace $1 (mode $2) with stdin, by rename, so a shell or script that has the
+# old file open goes on reading the old one.
+install_file() {
+  local tmp
+  tmp="$(mktemp "$(dirname "$1")/.new.XXXXXX")" || return 1
+  if cat >"$tmp" && chmod "$2" "$tmp" && mv -f "$tmp" "$1"; then return 0; fi
+  rm -f "$tmp"
+  return 1
+}
+
+# The variables every environment here sets alike, one command per line, valid
+# in bash and zsh: $1 GH_CONFIG_DIR, $2 ZDOTDIR, $3 git author, $4 git email,
+# $5 the github.com credential helper.
+body_lines() {
+  printf 'export GH_TOKEN=%s\n' "$(q "$SENTINEL")"
+  printf 'unset GITHUB_TOKEN\n'
+  printf 'export GH_CONFIG_DIR=%s\n' "$(q "$1")"
+  printf 'export ZDOTDIR=%s\n' "$(q "$2")"
+  printf 'export GIT_AUTHOR_NAME=%s GIT_COMMITTER_NAME=%s\n' "$(q "$3")" "$(q "$3")"
+  printf 'export GIT_AUTHOR_EMAIL=%s GIT_COMMITTER_EMAIL=%s\n' "$(q "$4")" "$(q "$4")"
+  printf 'export GIT_CONFIG_COUNT=2\n'
+  printf 'export GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0=\n'
+  printf 'export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1=%s\n' "$(q "$5")"
+}
+
+# reassert.zsh: run after each of the owner's startup files. $1 the directory
+# whose gh must come first, $2 the body_lines.
+reassert_zsh() {
+  cat <<EOF
+# Written by agent-env.sh, which rewrites it when what it holds changes. The
+# startup files beside it source this after each of the owner's: whatever
+# those did, this gh comes first on PATH, no alias or function shadows it, and
+# the variables are the eval's again. GH_PACKAGES_TOKEN goes back to the value
+# zsh inherited.
+() {
+  emulate -L zsh
+  local d
+  local -a keep
+  for d in \$path; do
+    [[ \$d == $(q "$ROOT") || \$d == $(q "$ROOT")/* ]] || keep+=("\$d")
+  done
+  path=($(q "$1") \$keep)
+  hash -r
+  unalias gh 2>/dev/null || true
+  unfunction gh 2>/dev/null || true
+  if [[ -n \${_mm_agent_pkg_set-} ]]; then
+    export GH_PACKAGES_TOKEN=\${_mm_agent_pkg-}
+  else
+    unset GH_PACKAGES_TOKEN
+  fi
+$2
+}
+EOF
+}
+
+# One zsh startup file ($1, e.g. .zprofile) for ZDOTDIR $2: it runs the owner's
+# file of that name, with ZDOTDIR set to the owner's directory while it does,
+# then reassert.zsh. The owner's directory is MM_AGENT_OWNER_ZDOTDIR, or HOME;
+# never one of ours, which would recurse.
+startup_zsh() {
+  local name="$1" dir="$2"
+  cat <<EOF
+# Written by agent-env.sh, which rewrites it when what it holds changes. zsh
+# reads this instead of the owner's $name because agent-env.sh exported
+# ZDOTDIR: it runs theirs, then puts the agent environment back.
+EOF
+  if [[ "$name" == .zshenv ]]; then
+    cat <<'EOF'
+typeset -g _mm_agent_owner="${MM_AGENT_OWNER_ZDOTDIR:-$HOME}"
+typeset -g _mm_agent_pkg_set="${GH_PACKAGES_TOKEN+1}" _mm_agent_pkg="${GH_PACKAGES_TOKEN-}"
+EOF
+  fi
+  if [[ "$name" == .zshrc ]]; then
+    # macOS /etc/zshrc, read just before this, puts the history in ZDOTDIR.
+    cat <<EOF
+if [[ "\${HISTFILE-}" == $(q "$dir")/.zsh_history ]]; then HISTFILE="\${_mm_agent_owner:-\$HOME}/.zsh_history"; fi
+EOF
+  fi
+  cat <<EOF
+if [[ "\${_mm_agent_owner:-\$HOME}" != $(q "$ROOT") && "\${_mm_agent_owner:-\$HOME}" != $(q "$ROOT")/* \\
+    && -r "\${_mm_agent_owner:-\$HOME}/$name" ]]; then
+  ZDOTDIR="\${_mm_agent_owner:-\$HOME}"
+  source "\$ZDOTDIR/$name"
+EOF
+  if [[ "$name" == .zshenv ]]; then
+    cat <<'EOF'
+  _mm_agent_owner="${ZDOTDIR:-$HOME}"  # their .zshenv may have moved their ZDOTDIR
+EOF
+  fi
+  printf '  ZDOTDIR=%s\nfi\n' "$(q "$dir")"
+  if [[ "$name" != .zlogout ]]; then printf 'source %s\n' "$(q "$dir/reassert.zsh")"; fi
+}
+
+# The ZDOTDIR directory $1, whose startup files keep the gh in $2 first and set
+# the body_lines $3.
+write_zdotdir() {
+  local f
+  { mkdir -p "$1" && chmod 700 "$1"; } || return 1
+  reassert_zsh "$2" "$3" | install_file "$1/reassert.zsh" 600 || return 1
+  for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
+    startup_zsh "$f" "$1" | install_file "$1/$f" 600 || return 1
+  done
+}
+
+# with_timeout <seconds> <command...>: perl's alarm survives its exec, so a hung
+# network call ends instead of hanging every tool command.
+with_timeout() {
+  local s="$1"
+  shift
+  if command -v perl >/dev/null 2>&1; then perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$s" "$@"; else "$@"; fi
+}
 
 PRINTED=0
 locked() {
   PRINTED=1
+  local lock_body
   mkdir -p "$LOCK/bin" "$LOCK/gh" 2>/dev/null || true
   chmod 700 "$ROOT" "$LOCK" "$LOCK/gh" 2>/dev/null || true
-  local tmp
-  if tmp="$(mktemp "$LOCK/bin/.gh.XXXXXX" 2>/dev/null)"; then
-    if ! { { printf '#!/bin/sh\n'
-             printf 'echo "gh: refused: this shell has no GitHub identity, because governance/identity/agent-env.sh failed. Fix what it said, then eval it again." >&2\n'
-             printf 'exit 1\n'; } >"$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$LOCK/bin/gh"; }; then
-      rm -f "$tmp"
-    fi
-  fi
+  { printf '#!/bin/sh\n'
+    printf 'echo "gh: refused: this shell has no GitHub identity, because governance/identity/agent-env.sh failed. Fix what it said, then eval it again." >&2\n'
+    printf 'exit 1\n'; } | install_file "$LOCK/bin/gh" 755 2>/dev/null || true
+  lock_body="$(body_lines "$LOCK/gh" "$LOCK/zdotdir" "" "" '!f(){ echo quit=true; }; f')"
+  write_zdotdir "$LOCK/zdotdir" "$LOCK/bin" "$lock_body" 2>/dev/null || true
   # `function gh`, not `gh()`: zsh parses the whole eval before running any
   # of it, and with an alias named gh, `gh() {` is a parse error that throws
   # away every line here.
@@ -74,13 +208,10 @@ locked() {
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
 function gh { echo "gh: refused: this shell has no GitHub identity, because agent-env.sh failed." >&2; return 1; }
-export GH_CONFIG_DIR=$(q "$LOCK/gh")
+$lock_body
+export MM_AGENT_OWNER_ZDOTDIR=$(q "${owner_zdotdir-}")
 export PATH=$(q "$LOCK/bin${clean_path:+:$clean_path}")
 hash -r 2>/dev/null || true
-export GIT_AUTHOR_NAME= GIT_COMMITTER_NAME=
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0=
-export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1=$(q '!f(){ echo quit=true; }; f')
 echo $(q "agent-env.sh: $1") >&2
 echo 'agent-env.sh: this shell now has NO GitHub identity: gh, git pushes and commits refuse until agent-env.sh succeeds.' >&2
 false
@@ -94,31 +225,64 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# PATH without any directory of ours (a previous eval's shim), so evals do not
+# stack, and the gh found here is the real one, never a shim.
+clean_path=""
+real_gh=""
+IFS=: read -r -a path_dirs <<<"$PATH"
+for d in ${path_dirs[@]+"${path_dirs[@]}"}; do
+  case "$d" in "$ROOT" | "$ROOT"/*) continue ;; esac
+  clean_path="${clean_path:+$clean_path:}$d"
+  if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then real_gh="$d/gh"; fi
+done
+# The owner's ZDOTDIR (empty means their HOME), whose startup files ours
+# source. A ZDOTDIR of ours is a previous eval's, which recorded the owner's.
+case "${ZDOTDIR:-}" in
+  "$ROOT" | "$ROOT"/*) owner_zdotdir="${MM_AGENT_OWNER_ZDOTDIR:-}" ;;
+  *) owner_zdotdir="${ZDOTDIR:-}" ;;
+esac
+case "$owner_zdotdir" in "$ROOT" | "$ROOT"/*) owner_zdotdir="" ;; esac
+
 [[ $# -eq 1 ]] || locked "usage: agent-env.sh <mm-agent|mm-reviewer>"
 NAME="$1"
 case "$NAME" in mm-agent | mm-reviewer) ;; *) locked "unknown identity: $NAME (mm-agent or mm-reviewer)" ;; esac
 DIR="$ROOT/$NAME"
 APP_JSON="$DIR/app.json"
 GH_DIR="$DIR/gh"
-BIN="$DIR/bin"
-TOKEN_CMD="$HERE/app-token.sh"
 [[ -r "$APP_JSON" ]] || locked "missing $APP_JSON; run create-app.py $NAME first"
-[[ -x "$HERE/gh-shim.sh" && -x "$TOKEN_CMD" ]] || locked "gh-shim.sh or app-token.sh is missing beside $0"
+[[ -x "$HERE/gh-shim.sh" && -x "$HERE/app-token.sh" ]] || locked "gh-shim.sh or app-token.sh is missing beside $0"
 [[ -n "$real_gh" ]] || locked "no gh on PATH"
-if ! { mkdir -p "$GH_DIR" "$BIN" && chmod 700 "$ROOT" "$DIR" "$GH_DIR" "$BIN"; }; then
-  locked "cannot create $GH_DIR and $BIN"
+command -v git >/dev/null || locked "git is required"
+
+# The commit the copies come from. The three scripts here must be exactly its
+# blobs, compared by content, so a change hidden from `git status`
+# (update-index --assume-unchanged) is refused too.
+top="$(git -C "$HERE" rev-parse --show-prefix 'HEAD^{commit}' 2>/dev/null)" \
+  || locked "$HERE is not in a git checkout with a commit, so what it would install cannot be tied to one. Eval from a clone of marvinamiranda/.github."
+{ read -r prefix; read -r commit; } <<<"$top" || true
+[[ "${commit:-}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || locked "cannot read the commit of the checkout at $HERE"
+want="$(git -C "$HERE" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
+  || locked "agent-env.sh, gh-shim.sh and app-token.sh are not all in commit ${commit:0:12}. Eval from a clean checkout of a merged commit."
+have="$(git -C "$HERE" hash-object -- agent-env.sh gh-shim.sh app-token.sh)" || locked "cannot read the scripts in $HERE"
+[[ "$have" == "$want" ]] \
+  || locked "a script in $HERE differs from commit ${commit:0:12} (uncommitted changes, or ones hidden from git status). Commit or discard them, or eval from a clean checkout of a merged commit."
+{ read -r _env_blob && read -r shim_blob && read -r token_blob; } <<<"$want" || locked "cannot read the blobs of commit ${commit:0:12}"
+
+SHIM="$DIR/shim/$commit"
+BIN="$SHIM/bin"
+LIBEXEC="$SHIM/libexec"
+ZD="$SHIM/zdotdir"
+TOKEN_CMD="$LIBEXEC/app-token.sh"
+if ! { mkdir -p "$GH_DIR" "$BIN" "$LIBEXEC" && chmod 700 "$ROOT" "$DIR" "$DIR/shim" "$SHIM" "$GH_DIR" "$BIN" "$LIBEXEC"; }; then
+  locked "cannot create $GH_DIR and $SHIM"
 fi
 [[ ! -e "$GH_DIR/hosts.yml" ]] || locked "$GH_DIR/hosts.yml exists: this directory must hold no login. Remove it."
 
-# The launcher sits at a fixed path outside any checkout. If the checkout it
-# points into loses gh-shim.sh (an older commit checked out), exec fails: it
-# never falls through to the real gh.
-tmp="$(mktemp "$BIN/.gh.XXXXXX")" || locked "cannot write $BIN/gh"
-if ! { printf '#!/usr/bin/env bash\n# Written by %s; rewritten on every run.\nexec %s %s %s "$@"\n' \
-         "$(q "$HERE/agent-env.sh")" "$(q "$HERE/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")" >"$tmp" \
-       && chmod 700 "$tmp" && mv -f "$tmp" "$BIN/gh"; }; then
-  rm -f "$tmp"
-  locked "cannot write $BIN/gh"
+# The copies. A commit's are the same whichever checkout wrote them, so they
+# are written once, each whole before it is renamed into place.
+if [[ ! -x "$LIBEXEC/gh-shim.sh" || ! -x "$TOKEN_CMD" ]]; then
+  git -C "$HERE" cat-file blob "$shim_blob" | install_file "$LIBEXEC/gh-shim.sh" 700 || locked "cannot write $LIBEXEC/gh-shim.sh"
+  git -C "$HERE" cat-file blob "$token_blob" | install_file "$TOKEN_CMD" 700 || locked "cannot write $TOKEN_CMD"
 fi
 
 slug="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["slug"])' "$APP_JSON")" \
@@ -145,16 +309,109 @@ email="${bot_id}+${bot}@users.noreply.github.com"
 # shellcheck disable=SC2016  # git's shell expands these when it runs the helper
 helper='!f(){ test "$1" = get || exit 0; t=$('"$(q "$TOKEN_CMD") $(q "$NAME")"') || t=; case "$t" in ghs_?*) printf "username=x-access-token\npassword=%s\n" "$t";; *) echo quit=true;; esac; }; f'
 
+# GH_PACKAGES_TOKEN. GitHub Packages accepts only a classic personal access
+# token, which no App can mint, so the owner makes one with read:packages alone
+# and keeps it in a file only they can read. The printed environment reads the
+# file when it is evaluated: the token itself is never printed.
+packages_line=""
+if [[ ! -e "$PACKAGES_TOKEN" && ! -L "$PACKAGES_TOKEN" ]]; then
+  packages_hint="there is no $PACKAGES_TOKEN"
+else
+  packages_hint="$(python3 - "$PACKAGES_TOKEN" <<'PY'
+import os, re, stat, sys
+path = sys.argv[1]
+def no(why):
+    print(path + " " + why)
+    sys.exit(0)
+try:
+    st = os.lstat(path)
+except OSError as e:
+    no("cannot be read (%s)" % e.strerror)
+if stat.S_ISLNK(st.st_mode):
+    no("is a symbolic link; it must be a regular file")
+if not stat.S_ISREG(st.st_mode):
+    no("is not a regular file")
+if st.st_uid != os.getuid():
+    no("is not yours")
+mode = stat.S_IMODE(st.st_mode)
+if mode & 0o077:
+    no("is open to others (mode %04o): chmod 600 it" % mode)
+try:
+    with open(path) as f:
+        text = f.read()
+except OSError as e:
+    no("cannot be read (%s)" % e.strerror)
+if not re.fullmatch(r"ghp_[A-Za-z0-9]+\n?", text):
+    no("does not hold exactly one classic personal access token (ghp_...)")
+PY
+)" || packages_hint="$PACKAGES_TOKEN could not be checked"
+  if [[ -z "$packages_hint" ]]; then packages_line="export GH_PACKAGES_TOKEN=\"\$(cat -- $(q "$PACKAGES_TOKEN"))\""; fi
+fi
+
+# The launcher, the only file in the directory PATH gets, so the helpers stay
+# off PATH; it execs the copy, and never falls through to the real gh. Then the
+# zsh startup files. Rewritten whenever what they hold changes, or one is
+# missing; the stamp that says they are current is written last.
+body="$(body_lines "$GH_DIR" "$ZD" "$bot" "$email" "$helper")"
+stamp="$real_gh"$'\n'"$body"
+current=1
+for f in "$BIN/gh" "$ZD/reassert.zsh" "$ZD/.zshenv" "$ZD/.zprofile" "$ZD/.zshrc" "$ZD/.zlogin" "$ZD/.zlogout" "$SHIM/.installed"; do
+  [[ -e "$f" ]] || current=0
+done
+if [[ $current -eq 0 || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
+  { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
+    printf 'exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
+  } | install_file "$BIN/gh" 700 || locked "cannot write $BIN/gh"
+  write_zdotdir "$ZD" "$BIN" "$body" || locked "cannot write the zsh startup files in $ZD"
+  printf '%s\n' "$stamp" | install_file "$SHIM/.installed" 600 || locked "cannot write $SHIM/.installed"
+fi
+
+# Is that commit on marvinamiranda/.github test, as GitHub has it now (its
+# canonical URL, as bootstrap.sh reads it)? "Yes" is remembered for good: a
+# commit on test stays there, since the test-integration ruleset forbids force
+# pushes. Any other answer is remembered for 10 minutes, so an eval, which opens
+# every tool command, asks the network at most that often; each call has a
+# time limit.
+provenance() {
+  local test_sha
+  if ! test_sha="$(with_timeout 10 env GIT_TERMINAL_PROMPT=0 git -C "$HERE" ls-remote "$SELF_URL" refs/heads/test 2>/dev/null | cut -f1)" \
+      || [[ ! "$test_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "marvinamiranda/.github test could not be read, so commit ${commit:0:12} is not known to be merged"
+  elif ! git -C "$HERE" cat-file -e "$test_sha^{commit}" 2>/dev/null \
+      && ! with_timeout 30 env GIT_TERMINAL_PROMPT=0 git -C "$HERE" fetch --quiet --no-tags --no-write-fetch-head "$SELF_URL" "$test_sha" 2>/dev/null; then
+    echo "marvinamiranda/.github test (${test_sha:0:12}) could not be fetched, so commit ${commit:0:12} is not known to be merged"
+  elif git -C "$HERE" merge-base --is-ancestor "$commit" "$test_sha"; then
+    : >"$SHIM/on-test" || true
+  else
+    echo "commit ${commit:0:12} is not on marvinamiranda/.github test (${test_sha:0:12}): it has not been merged"
+  fi
+}
+if [[ ! -e "$SHIM/on-test" ]]; then
+  now="$(date +%s)" checked_at="" why=""
+  if [[ -r "$SHIM/not-on-test" ]]; then { read -r checked_at && read -r why; } <"$SHIM/not-on-test" || true; fi
+  if [[ -z "$why" || ! "$checked_at" =~ ^[0-9]+$ ]] || (( checked_at > now || now - checked_at >= 600 )); then
+    why="$(provenance)" || why="the commit could not be checked against marvinamiranda/.github test"
+    if [[ -n "$why" ]]; then
+      printf '%s\n%s\n' "$now" "$why" | install_file "$SHIM/not-on-test" 600 || true
+    else
+      rm -f "$SHIM/not-on-test"
+    fi
+  fi
+  if [[ -n "$why" ]]; then
+    echo "agent-env.sh: WARNING: $why. The gh shim and token helper this session runs come from it; eval from a checkout of a merged commit." >&2
+  fi
+fi
+if [[ -n "${packages_hint:-}" ]]; then
+  echo "agent-env.sh: GH_PACKAGES_TOKEN is not set: ${packages_hint}. Package restores from GitHub Packages will fail (README, \"Packages\")." >&2
+fi
+
 cat <<EOF
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
-export GH_CONFIG_DIR=$(q "$GH_DIR")
+${packages_line}
+$body
+export MM_AGENT_OWNER_ZDOTDIR=$(q "$owner_zdotdir")
 export PATH=$(q "$BIN${clean_path:+:$clean_path}")
 hash -r 2>/dev/null || true
-export GIT_AUTHOR_NAME=$(q "$bot") GIT_COMMITTER_NAME=$(q "$bot")
-export GIT_AUTHOR_EMAIL=$(q "$email") GIT_COMMITTER_EMAIL=$(q "$email")
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0=
-export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1=$(q "$helper")
 EOF
 PRINTED=1

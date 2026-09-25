@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# The gh an agent shell runs. agent-env.sh writes a launcher that execs this,
-# ~/.config/mm-agent/<name>/bin/gh, and puts it first on PATH, so child
-# processes (scripts, `bash -c`, an agent CLI's tool shells) run it too:
+# The gh an agent shell runs. agent-env.sh copies this file, with
+# app-token.sh, out of a commit into ~/.config/mm-agent/<name>/shim/<commit>/,
+# and puts a launcher for the copy first on PATH, so child processes (scripts,
+# `bash -c`, zsh through its ZDOTDIR) run it too:
 #
 #   gh-shim.sh <mm-agent|mm-reviewer> <real gh> [gh arguments...]
 #
@@ -13,8 +14,12 @@
 # It refuses `gh auth`, except a plain `gh auth status`. `gh auth token` would
 # hand out a raw token, which a variable then keeps past its minutes, and
 # `gh auth token --user <owner>` reads the owner's keyring login whatever
-# GH_TOKEN holds. It refuses `gh alias set|import`, which could run one of
-# those under another name.
+# GH_TOKEN holds. It refuses `gh alias` except `list` and `delete`, since an
+# alias could run a refused command under another name. And it refuses any
+# flag ahead of the command: gh parses flags wherever they are, so
+# `gh --help=false auth token` runs `gh auth token`, and
+# `gh alias --help=false set` runs `gh alias set`. gh's only root flags are
+# --help (-h) and --version, which are accepted on their own.
 #
 # A strong default, not a sandbox: the real gh is one absolute path away.
 set -uo pipefail
@@ -31,6 +36,11 @@ refuse() {
 }
 
 case "${1:-}" in
+  -*)
+    if [[ $# -ne 1 || ( "$1" != --help && "$1" != -h && "$1" != --version ) ]]; then
+      refuse "gh $1 ...: a flag ahead of the command, which could hide the command from these checks. Put flags after the command; only --help, -h or --version is accepted there, on its own."
+    fi
+    ;;
   auth)
     if [[ $# -ne 2 || "$2" != status ]]; then
       refuse "gh $*. An agent shell hands out no token and holds no login: run gh and git directly, and each call gets a fresh token. Only a plain 'gh auth status' is allowed."
@@ -38,7 +48,8 @@ case "${1:-}" in
     ;;
   alias)
     case "${2:-}" in
-      set|import) refuse "gh alias $2: an alias could run a refused command under another name." ;;
+      "" | list | delete) ;;
+      *) refuse "gh alias ${2}: an alias could run a refused command under another name, so only 'gh alias list' and 'gh alias delete' are allowed." ;;
     esac
     ;;
 esac
