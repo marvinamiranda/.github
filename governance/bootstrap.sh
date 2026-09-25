@@ -3,6 +3,7 @@
 #
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops --project          # dry run
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops --project --apply  # owner only
+#   … --no-rulesets   # stage an adoption: everything except rulesets (apply those after the adoption PR merges)
 #
 # DRY RUN BY DEFAULT: only read calls are made, and every call that would
 # change something is printed instead. `--apply` executes them. Idempotent:
@@ -37,6 +38,7 @@ ORG="marvinamiranda"
 APPLY=0
 REPOS=()
 WANT_PROJECT=0
+SKIP_RULESETS=0
 PROJECT_TITLE="Omni237 Delivery"
 CONFIG_DIR=""
 CONFIG_REF="test"
@@ -75,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --apply) APPLY=1 ;;
     --repo) [[ $# -ge 2 ]] || { echo "--repo needs a value" >&2; exit 2; }; REPOS+=("$2"); shift ;;
     --project) WANT_PROJECT=1 ;;
+    --no-rulesets) SKIP_RULESETS=1 ;;
     --project-title) [[ $# -ge 2 ]] || { echo "--project-title needs a value" >&2; exit 2; }; PROJECT_TITLE="$2"; shift ;;
     --reviewer-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--reviewer-app-id needs a numeric id" >&2; exit 2; }; REVIEWER_APP_ID="$2"; shift ;;
     --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$2" && pwd)"; shift ;;
@@ -415,7 +418,11 @@ normalise_ruleset() {
 }
 
 section "d) Rulesets"
-for repo in "${REPOS[@]}"; do
+# --no-rulesets: stage an adoption. Rulesets require checks that only exist once
+# the repository's adoption PR has merged; applying them first blocks every PR,
+# including that one.
+if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=("${REPOS[@]}"); fi
+for repo in "${RULESET_REPOS[@]}"; do
   info "[$repo]"
   existing="$(get_all "repos/$ORG/$repo/rulesets?includes_parents=true&per_page=100")"
   info "Existing rulesets (as they are now):"
