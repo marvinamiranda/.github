@@ -191,9 +191,11 @@ const rcOf = (out, label) => { const m = new RegExp(`${label}=(\\d+)`).exec(out)
   const old = run(['-c', 'gh() { echo OLD; }; eval "$1"; type -t gh', '_', printed]);
   ok('a gh() function left by an older agent-env.sh is replaced by the shim', old.stdout.trim() === 'file', old.stdout.trim());
 
-  const z = spawnSync('zsh', ['-c', 'eval "$1" && command -v gh', '_', printed], { env: env(), encoding: 'utf8' });
+  // zsh parses a whole eval before running it, with aliases expanded, so an
+  // alias named gh is checked for too (as is one in an interactive bash).
+  const z = spawnSync('zsh', ['-c', 'alias gh="echo ALIAS"; eval "$1" && command -v gh', '_', printed], { env: env(), encoding: 'utf8' });
   if (z.error && z.error.code === 'ENOENT') console.log('ok - # SKIP zsh not installed');
-  else ok('the printed environment also evaluates under zsh', z.status === 0 && z.stdout.trim().startsWith(`${DIR}/`), (z.stdout + z.stderr).trim());
+  else ok('the printed environment also evaluates under zsh, with an alias named gh', z.status === 0 && z.stdout.trim().startsWith(`${DIR}/`), (z.stdout + z.stderr).trim());
 })();
 
 (function refusals() {
@@ -280,6 +282,23 @@ const rcOf = (out, label) => { const m = new RegExp(`${label}=(\\d+)`).exec(out)
         && rcOf(c.stdout, 'git-rc') !== 0 && !/password=./.test(c.stdout) && rcOf(c.stdout, 'commit-rc') !== 0
         && rcOf(c.stderr, 'eval-rc') !== 0,
       `${c.stdout.trim().split('\n').join(' | ')} || eval-rc=${rcOf(c.stderr, 'eval-rc')}`);
+  }
+
+  // The same, where the shell has an alias named gh.
+  fresh();
+  fs.rmSync(path.join(DIR, 'app.json'));
+  const printed = agentEnv(owner).stdout;
+  const probe = 'echo "tokens=${GH_TOKEN-unset}/${GH_PACKAGES_TOKEN-unset}"; eval "gh api user"; echo "gh-rc=$?"';
+  for (const [shell, args] of [
+    ['zsh', ['-c', `alias gh="echo ALIAS"; eval "$1"; echo "eval-rc=$?"; ${probe}`, '_', printed]],
+    ['bash (aliases on, as when interactive)', ['-c', `shopt -s expand_aliases; alias gh="echo ALIAS"; eval "$1"; echo "eval-rc=$?"; ${probe}`, '_', printed]],
+  ]) {
+    const bin = shell.startsWith('zsh') ? 'zsh' : BASH;
+    const a = spawnSync(bin, args, { env: env(owner), encoding: 'utf8' });
+    if (a.error && a.error.code === 'ENOENT') { console.log(`ok - # SKIP ${bin} not installed`); continue; }
+    ok(`under ${shell} with an alias named gh, what a failed run printed still leaves no identity`,
+      /tokens=unset\/unset/.test(a.stdout) && rcOf(a.stdout, 'gh-rc') !== 0 && rcOf(a.stdout, 'eval-rc') !== 0 && !/ALIAS/.test(a.stdout),
+      (a.stdout + a.stderr).trim().split('\n').join(' | '));
   }
 })();
 

@@ -67,10 +67,13 @@ locked() {
       rm -f "$tmp"
     fi
   fi
+  # `function gh`, not `gh()`: zsh parses the whole eval before running any
+  # of it, and with an alias named gh, `gh() {` is a parse error that throws
+  # away every line here.
   cat <<EOF
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
-gh() { echo "gh: refused: this shell has no GitHub identity, because agent-env.sh failed." >&2; return 1; }
+function gh { echo "gh: refused: this shell has no GitHub identity, because agent-env.sh failed." >&2; return 1; }
 export GH_CONFIG_DIR=$(q "$LOCK/gh")
 export PATH=$(q "$LOCK/bin${clean_path:+:$clean_path}")
 hash -r 2>/dev/null || true
