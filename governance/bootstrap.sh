@@ -19,8 +19,8 @@
 #   b) per repo: default branch -> test (closing keywords only act on merges
 #      into the default branch, DELIVERY §4)
 #   c) per repo: the §11 labels, plus area:* labels from areas.txt
-#   d) per repo: rulesets `test-integration` and `main-release`, created or
-#      updated by name (DELIVERY §9, §10)
+#   d) per repo: rulesets `test-integration`, `main-owner-only` and
+#      `main-checks`, created or updated by name (DELIVERY §9, §10)
 #   e) with --project: the Project, its Status/Priority/Size fields, and a link
 #      to each repo
 #
@@ -362,21 +362,36 @@ test_ruleset() {
     ]}'
 }
 
-# main-release (DELIVERY §9): nobody may update main except an organisation
-# admin, and only through a pull request — `update` (restrict updates) with the
-# OrganizationAdmin role as the only bypass, in pull_request mode. Merge commits
-# only: releases squashed onto main left test and main with different histories,
-# and omni237-ops pull requests 113, 115, 118, 121 and 126 were spent re-syncing
-# them ("MERGE WITH A MERGE COMMIT — … stop this recurring").
-main_ruleset() {
-  jq -n --argjson checks "$1" --argjson strict "$STRICT_UP_TO_DATE" '{
-    name: "main-release", target: "branch", enforcement: "active",
+# main is guarded by TWO rulesets, split so that the owner's bypass cannot
+# reach the checks (DELIVERY §9). A bypass actor bypasses every rule of the
+# ruleset it is listed on, so the one bypass lives alone:
+#
+# main-owner-only: nobody may update main except an organisation admin, and
+# only through a pull request — `update` (restrict updates) with the
+# OrganizationAdmin role as the only bypass, in pull_request mode. Nothing else.
+main_owner_ruleset() {
+  jq -n '{
+    name: "main-owner-only", target: "branch", enforcement: "active",
     bypass_actors: [{actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "pull_request"}],
+    conditions: {ref_name: {include: ["refs/heads/main"], exclude: []}},
+    rules: [
+      {type: "update", parameters: {update_allows_fetch_and_merge: false}}
+    ]}'
+}
+
+# main-checks: what every change to main must pass, the owner's included —
+# no bypass. Merge commits only: releases squashed onto main left test and main
+# with different histories, and omni237-ops pull requests 113, 115, 118, 121
+# and 126 were spent re-syncing them ("MERGE WITH A MERGE COMMIT — … stop this
+# recurring").
+main_checks_ruleset() {
+  jq -n --argjson checks "$1" --argjson strict "$STRICT_UP_TO_DATE" '{
+    name: "main-checks", target: "branch", enforcement: "active",
+    bypass_actors: [],
     conditions: {ref_name: {include: ["refs/heads/main"], exclude: []}},
     rules: [
       {type: "deletion"},
       {type: "non_fast_forward"},
-      {type: "update", parameters: {update_allows_fetch_and_merge: false}},
       {type: "pull_request", parameters: {
         required_approving_review_count: 0, dismiss_stale_reviews_on_push: true,
         require_code_owner_review: false, require_last_push_approval: false,
@@ -413,19 +428,20 @@ for repo in "${REPOS[@]}"; do
     detail="$BODY"
     jq '{id, name, source_type, enforcement, conditions, bypass_actors, rules}' <<<"$detail" | sed 's/^/      /'
     rs_name="$(jq -r .name <<<"$detail")"
-    if [[ "$rs_name" != "test-integration" && "$rs_name" != "main-release" ]] && jq -e '.bypass_actors | length > 0' <<<"$detail" >/dev/null; then
-      warn "ruleset '$rs_name' has bypass actors. Rulesets layer, so it cannot weaken the two below, but it is not the standard; retire it deliberately."
+    if [[ "$rs_name" != "test-integration" && "$rs_name" != "main-owner-only" && "$rs_name" != "main-checks" ]] && jq -e '.bypass_actors | length > 0' <<<"$detail" >/dev/null; then
+      warn "ruleset '$rs_name' has bypass actors. Rulesets layer, so it cannot weaken the ones below, but it is not the standard; retire it deliberately."
     fi
   done < <(jq -r '.[].id' <<<"$existing")
 
   cfg="$WORK/cfg/$repo"
   test_ruleset "$(required_checks_json review "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
-  main_ruleset "$(required_checks_json none "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-$repo.json"
+  main_owner_ruleset >"$WORK/rs-main-owner-$repo.json"
+  main_checks_ruleset "$(required_checks_json none "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
   if [[ -z "$REVIEWER_APP_ID" ]]; then
     warn "$repo test-integration: review/independent OMITTED (no Reviewer App id) — independent review is not enforced."
   fi
 
-  for payload in "$WORK/rs-test-$repo.json" "$WORK/rs-main-$repo.json"; do
+  for payload in "$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json"; do
     name="$(jq -r .name "$payload")"
     id="$(jq -r --arg n "$name" 'map(select(.name == $n and .source_type == "Repository")) | first | .id // empty' <<<"$existing")"
     if [[ -z "$id" ]]; then

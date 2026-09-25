@@ -146,10 +146,12 @@ reported for the owner to retire. `--help` lists the options.
   `~/.config/mm-agent/mm-reviewer/app.json`). Without that id it is omitted, with
   a loud warning, rather than left forgeable or blocking. No force push, no
   deletion, no bypass.
-- **`main-release`**: restrict updates, with the organisation-admin role as the
-  only bypass in pull-request mode; pull request (merge commits only, no
-  approvals); required checks from both lists + `governance/issue-link`; no
-  force push, no deletion.
+- **`main-owner-only`**: restrict updates, with the organisation-admin role as
+  the only bypass, in pull-request mode — and nothing else, because a bypass
+  actor bypasses every rule of its ruleset.
+- **`main-checks`**: pull request (merge commits only, no approvals); required
+  checks from both lists + `governance/issue-link`; no force push, no
+  deletion; no bypass, so the owner's merges pass the checks too.
 
 ## Tests
 
