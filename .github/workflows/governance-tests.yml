@@ -1,0 +1,53 @@
+# Tests for this repository's own governance code. Public repository, so the
+# hosted runner costs nothing. No paths filter: it must report on every pull
+# request to be requirable.
+name: Governance tests
+
+on:
+  pull_request:
+    branches: [test, main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: governance tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: issue-link matcher
+        run: node governance/tests/issue-link.test.js
+      - name: areas checker
+        run: node governance/tests/areas-check.test.js
+      - name: PR governance pin check
+        run: node governance/tests/pr-governance.test.js
+      - name: bootstrap (stub gh, no network)
+        run: node governance/tests/bootstrap.test.js
+      # The identity suite starts zsh as login and interactive shells, as the
+      # agent CLIs do; the runner image has no zsh, and a skipped case would pass.
+      - name: zsh, for the identity suite
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh && zsh --version
+      - name: agent identity (stub curl and gh, no network)
+        env:
+          IDENTITY_REQUIRE_ZSH: '1'
+        run: node governance/tests/identity.test.js
+      - name: shellcheck
+        run: shellcheck governance/bootstrap.sh governance/identity/*.sh
+      - name: identity manifests parse
+        run: for f in governance/identity/*.manifest.json; do python3 -m json.tool "$f" >/dev/null; done
+      - name: YAML parses
+        run: |
+          python3 - <<'EOF'
+          import glob, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob('.github/**/*.yml', recursive=True)):
+              try:
+                  yaml.safe_load(open(f))
+              except Exception as e:
+                  print(f'{f}: {e}'); bad += 1
+          sys.exit(bad)
+          EOF

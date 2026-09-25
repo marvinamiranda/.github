@@ -1,0 +1,75 @@
+name: "Decision"
+description: "A question only the owner may answer, raised when it must survive the session."
+title: "DECISION: "
+type: Decision
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Default: decide and proceed.** Raise this only when proceeding either way would be unsafe, irreversible, commercially binding, or would make the work useless if wrong.
+        Title it as the question: `DECISION: <the question>`. Link every blocked Task to this issue with native *blocked by*. Every reference is a full URL, never a bare `#123`.
+
+  - type: textarea
+    id: blocks
+    attributes:
+      label: What it blocks
+      description: The Tasks, Epics or milestones that cannot proceed, as full URLs, and how much.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why-owner
+    attributes:
+      label: Why it needs the owner
+      description: What makes this a product, security, commercial or governance judgement rather than an engineering one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: options
+    attributes:
+      label: Options and their consequences
+      description: Each option with its real advantage and real cost, and a concrete example. Include doing nothing where that is real.
+      placeholder: |
+        **A — ...**
+        - Advantage:
+        - Cost:
+        - Example:
+
+        **B — ...**
+        - Advantage:
+        - Cost:
+        - Example:
+    validations:
+      required: true
+
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommendation
+      description: The option recommended and why, judged on the long term — what it costs or saves in six months.
+    validations:
+      required: true
+
+  - type: textarea
+    id: against
+    attributes:
+      label: Strongest argument against the recommendation
+    validations:
+      required: true
+
+  - type: textarea
+    id: limitation
+    attributes:
+      label: Honest limitation of the recommendation
+    validations:
+      required: true
+
+  - type: textarea
+    id: how-to-answer
+    attributes:
+      label: How to answer
+      description: Literally what to reply.
+      placeholder: "Comment `A`, `B` or `C` on this issue."
+    validations:
+      required: true

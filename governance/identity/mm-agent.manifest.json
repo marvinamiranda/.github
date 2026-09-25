@@ -1,0 +1,20 @@
+{
+  "name": "MarvinaMiranda Agent",
+  "url": "https://github.com/marvinamiranda",
+  "description": "Identity every AI agent builds with (DELIVERY.md §9). Opens and merges pull requests into test when checks pass. Cannot merge main. No ruleset bypass.",
+  "public": false,
+  "hook_attributes": { "url": "https://example.invalid/unused", "active": false },
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "workflows": "write",
+    "actions": "read",
+    "checks": "read",
+    "statuses": "read",
+    "metadata": "read",
+    "organization_projects": "write",
+    "members": "read"
+  },
+  "default_events": []
+}

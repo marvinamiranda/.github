@@ -1,28 +1,28 @@
 name: "Bug"
-description: "An observed deviation from approved or expected behaviour."
-title: "[bug] "
+description: "Observed behaviour that contradicts the docs or the tests. Fixed in one pull request, with a test that failed first."
 type: Bug
 body:
   - type: textarea
-    id: expectation
+    id: observed
     attributes:
-      label: Approved expectation
-      description: Link the story, requirement, rule or other authority that defines correct behaviour.
+      label: Observed
+      description: What happened, who or what is affected, and any workaround.
     validations:
       required: true
 
   - type: textarea
-    id: actual
+    id: expected
     attributes:
-      label: Actual behaviour and impact
-      description: What happened, who/what is affected, and is there a workaround?
+      label: Expected
+      description: What should have happened, with a link to the doc or test that says so.
     validations:
       required: true
 
   - type: textarea
-    id: reproduce
+    id: reproduction
     attributes:
-      label: Steps to reproduce
+      label: Reproduction
+      description: Exact steps or commands. Remove secrets and personal data.
       placeholder: |
         1.
         2.
@@ -31,10 +31,10 @@ body:
       required: true
 
   - type: textarea
-    id: environment
+    id: revision
     attributes:
-      label: Environment and revision
-      description: URL/environment, application/build/commit, tenant/location test scope, device/OS/browser and first/last observed time where known.
+      label: Revision and environment
+      description: Environment and URL, deployed revision or commit SHA, device/OS/browser, first and last seen.
     validations:
       required: true
 
@@ -42,35 +42,27 @@ body:
     id: severity
     attributes:
       label: Severity
-      description: Severity is impact, not delivery priority.
+      description: Impact, not delivery priority. Priority is the Project field.
       options:
-        - "P0 — outage, active data loss/corruption or critical security exposure"
-        - "P1 — major workflow blocked with no acceptable workaround"
-        - "P2 — material defect with a workaround"
-        - "P3 — minor/cosmetic defect"
+        - "Critical — outage, data loss or corruption, or a security exposure"
+        - "Major — a workflow is blocked with no acceptable workaround"
+        - "Minor — wrong, but a workaround exists"
+        - "Cosmetic — presentation only"
+    validations:
+      required: true
+
+  - type: input
+    id: area
+    attributes:
+      label: Suspected area
+      description: The `area:` this most likely lives in, and the file if known. Set the `area:` label to match.
     validations:
       required: true
 
   - type: textarea
-    id: evidence
+    id: failing-test
     attributes:
-      label: Evidence
-      description: Screenshots, logs, traces or request/response details with secrets and personal data removed.
-
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies or related changes (optional)
-      description: Link known blockers, upstream fixes or related work. Leave blank when none is known.
-
-  - type: textarea
-    id: acceptance
-    attributes:
-      label: Fix and regression acceptance
-      description: Expected correct behaviour, regression checks and deployed verification.
-      placeholder: |
-        - [ ] Original reproduction no longer fails
-        - [ ] Regression test covers the cause
-        - [ ] Negative/adjacent behaviour remains correct
+      label: The failing test to add
+      description: The test that reproduces this and must be seen failing before the fix — file, name and level.
     validations:
       required: true

@@ -1,0 +1,16 @@
+{
+  "name": "MarvinaMiranda Reviewer",
+  "url": "https://github.com/marvinamiranda",
+  "description": "Independent review identity (DELIVERY.md §10). Posts the review/independent check on a pull request's head commit. Never writes code.",
+  "public": false,
+  "hook_attributes": { "url": "https://example.invalid/unused", "active": false },
+  "default_permissions": {
+    "checks": "write",
+    "statuses": "write",
+    "pull_requests": "write",
+    "contents": "read",
+    "issues": "read",
+    "metadata": "read"
+  },
+  "default_events": []
+}

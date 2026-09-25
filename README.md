@@ -1,7 +1,446 @@
 # Organisation GitHub defaults
 
-Generic issue forms, pull-request guidance and contribution rules used across the organisation.
+The shared assets of the organisation's delivery standard
+(`01 - Governance/DELIVERY.md` in the MarvinaMiranda knowledge repository, §14).
+The issue forms and pull request template are the organisation default: they
+apply to every repository that does not provide its own, immediately. Rulesets,
+`AGENTS.md` and areas are adopted per repository, at that repository's reset.
 
-These files intentionally contain no customer, product, environment or private architecture details. Repositories inherit them when they do not provide a complete local override.
+This repository is public, so product structure (areas, required checks, hot
+shared files) lives in each product repository under `.github/governance/`
+(DELIVERY §6). Product names appear here only as examples.
 
-The canonical governance and change rationale are maintained in the private corporate knowledge repository.
+**Every change here is `tier:senior` and needs an adversarial review**, and so
+does any change to `.github/**` in an adopted repository, or to any script a job
+with `checks: write` or a `workflow_run` trigger executes. The code in this
+repository decides every other repository's required checks, and the Agent App
+holds `workflows: write`.
+
+| Asset | Path |
+|---|---|
+| Issue forms: Epic, Task, Bug, Decision, Spike | `.github/ISSUE_TEMPLATE/` |
+| Pull request template | `.github/pull_request_template.md` |
+| Reusable PR governance workflow (`governance/issue-link`, areas check) | `.github/workflows/pr-governance.yml` |
+| Issue-link matcher and its tests | `governance/issue-link.js`, `governance/tests/issue-link.test.js` |
+| Areas checker and its tests | `governance/areas-check.js`, `governance/tests/areas-check.test.js` |
+| How to find and prefactor hot shared files | `governance/HOTSPOTS-GUIDE.md` |
+| Bootstrap: issue types, default branch, labels, rulesets, Project | `governance/bootstrap.sh` |
+| Agent identities: App manifests, creation, tokens, the agent shell's `gh` shim, posting a review | `governance/identity/` |
+| Tests of the workflow's pin check, the bootstrap and the identity scripts | `governance/tests/` |
+
+The issue forms set native issue types. Epic, Decision and Spike must exist as
+organisation issue types first — run the bootstrap before these forms reach
+the default branch, or those three forms open issues with no type.
+
+## What an adopted repository carries
+
+```text
+.github/governance/areas.txt                 areas, as label lines plus path globs
+.github/governance/required-checks.txt       CI checks required on test and main
+.github/governance/required-checks.main.txt  extra checks required on main only
+.github/governance/HOTSPOTS.md               its hot shared files (see HOTSPOTS-GUIDE.md)
+.github/workflows/pr-governance.yml          the caller below
+```
+
+`areas.txt`:
+
+```text
+<name>|<label description, at most 100 characters>
+#   path: <glob>     one or more; the first glob in the file that matches a file owns it
+```
+
+Globs: `*` within a path segment, `**` across segments, `{a,b}` either.
+
+`required-checks.txt`: one check-run name per line, exactly as GitHub shows it,
+`#` for comments. List only checks that **always** report on a pull request —
+a required check that never starts is a merge freeze. Where a workflow is
+path-filtered, require its always-running aggregator instead (DELIVERY §10).
+
+## PR governance
+
+The caller:
+
+```yaml
+name: PR governance
+
+on:
+  pull_request:
+    branches: [test, main]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  checks: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: pr-governance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    # A full commit SHA of this repository, never a branch: the code that
+    # judges a pull request must be a reviewed commit.
+    uses: marvinamiranda/.github/.github/workflows/pr-governance.yml@<40-char sha>
+    with:
+      runs-on: '["self-hosted", "pool-linux"]'   # runners are self-hosted
+      governance-ref: <the same sha>
+```
+
+- **Pin by SHA, twice.** `uses:` and `governance-ref` name the same merged
+  commit of this repository. A branch ref would let whoever can push to that
+  branch change every repository's checks. Moving the pin is a `tier:senior`
+  pull request in the adopting repository.
+- **The workflow checks the pin** before it fetches any governance code.
+  `governance-ref` must equal `job.workflow_sha`, the commit the caller's
+  `uses:` pinned (`github.workflow_sha` would be the caller's own commit), and
+  that commit must be on this repository's `test`: the branch is read by name
+  (`repos.getBranch`, which a tag named `test` cannot shadow), and GitHub's
+  compare of its head with the pin says `identical` or `behind`. Otherwise
+  `governance/issue-link` fails, and so does `governance / areas`. The check is
+  inline in the workflow, because code fetched at `governance-ref` cannot vouch
+  for `governance-ref`.
+- **What that catches:** a `governance-ref` that is not the `uses:` pin, and a
+  pin to a commit that carries this check but is not on `test`, such as an
+  unmerged pull request commit or a fork's.
+- **What it cannot catch**, because the check is code at the pinned commit:
+  - a pin to a commit without the check, merged or not (any commit from before
+    it), which runs no check at all;
+  - a pin moved back to an older merged commit, which passes (`behind`) with a
+    weaker judge;
+  - a pull request that adds its own workflow posting `governance/issue-link`:
+    every workflow of the repository runs as the Actions app the rulesets pin
+    the check to.
+
+  Review is the control for those, which is why moving the pin, and any change
+  to `.github/**` in an adopted repository, is `tier:senior` with an
+  adversarial review (DELIVERY §10).
+- `concurrency` cancels a superseded run, so an edit followed by a push cannot
+  finish out of order and leave the older verdict on the head.
+- `edited` is what re-runs the issue-link check when only the body changes.
+- No `paths:` filter: both jobs must report on every pull request.
+- `runs-on` is required and has no default, because a required check on a
+  runner that never starts is a merge freeze.
+- Where the repository has an aggregating PR gate that wakes on `workflow_run`,
+  add `PR governance` to its `workflow_run.workflows`: that makes the gate fire
+  on every pull request, and stops it judging before governance has finished
+  with nothing left to wake it.
+
+### `governance/issue-link`
+
+The check reads the pull request at run time (not from the event payload). It
+fails unless the pull request body closes an issue with a closing keyword
+(`close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`,
+`resolved`), optionally followed by a colon, then one of `#123`,
+`owner/repo#123` or `https://github.com/owner/repo/issues/123`. Text inside
+HTML comments, fenced code and inline code does not count. That regex is the
+fast, offline layer. For a pull request into the **default branch** the
+authority is GitHub's own parsing (GraphQL `closingIssuesReferences`), the same
+parser that closes the issue on merge: if GitHub links no issue, the check
+fails. GitHub parses the body after the event that starts the run, so an empty
+first answer is asked again once, 5 seconds later. A pull request opened
+before `test` became the default branch keeps the links GitHub parsed then:
+edit its body and save it, and GitHub reads it again. A pull request
+referencing only itself fails.
+
+- **Release pull requests** (`test` → `main`) are exempt and pass.
+- **`hotfix/*` pull requests** must close at least one issue **in the same
+  repository** whose type is **Bug**, and not a pull request.
+
+The job itself appears as `governance / issue-link`. The **required** context
+is the check run it publishes, named exactly `governance/issue-link` and
+created by the GitHub Actions app; the rulesets pin it to that app. That check
+run carries the verdict, and the job does not fail on it, so a failed job left
+by an older run cannot keep a pull request red after a later run passes.
+
+### `governance / areas`
+
+Runs `governance/areas-check.js` against the pull request's merge commit and
+fails when a tracked file has no area, an area owns nothing, or a glob can never
+win. Locally:
+
+```bash
+node governance/areas-check.js <product checkout> [git-ref]
+```
+
+## Identities (DELIVERY §9, Appendix A)
+
+Two organisation GitHub Apps, created once by the owner:
+
+```bash
+python3 governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
+python3 governance/identity/create-app.py mm-reviewer   # posts review/independent
+```
+
+Keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
+
+**Install or refresh an identity** from a checkout of a merged commit, by the
+script's absolute path:
+
+```bash
+eval "$(<checkout>/governance/identity/agent-env.sh mm-agent || echo false)" && gh auth status
+eval "$(<checkout>/governance/identity/agent-env.sh mm-reviewer || echo false)" && gh auth status
+```
+
+**Then open every tool command with the env file it installed**, joined with
+`&&`, never `;`:
+
+```bash
+. ~/.config/mm-agent/mm-agent/env && gh pr create …
+. ~/.config/mm-agent/mm-reviewer/env && governance/identity/post-review.sh owner/repo <sha> success "Matches the Task; tests seen failing first."
+```
+
+Both forms stop the command when they cannot set the identity up. A bare
+`eval "$(…/agent-env.sh mm-agent)"` does not: when the script is not there
+(the checkout moved or went away, or a relative path run from another
+directory), it evaluates nothing, succeeds, and the command runs as the owner.
+`|| echo false` turns that into a failing eval. `.` of a missing env file
+fails, and so does an env file whose shim is gone. The env file is written
+only by an eval from a commit on this repository's `test`, so it only ever
+runs merged code; an eval from anywhere else sets up its own shell and leaves
+the file alone. Sourcing it starts no process.
+
+**Claude Code and Codex need the env file on every tool command**: both
+rebuild each command's shell from a snapshot taken when the session began, and
+a snapshot taken from the owner's environment carries it. Claude Code's
+re-applies the `PATH` it captured, which puts the real `gh` first. Codex's
+re-exports every variable it captured, which on the owner's machine includes
+their `gh` login token as `GH_PACKAGES_TOKEN` (from `~/.zshrc`). That is the
+residual: a tool command that does not open with the env file runs as its
+snapshot has it; an alias named `gh` in the snapshot is expanded when the
+command line is parsed, before the env file can remove it (there is none on
+the owner's machine; `command gh` sidesteps one); and the snapshot files keep
+whatever was exported when they were taken (Codex writes them readable by
+every local user). Only the owner can clear those files.
+
+`agent-env.sh` is a strong default, not a sandbox: agents run on the owner's
+machine as the owner's user, and the owner's keyring login stays one absolute
+path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
+
+- puts the identity's `gh` first on `PATH`: a launcher in
+  `~/.config/mm-agent/<name>/shim/<commit>/bin/`, the only file there, for
+  copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`, taken from the
+  blobs of a commit. Which commit a shell runs depends on the form:
+  - the eval installs what the checkout's HEAD is at that moment and switches
+    that shell to it. The shell keeps it when the checkout changes or goes
+    away, until it evaluates again;
+  - the env file runs the commit it names: the last one an eval from a commit
+    on `test` installed on this machine. The checkout can change or go away
+    without touching it;
+- refuses a checkout whose three identity scripts differ from its HEAD commit
+  (compared by content, so a change hidden from `git status` counts), and
+  warns when that commit is not on this repository's `test`. A commit found on
+  `test` is remembered; anything else is asked again at the next eval;
+- keeps that `gh` first in zsh, login or interactive, without editing the
+  owner's files: `ZDOTDIR` points at startup files that source the owner's
+  (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`, with `ZDOTDIR` set to
+  the owner's directory while each runs), then put the shim first again, drop
+  any `gh` alias or function, and set the variables below again. The owner's
+  `~/.zprofile` runs `brew shellenv`, which otherwise puts the real `gh` first
+  in every login zsh;
+- gives every `gh` call a token from `app-token.sh`, and fails without running
+  `gh` when none can be minted;
+- refuses `gh auth` except a plain `gh auth status`, `gh alias` except `list`
+  and `delete`, and any flag ahead of the command other than a lone `--help`,
+  `-h` or `--version` (`gh --help=false auth token` runs `gh auth token`).
+  `gh auth token --user <owner>` reads the owner's keyring login whatever
+  `GH_TOKEN` holds, and a raw token copied into a variable is never renewed;
+- sets `GH_TOKEN` to a sentinel that is not a token, which the shim replaces on
+  every call: a real `gh` reached some other way answers `gh auth token` with
+  the sentinel, not the keyring login, and GitHub refuses the sentinel;
+- unsets `GITHUB_TOKEN`, sets `GH_PACKAGES_TOKEN` only from the owner's
+  packages file (below), and prints no token;
+- points `GH_CONFIG_DIR` at an empty directory, so the real `gh` finds no
+  stored login;
+- gives git a github.com credential helper that mints a token per operation,
+  and tells git to quit rather than fall back when it cannot;
+- sets the App's bot as git author and committer.
+
+If `agent-env.sh` fails once it is running, it prints an environment with no
+identity (the sentinel, `gh` refusing and kept first in zsh the same way, git
+told to quit, no commit identity, a failing status) instead of nothing, which
+would leave the shell on the owner's login, and it leaves the env file as it
+was. A script that cannot run at all prints nothing: that is what
+`|| echo false` is for.
+
+Bash login shells are not wrapped: on this machine they keep the shim first
+(the owner's bash files do not run `brew shellenv`), but macOS `path_helper`
+moves inherited entries behind `/usr/local/bin`, so a `gh` installed there
+would come first in `bash -l`.
+
+### Packages
+
+GitHub Packages accepts only a classic personal access token, and no App can
+mint one, so agents get their own, made by the owner once:
+
+1. On github.com: Settings, Developer settings, Personal access tokens, Tokens
+   (classic), Generate new token (classic). Scope: `read:packages` and nothing
+   else. Give it an expiry.
+2. Save it where only you can read it:
+   ```bash
+   ( umask 077 && read -rs t && printf '%s\n' "$t" > ~/.config/mm-agent/packages-token )   # paste it, then Enter
+   ```
+
+`agent-env.sh` then exports `GH_PACKAGES_TOKEN` (which `nuget.config` reads)
+from that file, for both identities. It refuses the file, leaving the variable
+unset and saying why in one line, unless it is a regular file you own, with
+no permission for group or others (0600), holding one `ghp_` token and
+nothing else. So `gh auth token > ~/.config/mm-agent/packages-token`, which
+would hand agents your login, is refused. The printed environment reads the
+file (`$(cat …)`); it never contains the token. Restores made with it are the
+owner's in GitHub's logs: the token is theirs, limited to reading packages.
+
+`app-token.sh` reuses a token for at most 5 minutes after minting it, so a
+revoked or suspended installation's token is served for at most 5 minutes,
+then the mint fails with GitHub's reason. Checking the cached token on every
+use would add a round trip to every `gh` and `git` call (0.49 s from the
+owner's machine), and GitHub does not document that a cheap endpoint reflects
+a suspension.
+
+`post-review.sh` creates the `review/independent` check run as the Reviewer
+App, and the `test-integration` ruleset pins that context to the Reviewer App's
+id. What that enforces: the check was posted by the Reviewer identity. On one
+machine, keeping builder and reviewer sessions apart is procedural: both keys
+sit under the same user. The known follow-up is to post reviews from a workflow
+in a locked repository that holds the reviewer key as a secret.
+
+## Bootstrap
+
+Run it **from a merged commit**: check this repository out by the SHA of a
+commit on its `test`. `--apply` refuses anything else. It refuses a commit
+that is not on `test` as GitHub has it now, read from
+`https://github.com/marvinamiranda/.github.git` and never from `origin`. It
+also refuses a checkout with uncommitted changes, and files outside a git
+checkout. It prints the commit it runs from. A dry run from anywhere else
+warns and carries on.
+
+**First, straight after this repository's own pull request merges**, before
+any product repository moves its pin to that commit: this repository's own
+rulesets, on their own. Until then it has none, so "on `test`" means only
+"pushed", both for the workflow's pin check and for `--apply`'s provenance.
+
+```bash
+git checkout <the merged sha>
+governance/bootstrap.sh --self-only                   # dry run
+governance/bootstrap.sh --self-only --probe --apply   # the probe, then this repository's rulesets
+```
+
+`--self-only` takes no `--repo` and touches nothing else: no issue types, no
+default branch, no labels. It is also the first run anywhere to create
+`main-owner-only`, whose user bypass has never been applied: if GitHub refuses
+it, it does so here, after `test-integration` exists, and a re-run is
+idempotent.
+
+**Then, for each product repository, after its adoption pull request has
+merged into its `test`.** Every step reads that repository's
+`.github/governance/` from `test`, so none of them can run before the merge (a
+dry run can read an unmerged adoption with `--config-dir`). In this order:
+
+```bash
+governance/bootstrap.sh --repo <repo> ...                                  # 1. dry run: reads only
+governance/bootstrap.sh --repo <repo> ... --no-rulesets --apply            # 2. default branch, labels
+governance/bootstrap.sh --repo <repo> ... --probe --no-rulesets --apply    # 3. the Reviewer App probe
+# 4. one Agent App squash-merge into test (proven: see below)
+governance/bootstrap.sh --repo <repo> ... --apply                          # 5. rulesets, owner only
+governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # also the Project
+```
+
+- **Step 3**, `--probe`, has the Reviewer App post a neutral
+  `review/independent` on each `test` head, so a missing installation shows up
+  now rather than on the first blocked pull request. Pass `--no-rulesets` with
+  it: without it, the same run goes on to apply the rulesets, before step 4.
+- **Step 4**: after step 5 a pull request that passes its checks is the only
+  way into `test`, and agents' pull requests are merged by the Agent App, so
+  its squash-merge must work first. It is proven:
+  [omni237-ops#160](https://github.com/marvinamiranda/omni237-ops/pull/160) was
+  squash-merged into `test` by `app/marvinamiranda-agent` (commit `2be0641`,
+  2026-09-25 17:52 UTC).
+- **Step 5** needs the Reviewer App's id (`--reviewer-app-id`, or
+  `~/.config/mm-agent/mm-reviewer/app.json`). Without it the run stops before
+  changing anything. This repository's own `test-integration` would otherwise
+  require only `governance tests`, which a pull request here can rewrite.
+
+**The credential for `--apply`** is a fine-grained personal access token of
+the owner's that expires the next day, passed as `GH_TOKEN` for that run only.
+Never add `admin:org` to the `gh` keyring login: agents on this machine can
+reach it, `admin:org` can disable the rulesets, and a scope removed again with
+`gh auth refresh --remove-scopes` stays on the token already issued
+([cli/cli#9233](https://github.com/cli/cli/issues/9233)). The token, at
+github.com/settings/personal-access-tokens:
+
+| Setting | Value | For |
+|---|---|---|
+| Resource owner | `marvinamiranda` | |
+| Expiration | Custom: the next day | |
+| Repository access | `.github` and each `--repo` (or all) | |
+| Organization: Issue Types | Read and write | a) Epic, Decision, Spike |
+| Organization: Projects | Read and write | f) only with `--project` |
+| Repository: Administration | Read and write | b) the default branch; e) rulesets |
+| Repository: Contents | Read | each repository's `.github/governance/` and `test` |
+| Repository: Issues | Read and write | c) labels |
+| Repository: Metadata | Read (always included) | repositories, ruleset lists |
+
+The probe, d), needs none of these: it posts with the Reviewer App's own
+token. `--self-only` needs Administration and Metadata on `.github` alone. The
+organisation may have to approve the token first. Pass it without leaving it
+in the shell history:
+
+```bash
+read -rs GH_TOKEN && export GH_TOKEN      # paste it; nothing is echoed
+governance/bootstrap.sh ... --apply
+unset GH_TOKEN
+```
+
+GitHub reports no permissions for a fine-grained token, so the bootstrap
+checks none in advance: it says which credential it runs with, and a step that
+lacks a permission fails, with nothing after it run. `--apply` on the keyring
+login warns. `--help` prints the same list.
+
+Reads each repository's `.github/governance/` from `test` (`--config-dir
+<dir>/<repo>/` overrides it for local testing). Dry run by default; idempotent;
+never deletes. Labels and Project fields outside the standard are reported for
+the owner to retire; legacy rulesets on `test` or `main` are set to enforcement
+`disabled`, never deleted. `--help` lists the options. Payloads are kept, and
+their path printed, when a run fails.
+
+The rulesets go on this repository, first, **and on each `--repo`**. This
+repository's `test` and `main` hold the code every other repository's checks
+run, so they need a pull request, `governance tests`, and (on `test`)
+`review/independent`, with no bypass.
+
+- **`test-integration`**: pull request, no approvals. The repo's required
+  checks + `governance/issue-link`, all pinned to the Actions app, plus
+  `review/independent` pinned to the Reviewer App. Merge methods: squash, which
+  is how every Task lands, and merge commit, which exists only to bring `main`
+  back into `test` after a hotfix (a pull request from `main`), so the two
+  branches keep one history. A ruleset cannot tie a merge method to a head
+  branch, so using merge commits only for that is procedural. No force push,
+  no deletion, no bypass. `require_extra_approval_for_unattributed_changes` is
+  set to `false` explicitly, and compared. Merge methods compare as a set, and
+  a rule without any counts as GitHub's default, all three.
+- **`main-owner-only`**: restrict updates, with one user (the owner's account,
+  by id) as the only bypass, in pull-request mode, and nothing else, because a
+  bypass actor bypasses every rule of its ruleset. A user, not the
+  organisation-admin role, which would extend to every admin.
+- **`main-checks`**: pull request (merge commits only, no approvals); required
+  checks from both lists + `governance/issue-link`; no force push, no
+  deletion; no bypass, so the owner's merges pass the checks too.
+
+## Tests
+
+```bash
+for t in governance/tests/*.test.js; do node "$t" || echo "FAILED: $t"; done   # one file per node
+BOOTSTRAP_BASH=/bin/bash node governance/tests/bootstrap.test.js              # macOS bash 3.2
+IDENTITY_BASH=/bin/bash node governance/tests/identity.test.js
+shellcheck governance/bootstrap.sh governance/identity/*.sh
+actionlint                                                                    # reads .github/actionlint.yaml
+```
+
+`node governance/tests/*.test.js` runs only the first file: node takes the
+rest as its arguments. The bootstrap and identity tests run the scripts
+against stubs of `gh` and `curl`, so they need no network and touch no login.
+The identity suite also starts zsh as a login and an interactive shell, under
+a fake HOME whose startup files put another `gh` first; without zsh those
+cases are skipped, and `IDENTITY_REQUIRE_ZSH=1` (set in CI) fails them
+instead.

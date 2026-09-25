@@ -1,49 +1,59 @@
-## Outcome
-
-What approved issue outcome does this deliver?
-
 Closes #
 
-## Changes
+<!--
+One Task, one pull request. The line above must name the Task or Bug:
+"Closes #n" in the same repository, "Closes owner/repo#n" across repositories,
+or "Closes" followed by the full issue URL. The governance/issue-link check fails
+without it. A hotfix/* pull request must close a Bug.
+A pull request that is still gathering evidence, or has a known gap, is a draft.
+-->
+
+## What changed
 
 -
 
-## Scope and non-goals
+## How verified
 
-- In scope:
-- Not included:
+<!-- The exact commands run and their results. Numbers and names, not a story. -->
 
-## Verification
+```text
+$
+```
 
-- Local commands and results:
-- User-visible workflow exercised:
-- Negative/recovery paths:
-- Independent/risk review required:
+## Tests added
 
-## Contracts, data and operations
+<!-- File and test name, level (unit, integration, end-to-end, browser, widget, golden). -->
 
-- API/event/schema compatibility:
-- Migration/configuration/entitlement effects:
-- Security/tenancy/financial/concurrency effects:
-- Deployment and rollback:
-- Observability:
+- [ ] Each new behaviour has at least one test that I saw failing before the change
 
-## Knowledge impact
+-
 
-- Canonical documentation/code maps:
-- Manuals/runbooks/training/marketing/RAG:
+## Regression surface run
 
-## Deployed acceptance still required
+<!-- The regression surface named in the Task, with the command and its result. -->
 
-- Environment and steps:
-- Expected evidence:
-- Known limitations/watch items:
+-
 
-## Author checklist
+## Screenshots
 
-- [ ] The branch was created from current `test` and targets `test` (unless this is an authorised hotfix).
-- [ ] The linked issue is Ready and no unresolved decision was invented in implementation.
-- [ ] Required repository gates pass for the current revision.
-- [ ] Unrelated changes and secrets are absent.
-- [ ] Migration, rollback and documentation effects are explicit.
-- [ ] I have not approved or merged this pull request myself.
+<!-- User-visible change: the changed screen, light and dark where the product has both. Write "Not user-visible" otherwise. -->
+
+## Risk surfaces touched
+
+<!-- Tick every one that applies. Any tick means a second, adversarial review before merge. -->
+
+- [ ] Security
+- [ ] Tenancy / RLS
+- [ ] Migration of live data
+- [ ] Money
+- [ ] Concurrency
+- [ ] Offline sync
+- [ ] Cross-repository contract
+- [ ] Deployment
+- [ ] None of the above
+
+## Docs updated
+
+<!-- The docs the Task names, updated in this pull request. Path, or "None named by the Task". -->
+
+-
