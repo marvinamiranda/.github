@@ -1,27 +1,28 @@
 # Contributing
 
-## Choose the correct work item
+The rules are the organisation's delivery standard
+(`01 - Governance/DELIVERY.md` in the MarvinaMiranda knowledge repository).
+This page is the short form.
 
-Create work through the guided issue forms. Blank issues are disabled.
+## Choose the issue type
 
-- Initiative: large measurable outcome.
-- Feature: coherent product capability.
-- Story: smallest independently demonstrable value slice.
-- Technical task: independently verifiable enabler owned by a story.
-- Bug: observed deviation from approved behaviour.
-- Hotfix: urgent production P0/P1 only.
-- Data correction: controlled repair of existing data.
-- Release acceptance: release-level evidence and sign-off.
+Blank issues are disabled; every issue starts from a form.
 
-## Normal delivery path
+- **Epic** — one capability a user recognises; 3–12 Tasks as sub-issues.
+- **Task** — exactly one pull request, at most ~400 changed lines.
+- **Bug** — behaviour that contradicts the docs or the tests; fixed with a test that failed first.
+- **Decision** — a question only the owner may answer, titled `DECISION: <the question>`.
+- **Spike** — at most a day's investigation, ending in a written finding in the docs.
 
-1. Begin only with an approved, Ready issue.
-2. Branch from current `test` using `feature|fix|chore|refactor|docs/<issue>-<slug>`.
-3. Run repository-required local checks and exercise affected behaviour.
-4. Open a pull request to `test`; link the issue and provide evidence.
-5. Resolve CI and review findings. Only a human approves or merges.
-6. After merge, deploy the changed immutable artifact to the test environment.
-7. Independently validate the running product and reconcile documentation/evidence.
-8. Production release uses a human-approved `test` to `main` pull request.
+Milestones are GitHub milestones, not issues.
 
-Only `hotfix/<issue>-<slug>` may target `main` directly, and it must be reconciled back into `test` immediately.
+## Delivery path
+
+1. Start only a **Ready** Task with no open *blocked by*, whose `area:` has no other Task In progress.
+2. Branch from current `test` as `<issue>-<slug>` (for example `742-supplier-list`). Hotfixes branch from `main` as `hotfix/<slug>`.
+3. Commit with Conventional Commits: `feat(area): …`, `fix(area): …`, `test`, `docs`, `refactor`, `chore`.
+4. Open the pull request into `test` with `Closes #n` in the body. Draft until it is a merge candidate.
+5. The Agent App squash-merges when every required check and `review/independent` (posted by the Reviewer App) pass on the head commit.
+6. `main` changes only by a pull request from `test` or `hotfix/*`, merged by the owner with a merge commit. The Agent App opens release pull requests. A hotfix is merged back into `test` the same day.
+
+Never force-push or delete `test` or `main`, rewrite a pushed shared branch, or `git stash` in a shared checkout.
