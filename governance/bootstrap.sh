@@ -42,7 +42,7 @@ CONFIG_DIR=""
 CONFIG_REF="test"
 STRICT_UP_TO_DATE=false
 REVIEWER_APP_ID=""
-REVIEWER_APP_JSON="$HOME/.config/mm-agent/mm-reviewer/app.json"
+REVIEWER_APP_JSON="${MM_REVIEWER_APP_JSON:-$HOME/.config/mm-agent/mm-reviewer/app.json}"
 
 # GitHub Actions' app id. Every required CI check and governance/issue-link is a
 # check run created by this app; pinning the context to it means neither a
