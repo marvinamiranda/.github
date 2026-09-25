@@ -27,7 +27,13 @@ jobs:
         run: node governance/tests/pr-governance.test.js
       - name: bootstrap (stub gh, no network)
         run: node governance/tests/bootstrap.test.js
+      # The identity suite starts zsh as login and interactive shells, as the
+      # agent CLIs do; the runner image has no zsh, and a skipped case would pass.
+      - name: zsh, for the identity suite
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh && zsh --version
       - name: agent identity (stub curl and gh, no network)
+        env:
+          IDENTITY_REQUIRE_ZSH: '1'
         run: node governance/tests/identity.test.js
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
