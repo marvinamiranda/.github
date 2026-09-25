@@ -1,0 +1,140 @@
+# governance/issue-link — DELIVERY §9: one Task, one pull request, and the pull
+# request body says which issue it closes.
+#
+# Called from each adopted repository (see README, "PR governance"). It
+# publishes a check run named exactly `governance/issue-link` through the
+# Checks API, because a reusable workflow's own job appears as
+# "<caller job> / <this job>" and a ruleset cannot require a name that varies
+# with the caller. A check run can only be created by a GitHub App — here the
+# Actions app, through GITHUB_TOKEN — so a personal token cannot forge it, and
+# rulesets pin the context to that app.
+#
+# The matching logic lives in governance/issue-link.js, shared with
+# governance/tests/issue-link.test.js. No third-party actions.
+#
+# A second job, `areas`, proves the calling repository's
+# .github/governance/areas.txt still gives every tracked file exactly one area
+# (DELIVERY §6), using governance/areas-check.js from this repository.
+name: PR governance
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Runner for the job, as JSON: '"ubuntu-latest"' or '["self-hosted","pool-linux"]'.
+          Required, because a check a ruleset requires must land on a runner that exists.
+        type: string
+        required: true
+      governance-ref:
+        description: Ref of marvinamiranda/.github whose governance/*.js is used.
+        type: string
+        required: false
+        default: test
+
+jobs:
+  issue-link:
+    name: issue-link
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions:
+      checks: write
+      contents: read
+      issues: read
+    steps:
+      - name: Fetch the shared matcher
+        uses: actions/checkout@v4
+        with:
+          repository: marvinamiranda/.github
+          ref: ${{ inputs.governance-ref }}
+          path: .org-governance
+          sparse-checkout: governance/issue-link.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Judge the pull request body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const lib = require('./.org-governance/governance/issue-link.js');
+            const pr = context.payload.pull_request;
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            let verdict = lib.evaluate({
+              body: pr.body || '',
+              headRef: pr.head.ref,
+              baseRef: pr.base.ref,
+              repository,
+            });
+
+            // hotfix/* must close a Bug. Only the API knows an issue's type.
+            if (verdict.status === 'pass' && verdict.requireBug) {
+              const notes = [];
+              let bug = null;
+              for (const ref of verdict.refs) {
+                try {
+                  const { data } = await github.rest.issues.get({
+                    owner: ref.owner, repo: ref.repo, issue_number: ref.number,
+                  });
+                  if (lib.isBug(data)) { bug = ref; break; }
+                  notes.push(`${ref.key} is ${data.pull_request ? 'a pull request' : `of type ${data.type ? data.type.name : 'none'}`}`);
+                } catch (error) {
+                  notes.push(`${ref.key} could not be read (HTTP ${error.status || '?'}); link a Bug in this repository`);
+                }
+              }
+              verdict = bug
+                ? { ...verdict, message: `Hotfix closes Bug ${bug.key}` }
+                : { ...verdict, status: 'fail', message: `A hotfix/* pull request must close a Bug. ${notes.join('; ')}.` };
+            }
+
+            const ok = verdict.status !== 'fail';
+            const title = verdict.status === 'exempt'
+              ? 'Release pull request: exempt'
+              : ok ? verdict.message : 'No closing issue link';
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'governance/issue-link',
+              head_sha: pr.head.sha,
+              status: 'completed',
+              conclusion: ok ? 'success' : 'failure',
+              output: { title: title.slice(0, 255), summary: verdict.message },
+            });
+            core.summary.addHeading('governance/issue-link').addRaw(verdict.message).write();
+            if (!ok) core.setFailed(verdict.message);
+
+  areas:
+    name: areas
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # pull_request: the merge of the head into the base, which is what will
+      # land. Under pull_request_target this is the base; the check then proves
+      # the base, which is harmless and never executes pull request code.
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          path: product
+          persist-credentials: false
+
+      - name: Fetch the shared checker
+        uses: actions/checkout@v4
+        with:
+          repository: marvinamiranda/.github
+          ref: ${{ inputs.governance-ref }}
+          path: .org-governance
+          sparse-checkout: governance/areas-check.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Every tracked file has exactly one area
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { checkAreas } = require('./.org-governance/governance/areas-check.js');
+            const { ok, report } = checkAreas({ checkout: 'product', ref: 'HEAD' });
+            console.log(report);
+            if (!ok) core.setFailed('areas.txt no longer partitions this repository; see the log above.');

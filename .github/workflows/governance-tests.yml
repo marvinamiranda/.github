@@ -1,0 +1,41 @@
+# Tests for this repository's own governance code. Public repository, so the
+# hosted runner costs nothing. No paths filter: it must report on every pull
+# request to be requirable.
+name: Governance tests
+
+on:
+  pull_request:
+    branches: [test, main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: governance tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: issue-link matcher
+        run: node governance/tests/issue-link.test.js
+      - name: areas checker
+        run: node governance/tests/areas-check.test.js
+      - name: shellcheck
+        run: shellcheck governance/bootstrap.sh governance/identity/*.sh
+      - name: identity manifests parse
+        run: for f in governance/identity/*.manifest.json; do python3 -m json.tool "$f" >/dev/null; done
+      - name: YAML parses
+        run: |
+          python3 - <<'EOF'
+          import glob, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob('.github/**/*.yml', recursive=True)):
+              try:
+                  yaml.safe_load(open(f))
+              except Exception as e:
+                  print(f'{f}: {e}'); bad += 1
+          sys.exit(bad)
+          EOF
