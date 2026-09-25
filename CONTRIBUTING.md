@@ -23,6 +23,6 @@ Milestones are GitHub milestones, not issues.
 3. Commit with Conventional Commits: `feat(area): …`, `fix(area): …`, `test`, `docs`, `refactor`, `chore`.
 4. Open the pull request into `test` with `Closes #n` in the body. Draft until it is a merge candidate.
 5. The Agent App squash-merges when every required check and `review/independent` (posted by the Reviewer App) pass on the head commit.
-6. `main` changes only by a pull request from `test` or `hotfix/*`, merged by the owner with a merge commit. The Agent App opens release pull requests. A hotfix is merged back into `test` the same day.
+6. `main` changes only by a pull request from `test` or `hotfix/*`, merged by the owner with a merge commit. The Agent App opens release pull requests. A hotfix is merged back into `test` the same day by a pull request from `main`, merged with a merge commit: the only pull request into `test` that is not squashed.
 
 Never force-push or delete `test` or `main`, rewrite a pushed shared branch, or `git stash` in a shared checkout.

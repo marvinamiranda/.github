@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 # Bootstrap the delivery standard (DELIVERY §14) for the marvinamiranda organisation.
 #
-#   governance/bootstrap.sh --repo omni237 --repo omni237-ops                       # dry run
-#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply # stage an adoption
-#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --probe --apply       # owner only
+# In this order, each run from a merged commit (below):
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops                                # 1. dry run
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply          # 2. stage an adoption
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --probe --no-rulesets --apply  # 3. Reviewer App probe
+#   4. one Agent App squash-merge into test: under the rulesets a passing pull
+#      request is the only way in, and the Agent App merges agents' ones.
+#      Proven: marvinamiranda/omni237-ops#160 was squash-merged into test by
+#      app/marvinamiranda-agent (commit 2be0641, 2026-09-25 17:52 UTC).
+#   governance/bootstrap.sh --repo omni237 --repo omni237-ops --apply                        # 5. rulesets, owner only
+# Without --no-rulesets, step 3 would also apply the rulesets in the same run.
 #
-# RUN IT FROM A REVIEWED COMMIT: check this repository out by the SHA of a
-# merged commit (`git checkout <sha>`), never from a branch tip — not even
-# `test`. With --apply it refuses to run from a checkout with uncommitted
-# changes, and it prints the commit it runs from.
+# RUN IT FROM A MERGED COMMIT: check this repository out by the SHA of a commit
+# on its test branch (`git checkout <sha>`). --apply refuses anything else: a
+# commit that is not on test as GitHub has it now (read from
+# https://github.com/marvinamiranda/.github.git, never from `origin`), a
+# checkout with uncommitted changes, or files outside a git checkout. It
+# prints the commit it runs from.
 #
 # DRY RUN BY DEFAULT: only read calls are made, and every call that would
 # change something is printed instead. `--apply` executes them. Idempotent:
@@ -31,12 +40,11 @@
 #   e) rulesets `test-integration`, `main-owner-only` and `main-checks` on each
 #      repo AND on marvinamiranda/.github itself, created or updated by name
 #      (DELIVERY §9, §10); legacy rulesets on test or main are set to
-#      enforcement `disabled` (never deleted). Skipped with --no-rulesets.
+#      enforcement `disabled` (never deleted). They need the Reviewer App's id:
+#      without it the run stops before it changes anything. Skipped with
+#      --no-rulesets.
 #   f) with --project: the Project, its Status/Priority/Size fields, and a link
 #      to each repo
-#
-# Before the first --apply with rulesets, prove one Agent App squash-merge into
-# test on a throwaway pull request: the rulesets allow nothing else.
 #
 # What it never does: delete a label, a ruleset, a field, a field option or an
 # issue. Anything that exists and is not in the standard is REPORTED so the
@@ -44,7 +52,7 @@
 # installed by the owner (governance/identity/, DELIVERY Appendix A).
 #
 # Needs: gh (for --apply: an organisation owner with admin:org, repo and
-# project scopes), jq, and bash 3.2 or later.
+# project scopes), git, jq, and bash 3.2 or later.
 set -euo pipefail
 
 ORG="marvinamiranda"
@@ -60,6 +68,7 @@ OWNER_USER_ID=1245936
 # This repository. Its own test and main get rulesets too: it holds the code
 # every other repository's required checks run.
 SELF_REPO=".github"
+SELF_URL="https://github.com/$ORG/$SELF_REPO.git"
 SELF_CHECKS="governance tests"
 CONFIG_DIR=""
 CONFIG_REF="test"
@@ -76,7 +85,8 @@ REVIEWER_APP_JSON="${MM_REVIEWER_APP_JSON:-$HOME/.config/mm-agent/mm-reviewer/ap
 ACTIONS_APP_ID=15368
 
 usage() {
-  sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
+  # The comment block at the top of this file, whatever its length.
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
   cat <<EOF
 
 Options:
@@ -85,7 +95,8 @@ Options:
   --no-rulesets            Everything except rulesets: stage an adoption, and
                            apply rulesets once the adoption PR has merged.
   --probe                  Have the Reviewer App post a neutral review/independent
-                           check on each repo's test head (needs its key).
+                           check on each repo's test head (needs its key). Pair it
+                           with --no-rulesets, or the same run applies the rulesets.
   --project                Also ensure the Project and link the repos to it.
   --project-title <t>      Project title. Required with --project.
   --reviewer-app-id <id>   The Reviewer App's id, which review/independent is pinned to.
@@ -207,18 +218,61 @@ else
   info "Product config: each repo's .github/governance/ on $CONFIG_REF"
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Provenance: --apply runs only from a commit that is on this repository's
+# test as GitHub has it now, read from its canonical URL (never from whatever
+# `origin` points at), with no uncommitted changes. A commit that only exists
+# in this clone, or on a pull request branch, could hold a bypass nobody
+# reviewed. Checked before any gh call.
+not_reviewed=""
 if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  info "Running from marvinamiranda/.github commit $(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+  head_sha="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+  info "Running from $ORG/$SELF_REPO commit $head_sha"
   if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- .)" ]]; then
-    if [[ $APPLY -eq 1 ]]; then
-      echo "Refusing --apply: this checkout has uncommitted changes. Check out a reviewed commit by SHA." >&2
-      exit 1
-    fi
-    warn "this checkout has uncommitted changes; --apply would refuse to run."
+    not_reviewed="this checkout has uncommitted changes"
+  elif ! test_sha="$(git ls-remote "$SELF_URL" refs/heads/test 2>"$WORK/ls-remote.err" | cut -f1)" \
+      || [[ ! "$test_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    not_reviewed="$ORG/$SELF_REPO test could not be read from $SELF_URL: $(tr '\n' ' ' <"$WORK/ls-remote.err")"
+  elif ! git -C "$SCRIPT_DIR" cat-file -e "$test_sha^{commit}" 2>/dev/null \
+      && ! git -C "$SCRIPT_DIR" fetch --quiet --no-tags "$SELF_URL" "$test_sha" 2>"$WORK/fetch.err"; then
+    not_reviewed="$ORG/$SELF_REPO test (${test_sha:0:12}) could not be fetched: $(tr '\n' ' ' <"$WORK/fetch.err")"
+  elif git -C "$SCRIPT_DIR" merge-base --is-ancestor "$head_sha" "$test_sha"; then
+    info "That commit is on $ORG/$SELF_REPO test (read now: ${test_sha:0:12})."
+  else
+    not_reviewed="commit ${head_sha:0:12} is not on $ORG/$SELF_REPO test (read now: ${test_sha:0:12}), so it has not been merged"
   fi
 else
-  warn "not running from a git checkout; the commit cannot be shown."
+  not_reviewed="this is not a git checkout, so its commit cannot be checked"
 fi
+if [[ -n "$not_reviewed" ]]; then
+  if [[ $APPLY -eq 1 ]]; then
+    echo "Refusing --apply: $not_reviewed. Check out a merged commit of $ORG/$SELF_REPO by its SHA." >&2
+    exit 1
+  fi
+  warn "$not_reviewed; --apply would refuse to run."
+fi
+
+# The Reviewer App id that review/independent is pinned to. Without it no
+# ruleset is applied: this repository's own test-integration would require
+# only `governance tests`, which a pull request here can rewrite, and this
+# repository's code decides every other repository's checks.
+if [[ -z "$REVIEWER_APP_ID" && -r "$REVIEWER_APP_JSON" ]]; then
+  REVIEWER_APP_ID="$(jq -r '.id // empty' "$REVIEWER_APP_JSON")"
+  [[ "$REVIEWER_APP_ID" =~ ^[0-9]+$ ]] || REVIEWER_APP_ID=""
+fi
+if [[ -n "$REVIEWER_APP_ID" ]]; then
+  info "Reviewer App id: $REVIEWER_APP_ID (review/independent is pinned to it)"
+elif (( SKIP_RULESETS )); then
+  info "Reviewer App id: none (no ruleset is applied with --no-rulesets)"
+else
+  {
+    echo "No Reviewer App id, so no rulesets: $ORG/$SELF_REPO's own test-integration would require"
+    echo "only 'governance tests', which a pull request here can rewrite. Create the Reviewer App"
+    echo "(governance/identity/create-app.py mm-reviewer), then re-run with --reviewer-app-id <id>"
+    echo "or with $REVIEWER_APP_JSON present; or run with --no-rulesets."
+  } >&2
+  exit 1
+fi
+
 owner_login="$(gh api "user/$OWNER_USER_ID" --jq .login)"
 info "main may be moved only by: $owner_login (user id $OWNER_USER_ID), through a pull request"
 viewer="$(gh api user --jq .login)"
@@ -231,25 +285,6 @@ if [[ "$scopes" != *"admin:org"* ]]; then
 fi
 if [[ $WANT_PROJECT -eq 1 && "$scopes" != *"project"* ]]; then
   warn "token lacks the project scope — --apply will fail on the Project."
-fi
-
-# The Reviewer App id that review/independent is pinned to.
-if [[ -z "$REVIEWER_APP_ID" && -r "$REVIEWER_APP_JSON" ]]; then
-  REVIEWER_APP_ID="$(jq -r '.id // empty' "$REVIEWER_APP_JSON")"
-  [[ "$REVIEWER_APP_ID" =~ ^[0-9]+$ ]] || REVIEWER_APP_ID=""
-fi
-if [[ -n "$REVIEWER_APP_ID" ]]; then
-  info "Reviewer App id: $REVIEWER_APP_ID (review/independent is pinned to it)"
-else
-  printf '\n'
-  printf '   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n'
-  printf '   !! NO REVIEWER APP ID. review/independent is OMITTED from test-integration.\n'
-  printf '   !! Requiring it unpinned would let any writer post it; requiring it with\n'
-  printf '   !! no reviewer would block every pull request. Neither is acceptable, so\n'
-  printf '   !! independent review is NOT enforced until you create the Reviewer App\n'
-  printf '   !! (governance/identity/create-app.py mm-reviewer) and re-run this with\n'
-  printf '   !! --reviewer-app-id <id> or with %s present.\n' "$REVIEWER_APP_JSON"
-  printf '   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n'
 fi
 
 # Materialise each repo's product config into $WORK/cfg/<repo>/.
@@ -396,9 +431,12 @@ required_checks_json() {
   fi
 }
 
-# test-integration (DELIVERY §9): pull request, squash only, no approvals (the
-# review is the pinned review/independent check), required checks, no force
-# push, no deletion, no bypass for anyone.
+# test-integration (DELIVERY §9): pull request, no approvals (the review is the
+# pinned review/independent check), required checks, no force push, no
+# deletion, no bypass for anyone. Squash, which is how every Task lands, or a
+# merge commit, which exists only to bring main back into test after a hotfix
+# (a pull request from main), so the two branches keep one history. A ruleset
+# cannot tie a merge method to a head branch: that one is procedural.
 test_ruleset() {
   jq -n --argjson checks "$1" --argjson strict "$STRICT_UP_TO_DATE" '{
     name: "test-integration", target: "branch", enforcement: "active",
@@ -412,7 +450,7 @@ test_ruleset() {
         require_code_owner_review: false, require_last_push_approval: false,
         required_review_thread_resolution: false,
         require_extra_approval_for_unattributed_changes: false,
-        allowed_merge_methods: ["squash"]}},
+        allowed_merge_methods: ["squash", "merge"]}},
       {type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: $strict, do_not_enforce_on_create: false,
         required_status_checks: $checks}}
@@ -463,13 +501,15 @@ main_checks_ruleset() {
     ]}'
 }
 
-# Normalises a ruleset (desired or fetched) so the two can be diffed.
+# Normalises a ruleset (desired or fetched) so the two can be diffed. Merge
+# methods compare as a set; a pull request rule without them allows all three,
+# as GitHub does.
 normalise_ruleset() {
   jq -S '{name, target, enforcement,
           bypass_actors: (.bypass_actors // [] | map({actor_id, actor_type, bypass_mode}) | sort_by(.actor_type, .actor_id)),
           conditions: {ref_name: .conditions.ref_name},
           rules: (.rules | map(
-            if .type == "pull_request" then {type, parameters: (.parameters | {required_approving_review_count, dismiss_stale_reviews_on_push, require_code_owner_review, require_last_push_approval, required_review_thread_resolution, require_extra_approval_for_unattributed_changes: (.require_extra_approval_for_unattributed_changes // false), allowed_merge_methods: (.allowed_merge_methods | sort)})}
+            if .type == "pull_request" then {type, parameters: (.parameters | {required_approving_review_count, dismiss_stale_reviews_on_push, require_code_owner_review, require_last_push_approval, required_review_thread_resolution, require_extra_approval_for_unattributed_changes: (.require_extra_approval_for_unattributed_changes // false), allowed_merge_methods: (.allowed_merge_methods // ["merge", "squash", "rebase"] | unique)})}
             elif .type == "required_status_checks" then {type, parameters: (.parameters | {strict_required_status_checks_policy, do_not_enforce_on_create: (.do_not_enforce_on_create // false), required_status_checks: (.required_status_checks | map({context} + (if .integration_id then {integration_id} else {} end)) | sort_by(.context))})}
             elif .type == "update" then {type, parameters: {update_allows_fetch_and_merge: (.parameters.update_allows_fetch_and_merge // false)}}
             else {type} end) | sort_by(.type))}'
@@ -548,9 +588,6 @@ for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
     main_checks_ruleset "$(required_checks_json none issue-link "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
   fi
   main_owner_ruleset >"$WORK/rs-main-owner-$repo.json"
-  if [[ -z "$REVIEWER_APP_ID" ]]; then
-    warn "$repo test-integration: review/independent OMITTED (no Reviewer App id) — independent review is not enforced."
-  fi
 
   for payload in "$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json"; do
     name="$(jq -r .name "$payload")"
