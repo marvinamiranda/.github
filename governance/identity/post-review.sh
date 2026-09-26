@@ -8,6 +8,8 @@
 # review/independent. A new push has no check run for its new head, which is
 # what resets the review. Findings belong in review comments on the pull
 # request; <summary> is the one-paragraph verdict.
+# Requires MM_REAL_GH_BIN and an isolated GH_CONFIG_DIR from agent-env.sh; PATH
+# may begin with the mm-agent identity shim and is never used to choose gh.
 set -euo pipefail
 
 usage() { echo "usage: post-review.sh <owner/repo> <sha> <success|failure> <summary>" >&2; exit 2; }
@@ -19,8 +21,29 @@ case "$CONCLUSION" in success|failure) ;; *) echo "conclusion must be success or
 [[ -n "$SUMMARY" ]] || { echo "summary is empty" >&2; usage; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL_GH="${MM_REAL_GH_BIN:-}"
+if [[ "$REAL_GH" != /* || ! -f "$REAL_GH" || ! -x "$REAL_GH" ]]; then
+  echo "post-review.sh: no verified real GitHub CLI path; eval agent-env.sh and retry" >&2
+  exit 1
+fi
+case "$REAL_GH" in
+  "$HOME"/.config/mm-agent/*/bin/gh)
+    echo "post-review.sh: MM_REAL_GH_BIN points to an identity shim, not the real GitHub CLI" >&2
+    exit 1
+    ;;
+esac
+case "${GH_CONFIG_DIR:-}" in
+  "$HOME"/.config/mm-agent/*/gh) ;;
+  *) echo "post-review.sh: no isolated agent GH_CONFIG_DIR; eval agent-env.sh and retry" >&2; exit 1 ;;
+esac
+if [[ ! -d "$GH_CONFIG_DIR" || -e "$GH_CONFIG_DIR/hosts.yml" ]]; then
+  echo "post-review.sh: agent GH_CONFIG_DIR is missing or contains a login; eval agent-env.sh and retry" >&2
+  exit 1
+fi
+
 GH_TOKEN="$("$HERE/app-token.sh" mm-reviewer)"
 export GH_TOKEN
+unset GITHUB_TOKEN
 
 title="Independent review: $CONCLUSION"
 jq -n --arg sha "$SHA" --arg c "$CONCLUSION" --arg t "$title" --arg s "$SUMMARY" '{
@@ -29,4 +52,4 @@ jq -n --arg sha "$SHA" --arg c "$CONCLUSION" --arg t "$title" --arg s "$SUMMARY"
     status: "completed",
     conclusion: $c,
     output: {title: $t, summary: $s}
-  }' | gh api -X POST "repos/$REPO/check-runs" --input - --jq '"posted review/independent=\(.conclusion) on \(.head_sha[0:12]) as \(.app.slug): \(.html_url)"'
+  }' | "$REAL_GH" api -X POST "repos/$REPO/check-runs" --input - --jq '"posted review/independent=\(.conclusion) on \(.head_sha[0:12]) as \(.app.slug): \(.html_url)"'

@@ -72,11 +72,13 @@ const brewLog = path.join(root, 'brew-gh.log');
 const src = path.join(root, 'src'); // the checkout the scripts run from
 const canon = path.join(root, 'canon.git'); // stands in for marvinamiranda/.github
 const IDENTITY = path.join(src, 'governance', 'identity');
+const POST_REVIEW = path.join(IDENTITY, 'post-review.sh');
 const ROOT = path.join(home, '.config', 'mm-agent');
 const DIR = path.join(ROOT, NAME);
 const CACHE = path.join(DIR, 'token.cache');
 const PACKAGES = path.join(ROOT, 'packages-token');
 const REAL_GH = path.join(realBin, 'gh');
+const REVIEW_SHA = 'a3ff6b5a1f95bd8d45605d122fbf4cecc0189d6f';
 
 for (const d of [stubBin, realBin, brewBin, gitHome]) fs.mkdirSync(d, { recursive: true });
 
@@ -119,10 +121,11 @@ if (fmt) process.stdout.write(fmt.replace('%{http_code}', String(r.status)));
 // The "real" gh: records what it was given. Reaching it is the only way a
 // command can act on GitHub, so every refusal is checked against this log.
 fs.writeFileSync(REAL_GH, `#!/usr/bin/env node
+const input = require('fs').readFileSync(0, 'utf8');
 require('fs').appendFileSync(process.env.FAKE_REAL_GH_LOG, JSON.stringify({
   token: process.env.GH_TOKEN === undefined ? null : process.env.GH_TOKEN,
   config: process.env.GH_CONFIG_DIR === undefined ? null : process.env.GH_CONFIG_DIR,
-  args: process.argv.slice(2) }) + '\\n');
+  args: process.argv.slice(2), input }) + '\\n');
 console.log('real gh ran: ' + process.argv.slice(2).join(' '));
 `, { mode: 0o755 });
 
@@ -157,6 +160,8 @@ for (const f of SCRIPTS) {
   fs.copyFileSync(path.join(IDENTITY_SRC, f), path.join(IDENTITY, f));
   fs.chmodSync(path.join(IDENTITY, f), 0o755);
 }
+fs.copyFileSync(path.join(IDENTITY_SRC, 'post-review.sh'), path.join(IDENTITY, 'post-review.sh'));
+fs.chmodSync(path.join(IDENTITY, 'post-review.sh'), 0o755);
 git(root, 'init', '-q', src);
 git(src, 'add', '.');
 git(src, 'commit', '-q', '-m', 'identity scripts');
@@ -244,6 +249,15 @@ function writeCache({ token, mintedAgo = 0, expiresIn = 3600 - mintedAgo, oneLin
   fs.writeFileSync(CACHE, oneLine ? first : `${first}${now() - mintedAgo}\n`, { mode: 0o600 });
 }
 
+function writeReviewerFixture() {
+  const dir = path.join(ROOT, 'mm-reviewer');
+  const minted = now();
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, 'app.json'), JSON.stringify({ id: 222, slug: 'fake-reviewer', name: 'Fake Reviewer' }), { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, 'private-key.pem'), privateKey, { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, 'token.cache'), `${minted + 3600} ghs_REVIEWER_FIXTURE\n${minted}\n`, { mode: 0o600 });
+}
+
 function env(extra = {}) {
   return {
     HOME: home,
@@ -307,6 +321,9 @@ function zshOrSkip(what) {
   const w = inChild(printed, 'command -v gh');
   ok('a grandchild process resolves gh to the shim, not the real gh',
     w.stdout.trim().startsWith(`${DIR}/`) && w.stdout.trim() !== REAL_GH, w.stdout.trim() || w.stderr.trim());
+  const real = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
+  ok('agent-env exports the absolute real gh path it found before installing the shim',
+    field(real.stdout, 'real-gh') === REAL_GH, real.stdout.trim());
 
   const old = run(['-c', 'gh() { echo OLD; }; eval "$1"; type -t gh', '_', printed]);
   ok('a gh() function left by an older agent-env.sh is replaced by the shim', old.stdout.trim() === 'file', old.stdout.trim());
@@ -317,6 +334,64 @@ function zshOrSkip(what) {
     const z = spawnSync('zsh', ['-c', 'alias gh="echo ALIAS"; eval "$1" && command -v gh', '_', printed], { env: env(), encoding: 'utf8' });
     ok('the printed environment also evaluates under zsh, with an alias named gh', z.status === 0 && z.stdout.trim().startsWith(`${DIR}/`), (z.stdout + z.stderr).trim());
   }
+})();
+
+// ---------------------------- post-review.sh uses the Reviewer App identity ----
+(function postReviewUsesReviewerIdentity() {
+  fresh();
+  fs.writeFileSync(path.join(DIR, 'bot-id'), '99\n');
+  writeCache({ token: 'ghs_AGENT_FIXTURE' });
+  writeReviewerFixture();
+  const printed = agentEnv().stdout;
+  const agentShim = path.join(SHIM(), 'bin', 'gh');
+  const post = `${JSON.stringify(POST_REVIEW)} marvinamiranda/omni237 ${REVIEW_SHA} success ${JSON.stringify('fixture review')}`;
+  const before = records(curlLog).length;
+  fs.writeFileSync(ghLog, '');
+
+  const result = inChild(printed, `printf 'shim=%s\\n' "$(command -v gh)"; printf 'real=%s\\n' "$MM_REAL_GH_BIN"; ${post}`);
+  const calls = ghRuns();
+  const call = calls[0];
+  let payload = null;
+  try { payload = call ? JSON.parse(call.input) : null; } catch {}
+  ok('post-review succeeds with the mm-agent shim first on PATH',
+    result.status === 0 && field(result.stdout, 'shim') === agentShim && field(result.stdout, 'real') === REAL_GH
+      && calls.length === 1 && call.args[0] === 'api' && call.args.includes('repos/marvinamiranda/omni237/check-runs'),
+    `status=${result.status}; shim=${field(result.stdout, 'shim')}; real=${field(result.stdout, 'real')}; calls=${calls.length}`);
+  ok('post-review sends the exact independent check name and head SHA',
+    payload?.name === 'review/independent' && payload.head_sha === REVIEW_SHA
+      && payload.status === 'completed' && payload.conclusion === 'success',
+    payload ? JSON.stringify(payload) : 'no check payload recorded');
+  ok('post-review passes the cached mm-reviewer fixture token directly to real gh',
+    call?.token === 'ghs_REVIEWER_FIXTURE' && call.config === path.join(DIR, 'gh'),
+    `reviewer-token=${call?.token === 'ghs_REVIEWER_FIXTURE' ? 'yes' : 'no'}; isolated-config=${call?.config === path.join(DIR, 'gh')}`);
+  ok('the fixture token is never printed and the helper makes no API calls',
+    !result.stdout.includes('ghs_REVIEWER_FIXTURE') && !result.stderr.includes('ghs_REVIEWER_FIXTURE')
+      && before === 0 && records(curlLog).length === before,
+    `stdout-has-token=${result.stdout.includes('ghs_REVIEWER_FIXTURE')}; stderr-has-token=${result.stderr.includes('ghs_REVIEWER_FIXTURE')}; calls-before=${before}; calls-after=${records(curlLog).length}`);
+
+  fs.writeFileSync(ghLog, '');
+  const absent = inChild(printed, `unset MM_REAL_GH_BIN; ${post}`);
+  ok('post-review fails closed without the discovered real gh path instead of using PATH',
+    absent.status !== 0 && ghRuns().length === 0 && records(curlLog).length === before,
+    `status=${absent.status}; real-gh-runs=${ghRuns().length}; fake-api-calls=${records(curlLog).length - before}`);
+
+  const shimPath = `MM_REAL_GH_BIN=${JSON.stringify(agentShim)}; export MM_REAL_GH_BIN; ${post}`;
+  const shim = inChild(printed, shimPath);
+  ok('post-review rejects an identity shim passed as the real gh path',
+    shim.status !== 0 && ghRuns().length === 0 && records(curlLog).length === before,
+    `status=${shim.status}; real-gh-runs=${ghRuns().length}; fake-api-calls=${records(curlLog).length - before}`);
+
+  const ownerConfig = `GH_CONFIG_DIR=${JSON.stringify(path.join(home, '.config', 'gh'))}; export GH_CONFIG_DIR; ${post}`;
+  const config = inChild(printed, ownerConfig);
+  ok('post-review rejects an owner gh config that could supply a fallback login',
+    config.status !== 0 && ghRuns().length === 0 && records(curlLog).length === before,
+    `status=${config.status}; real-gh-runs=${ghRuns().length}; fake-api-calls=${records(curlLog).length - before}`);
+
+  fs.rmSync(agentShim, { force: true });
+  const missingShim = inChild(printed,
+    `source ${JSON.stringify(path.join(DIR, 'env'))}; printf 'real-gh=%s\\n' "\${MM_REAL_GH_BIN-unset}"`);
+  ok('the installed environment clears MM_REAL_GH_BIN when its shim is missing',
+    field(missingShim.stdout, 'real-gh') === 'unset', missingShim.stdout.trim());
 })();
 
 // ------------------------------------ R1: zsh login and interactive shells ----
@@ -461,10 +536,11 @@ function zshOrSkip(what) {
     setup();
     const r = agentEnv(owner, name);
     ok(`agent-env.sh exits non-zero when ${what}`, r.status !== 0, `status ${r.status}`);
-    const c = inChild(r.stdout, `echo "tokens=\${GH_TOKEN-unset}/\${GITHUB_TOKEN-unset}/\${GH_PACKAGES_TOKEN-unset}"; gh api user; echo "gh-rc=$?"; ${CRED}; ${COMMIT_CMD}`, owner);
+    const c = inChild(r.stdout, `echo "tokens=\${GH_TOKEN-unset}/\${GITHUB_TOKEN-unset}/\${GH_PACKAGES_TOKEN-unset}"; echo "real-gh=\${MM_REAL_GH_BIN-unset}"; gh api user; echo "gh-rc=$?"; ${CRED}; ${COMMIT_CMD}`, owner);
     const toks = (field(c.stdout, 'tokens') || '').split('/');
     ok(`...and what it printed leaves no identity: the sentinel, gh, git and commits refuse, the eval fails (${what})`,
       SENTINEL_RE.test(toks[0] || '') && toks[1] === 'unset' && toks[2] === 'unset'
+        && field(c.stdout, 'real-gh') === 'unset'
         && rcOf(c.stdout, 'gh-rc') !== 0 && ghRuns().length === 0
         && rcOf(c.stdout, 'git-rc') !== 0 && !/password=./.test(c.stdout) && rcOf(c.stdout, 'commit-rc') !== 0
         && rcOf(c.stderr, 'eval-rc') !== 0,
