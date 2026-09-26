@@ -125,6 +125,9 @@ const input = require('fs').readFileSync(0, 'utf8');
 require('fs').appendFileSync(process.env.FAKE_REAL_GH_LOG, JSON.stringify({
   token: process.env.GH_TOKEN === undefined ? null : process.env.GH_TOKEN,
   config: process.env.GH_CONFIG_DIR === undefined ? null : process.env.GH_CONFIG_DIR,
+  ghHost: process.env.GH_HOST === undefined ? null : process.env.GH_HOST,
+  enterpriseToken: process.env.GH_ENTERPRISE_TOKEN === undefined ? null : process.env.GH_ENTERPRISE_TOKEN,
+  githubEnterpriseToken: process.env.GITHUB_ENTERPRISE_TOKEN === undefined ? null : process.env.GITHUB_ENTERPRISE_TOKEN,
   args: process.argv.slice(2), input }) + '\\n');
 console.log('real gh ran: ' + process.argv.slice(2).join(' '));
 `, { mode: 0o755 });
@@ -358,21 +361,28 @@ function zshOrSkip(what) {
   const before = records(curlLog).length;
   fs.writeFileSync(ghLog, '');
 
-  const result = inChild(printed, `printf 'shim=%s\\n' "$(command -v gh)"; printf 'real=%s\\n' "$MM_REAL_GH_BIN"; ${post}`);
+  const inheritedEnterprise = {
+    GH_HOST: 'example.invalid',
+    GH_ENTERPRISE_TOKEN: 'fake-enterprise-owner-fixture',
+    GITHUB_ENTERPRISE_TOKEN: 'fake-github-enterprise-owner-fixture',
+  };
+  const result = inChild(printed, `printf 'shim=%s\\n' "$(command -v gh)"; printf 'real=%s\\n' "$MM_REAL_GH_BIN"; ${post}`, inheritedEnterprise);
   const calls = ghRuns();
   const call = calls[0];
   let payload = null;
   try { payload = call ? JSON.parse(call.input) : null; } catch {}
   ok('post-review succeeds with the mm-agent shim first on PATH',
     result.status === 0 && field(result.stdout, 'shim') === agentShim && field(result.stdout, 'real') === REAL_GH_CANON
-      && calls.length === 1 && call.args[0] === 'api' && call.args.includes('repos/marvinamiranda/omni237/check-runs'),
+      && calls.length === 1 && call.args[0] === 'api' && call.args.includes('repos/marvinamiranda/omni237/check-runs')
+      && call.args.includes('--hostname') && call.args[call.args.indexOf('--hostname') + 1] === 'github.com',
     `status=${result.status}; shim=${field(result.stdout, 'shim')}; real=${field(result.stdout, 'real')}; calls=${calls.length}`);
   ok('post-review sends the exact independent check name and head SHA',
     payload?.name === 'review/independent' && payload.head_sha === REVIEW_SHA
       && payload.status === 'completed' && payload.conclusion === 'success',
     payload ? JSON.stringify(payload) : 'no check payload recorded');
   ok('post-review passes the cached mm-reviewer fixture token directly to real gh',
-    call?.token === 'ghs_REVIEWER_FIXTURE' && call.config === path.join(DIR, 'gh'),
+    call?.token === 'ghs_REVIEWER_FIXTURE' && call.config === path.join(DIR, 'gh')
+      && call.ghHost === null && call.enterpriseToken === null && call.githubEnterpriseToken === null,
     `reviewer-token=${call?.token === 'ghs_REVIEWER_FIXTURE' ? 'yes' : 'no'}; isolated-config=${call?.config === path.join(DIR, 'gh')}`);
   ok('the fixture token is never printed and the helper makes no API calls',
     !result.stdout.includes('ghs_REVIEWER_FIXTURE') && !result.stderr.includes('ghs_REVIEWER_FIXTURE')

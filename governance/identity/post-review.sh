@@ -54,7 +54,7 @@ fi
 
 GH_TOKEN="$("$HERE/app-token.sh" mm-reviewer)"
 export GH_TOKEN
-unset GITHUB_TOKEN
+unset GITHUB_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 
 title="Independent review: $CONCLUSION"
 jq -n --arg sha "$SHA" --arg c "$CONCLUSION" --arg t "$title" --arg s "$SUMMARY" '{
@@ -63,4 +63,4 @@ jq -n --arg sha "$SHA" --arg c "$CONCLUSION" --arg t "$title" --arg s "$SUMMARY"
     status: "completed",
     conclusion: $c,
     output: {title: $t, summary: $s}
-  }' | "$REAL_GH" api -X POST "repos/$REPO/check-runs" --input - --jq '"posted review/independent=\(.conclusion) on \(.head_sha[0:12]) as \(.app.slug): \(.html_url)"'
+  }' | "$REAL_GH" api --hostname github.com -X POST "repos/$REPO/check-runs" --input - --jq '"posted review/independent=\(.conclusion) on \(.head_sha[0:12]) as \(.app.slug): \(.html_url)"'
