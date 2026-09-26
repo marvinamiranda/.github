@@ -282,11 +282,19 @@ trap on_exit EXIT
 # stack, and the gh found here is the real one, never a shim.
 clean_path=""
 real_gh=""
+root_canon="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ROOT" 2>/dev/null)" \
+  || locked "python3 is required to verify the real gh path"
+[[ "$root_canon" == /* ]] || locked "cannot resolve the mm-agent directory for real gh verification"
 IFS=: read -r -a path_dirs <<<"$PATH"
 for d in ${path_dirs[@]+"${path_dirs[@]}"}; do
   case "$d" in "$ROOT" | "$ROOT"/*) continue ;; esac
   clean_path="${clean_path:+$clean_path:}$d"
-  if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then real_gh="$d/gh"; fi
+  if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then
+    candidate_canon="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$d/gh" 2>/dev/null)" || continue
+    [[ "$candidate_canon" == /* && -f "$candidate_canon" && -x "$candidate_canon" ]] || continue
+    case "$candidate_canon" in "$root_canon" | "$root_canon"/*) continue ;; esac
+    real_gh="$candidate_canon"
+  fi
 done
 
 [[ $# -eq 1 ]] || locked "usage: agent-env.sh <mm-agent|mm-reviewer>"

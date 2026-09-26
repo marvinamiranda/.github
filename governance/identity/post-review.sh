@@ -26,12 +26,23 @@ if [[ "$REAL_GH" != /* || ! -f "$REAL_GH" || ! -x "$REAL_GH" ]]; then
   echo "post-review.sh: no verified real GitHub CLI path; eval agent-env.sh and retry" >&2
   exit 1
 fi
-case "$REAL_GH" in
-  "$HOME"/.config/mm-agent/*/bin/gh)
-    echo "post-review.sh: MM_REAL_GH_BIN points to an identity shim, not the real GitHub CLI" >&2
+if ! MM_ROOT_CANON="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/.config/mm-agent" 2>/dev/null)" \
+    || [[ "$MM_ROOT_CANON" != /* ]]; then
+  echo "post-review.sh: cannot resolve the mm-agent directory for real gh verification" >&2
+  exit 1
+fi
+if ! REAL_GH_CANON="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$REAL_GH" 2>/dev/null)" \
+    || [[ "$REAL_GH_CANON" != /* || ! -f "$REAL_GH_CANON" || ! -x "$REAL_GH_CANON" ]]; then
+  echo "post-review.sh: cannot verify the real GitHub CLI path" >&2
+  exit 1
+fi
+case "$REAL_GH_CANON" in
+  "$MM_ROOT_CANON" | "$MM_ROOT_CANON"/*)
+    echo "post-review.sh: MM_REAL_GH_BIN resolves inside the mm-agent identity directory" >&2
     exit 1
     ;;
 esac
+REAL_GH="$REAL_GH_CANON"
 case "${GH_CONFIG_DIR:-}" in
   "$HOME"/.config/mm-agent/*/gh) ;;
   *) echo "post-review.sh: no isolated agent GH_CONFIG_DIR; eval agent-env.sh and retry" >&2; exit 1 ;;

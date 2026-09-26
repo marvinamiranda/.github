@@ -128,6 +128,7 @@ require('fs').appendFileSync(process.env.FAKE_REAL_GH_LOG, JSON.stringify({
   args: process.argv.slice(2), input }) + '\\n');
 console.log('real gh ran: ' + process.argv.slice(2).join(' '));
 `, { mode: 0o755 });
+const REAL_GH_CANON = fs.realpathSync(REAL_GH);
 
 // The gh the owner's startup files put first (Homebrew's, on the owner's
 // machine). Like the real one it answers `gh auth token` with GH_TOKEN when
@@ -323,7 +324,7 @@ function zshOrSkip(what) {
     w.stdout.trim().startsWith(`${DIR}/`) && w.stdout.trim() !== REAL_GH, w.stdout.trim() || w.stderr.trim());
   const real = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
   ok('agent-env exports the absolute real gh path it found before installing the shim',
-    field(real.stdout, 'real-gh') === REAL_GH, real.stdout.trim());
+    field(real.stdout, 'real-gh') === REAL_GH_CANON, real.stdout.trim());
 
   const old = run(['-c', 'gh() { echo OLD; }; eval "$1"; type -t gh', '_', printed]);
   ok('a gh() function left by an older agent-env.sh is replaced by the shim', old.stdout.trim() === 'file', old.stdout.trim());
@@ -342,8 +343,17 @@ function zshOrSkip(what) {
   fs.writeFileSync(path.join(DIR, 'bot-id'), '99\n');
   writeCache({ token: 'ghs_AGENT_FIXTURE' });
   writeReviewerFixture();
-  const printed = agentEnv().stdout;
+  agentEnv(); // installs the fake identity shim that the external PATH link targets
   const agentShim = path.join(SHIM(), 'bin', 'gh');
+  const linkedBin = path.join(root, 'linked-bin');
+  fs.mkdirSync(linkedBin);
+  fs.symlinkSync(agentShim, path.join(linkedBin, 'gh'));
+  const discovery = agentEnv({ PATH: [stubBin, linkedBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':') });
+  const printed = discovery.stdout;
+  const discoveredPath = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
+  ok('agent-env skips an external PATH symlink whose target is inside mm-agent',
+    discovery.status === 0 && field(discoveredPath.stdout, 'real-gh') === REAL_GH_CANON,
+    `status=${discovery.status}; discovered=${field(discoveredPath.stdout, 'real-gh')}`);
   const post = `${JSON.stringify(POST_REVIEW)} marvinamiranda/omni237 ${REVIEW_SHA} success ${JSON.stringify('fixture review')}`;
   const before = records(curlLog).length;
   fs.writeFileSync(ghLog, '');
@@ -354,7 +364,7 @@ function zshOrSkip(what) {
   let payload = null;
   try { payload = call ? JSON.parse(call.input) : null; } catch {}
   ok('post-review succeeds with the mm-agent shim first on PATH',
-    result.status === 0 && field(result.stdout, 'shim') === agentShim && field(result.stdout, 'real') === REAL_GH
+    result.status === 0 && field(result.stdout, 'shim') === agentShim && field(result.stdout, 'real') === REAL_GH_CANON
       && calls.length === 1 && call.args[0] === 'api' && call.args.includes('repos/marvinamiranda/omni237/check-runs'),
     `status=${result.status}; shim=${field(result.stdout, 'shim')}; real=${field(result.stdout, 'real')}; calls=${calls.length}`);
   ok('post-review sends the exact independent check name and head SHA',
@@ -380,6 +390,14 @@ function zshOrSkip(what) {
   ok('post-review rejects an identity shim passed as the real gh path',
     shim.status !== 0 && ghRuns().length === 0 && records(curlLog).length === before,
     `status=${shim.status}; real-gh-runs=${ghRuns().length}; fake-api-calls=${records(curlLog).length - before}`);
+
+  const linkedGh = path.join(root, 'external-real-gh-link');
+  fs.symlinkSync(agentShim, linkedGh);
+  const linkedPath = `MM_REAL_GH_BIN=${JSON.stringify(linkedGh)}; export MM_REAL_GH_BIN; ${post}`;
+  const linked = inChild(printed, linkedPath);
+  ok('post-review rejects an external executable symlink resolving into mm-agent',
+    linked.status !== 0 && ghRuns().length === 0 && records(curlLog).length === before,
+    `status=${linked.status}; real-gh-runs=${ghRuns().length}; fake-api-calls=${records(curlLog).length - before}`);
 
   const ownerConfig = `GH_CONFIG_DIR=${JSON.stringify(path.join(home, '.config', 'gh'))}; export GH_CONFIG_DIR; ${post}`;
   const config = inChild(printed, ownerConfig);
