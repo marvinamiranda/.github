@@ -19,9 +19,39 @@
 #
 # Needs git and bash 3.2 or later. Makes no GitHub API call: it reads test with
 # `git ls-remote` and, when this clone lacks that commit, fetches it.
+#
+# test is read with a clean git configuration, from outside any checkout: no
+# global or system config, no GIT_CONFIG_COUNT/GIT_CONFIG_PARAMETERS, no
+# GIT_DIR, and no TLS overrides. Otherwise a `url.<x>.insteadOf` anywhere in
+# the owner's configuration (or the checkout's own) could point the canonical
+# URL at a repository whose test is an unreviewed commit. The fetch of that
+# exact commit may use the ordinary configuration: it is asked for by SHA, so a
+# redirect can only fail to supply it.
+#
+# "Uncommitted changes" is judged by content, not by `git status` alone:
+# every file under the directory must hash to its blob in HEAD, so an edit
+# hidden with skip-worktree or assume-unchanged still counts.
 
 MM_PROVENANCE_REPO="marvinamiranda/.github"
 MM_PROVENANCE_URL="https://github.com/$MM_PROVENANCE_REPO.git"
+
+# The first file under $1 whose content is not its blob in HEAD, or nothing.
+mm_provenance_changed() {
+  local dir="$1" entry meta path mode type sha
+  while IFS= read -r -d '' entry; do
+    meta="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    read -r mode type sha <<<"$meta"
+    [[ "$type" == "blob" ]] || continue
+    if [[ "$mode" == "120000" ]]; then
+      [[ -L "$dir/$path" && "$(readlink "$dir/$path")" == "$(git -C "$dir" cat-file blob "$sha")" ]] || { printf '%s' "$path"; return 0; }
+    elif [[ -L "$dir/$path" || ! -f "$dir/$path" || "$(git -C "$dir" hash-object -- "$path")" != "$sha" ]]; then
+      printf '%s' "$path"
+      return 0
+    fi
+  done < <(git -C "$dir" ls-tree -r -z HEAD -- .)
+  return 0
+}
 
 mm_provenance() {
   local dir="$1" scratch="$2"
@@ -33,9 +63,15 @@ mm_provenance() {
     return 0
   fi
   PROVENANCE_HEAD="$(git -C "$dir" rev-parse HEAD)"
-  if [[ -n "$(git -C "$dir" status --porcelain -- .)" ]]; then
+  local hidden=""
+  if [[ -n "$(git -C "$dir" status --porcelain --untracked-files=all -- .)" ]]; then
     PROVENANCE_PROBLEM="this checkout has uncommitted changes"
-  elif ! PROVENANCE_TEST="$(git ls-remote "$MM_PROVENANCE_URL" refs/heads/test 2>"$scratch/ls-remote.err" | cut -f1)" \
+  elif hidden="$(mm_provenance_changed "$dir")" && [[ -n "$hidden" ]]; then
+    PROVENANCE_PROBLEM="this checkout has uncommitted changes: $hidden differs from its commit, though git status does not show it"
+  elif ! PROVENANCE_TEST="$(cd / && env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GIT_DIR -u GIT_WORK_TREE \
+        -u GIT_COMMON_DIR -u GIT_EXEC_PATH -u GIT_SSL_NO_VERIFY -u GIT_SSL_CAINFO -u GIT_SSL_CAPATH \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git ls-remote "$MM_PROVENANCE_URL" refs/heads/test 2>"$scratch/ls-remote.err" | cut -f1)" \
       || [[ ! "$PROVENANCE_TEST" =~ ^[0-9a-f]{40}$ ]]; then
     PROVENANCE_PROBLEM="$MM_PROVENANCE_REPO test could not be read from $MM_PROVENANCE_URL: $(tr '\n' ' ' <"$scratch/ls-remote.err")"
   elif ! git -C "$dir" cat-file -e "$PROVENANCE_TEST^{commit}" 2>/dev/null \
@@ -58,4 +94,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exit 1
   fi
   echo "Running from $MM_PROVENANCE_REPO commit $PROVENANCE_HEAD, which is on test (read now: ${PROVENANCE_TEST:0:12})."
+  if [[ "$PROVENANCE_HEAD" != "$PROVENANCE_TEST" ]]; then
+    echo "WARNING: that is an older merged commit, not test's tip (${PROVENANCE_TEST:0:12}). Check out the tip unless you mean to run older code."
+  fi
 fi

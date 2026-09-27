@@ -914,7 +914,10 @@ function zshOrSkip(what) {
 (function checksApp() {
   // create-app.py refuses to run unless its checkout is on
   // marvinamiranda/.github test (identity/provenance.sh), so it runs from a
-  // throwaway checkout whose canonical test is a local bare repository.
+  // throwaway checkout, and "GitHub" is a local bare repository reached
+  // through a fake `git` (below), never through git configuration: the check
+  // reads test with a clean configuration, so an insteadOf could not reach it,
+  // and the cases below prove that one planted to redirect it is ignored.
   const cSrc = path.join(root, 'checks-src');
   const cCanon = path.join(root, 'checks-canon.git');
   const cIdentity = path.join(cSrc, 'governance', 'identity');
@@ -944,6 +947,29 @@ function zshOrSkip(what) {
   const harness = path.join(root, 'checks-harness.py');
   fs.mkdirSync(cBin, { recursive: true });
 
+  // git: the real one, except that the canonical URL of marvinamiranda/.github
+  // is served by FAKE_GITHUB (a local bare repository) after git's own URL
+  // rewriting. It asks the real git what the URL becomes under the caller's
+  // configuration and environment (\`ls-remote --get-url\`): if an insteadOf
+  // rewrote it, the rewritten URL is used, exactly as git would; if not, it
+  // stands for GitHub. So a configuration that redirects the canonical URL
+  // behaves here as it would on the owner's machine.
+  const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  fs.writeFileSync(path.join(cBin, 'git'), `#!/usr/bin/env bash
+real=${JSON.stringify(REAL_GIT)}
+canonical=${JSON.stringify(CANONICAL)}
+pre=()
+if [ "\${1-}" = -C ]; then pre=(-C "$2"); fi
+hit=0
+for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
+if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
+url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
+if [ "$url" = "$canonical" ]; then url="$FAKE_GITHUB"; fi
+args=()
+for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
+exec "$real" "\${args[@]}"
+`, { mode: 0o755 });
+
   const hasPython = spawnSync('python3', ['-c', 'import sys; sys.exit(sys.version_info < (3, 8))']).status === 0;
   if (!hasPython) {
     ok('python3 3.8+ is available for the create-app.py cases', false, 'no python3');
@@ -971,6 +997,7 @@ if (args[0] === 'api') {
 if ((args[0] === 'secret' || args[0] === 'variable') && args[1] === 'set') {
   const repo = args[args.indexOf('--repo') + 1] || '';
   if (process.env.FAKE_GH_FAIL && repo.endsWith('/' + process.env.FAKE_GH_FAIL)) { process.stderr.write('HTTP 403: Resource not accessible\\n'); process.exit(1); }
+  if (args[0] === 'variable' && process.env.FAKE_GH_FAIL_VARIABLE && repo.endsWith('/' + process.env.FAKE_GH_FAIL_VARIABLE)) { process.stderr.write('HTTP 403: variables\\n'); process.exit(1); }
   process.stdout.write('set\\n');
   process.exit(0);
 }
@@ -995,9 +1022,9 @@ def fake_urlopen(req, *a, **k):
     m = re.fullmatch(r'https://api\\.github\\.com/app-manifests/([^/]+)/conversions', url)
     if m and method == 'POST':
         log(event='conversion', code=m.group(1))
-        return Resp(json.dumps({'id': 4242, 'slug': 'fake-checks', 'client_id': os.environ['FAKE_CLIENT_ID'],
-            'html_url': 'https://github.com/apps/fake-checks', 'name': 'MarvinaMiranda Checks', 'pem': pem,
-            'client_secret': 'fake-client-secret', 'webhook_secret': None}))
+        app = json.loads(os.environ['FAKE_APP'])
+        app['pem'] = pem
+        return Resp(json.dumps(app))
     log(event='network', url=url)
     raise RuntimeError('no network in this test: ' + url)
 urllib.request.urlopen = fake_urlopen
@@ -1030,6 +1057,17 @@ def browser(url, *a, **k):
     return True
 walkers = []
 webbrowser.open = browser
+import subprocess
+_run = subprocess.run
+def run_then_touch(cmd, *a, **k):
+    result = _run(cmd, *a, **k)
+    after = os.environ.get('FAKE_AFTER_PROVENANCE')
+    if after and any(str(c).endswith('provenance.sh') for c in cmd):
+        target, text = json.loads(after)
+        with open(target, 'w') as f:
+            f.write(text)
+    return result
+subprocess.run = run_then_touch
 sys.argv = [sys.argv[1]] + sys.argv[2:]
 try:
     runpy.run_path(sys.argv[0], run_name='__main__')
@@ -1054,14 +1092,24 @@ finally:
   }
   const allRepos = (opts = {}) => Object.assign({}, ...REPOS.map((r) => repoFixtures(r, opts[r] || {})));
 
-  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '' } = {}) {
+  // What the manifest conversion returns: by default the App the manifest in
+  // the checkout describes, owned by the organisation. \`app\` changes it.
+  function convertedApp(name, change = (a) => a) {
+    let m = {};
+    try { m = JSON.parse(fs.readFileSync(path.join(cIdentity, `${name}.manifest.json`), 'utf8')); } catch (e) { m = {}; }
+    return change({ id: 4242, slug: 'fake-checks', client_id: CLIENT_ID, html_url: 'https://github.com/apps/fake-checks',
+      name: m.name, owner: { login: ORG, type: 'Organization' }, permissions: m.default_permissions, events: m.default_events,
+      client_secret: 'fake-client-secret', webhook_secret: null });
+  }
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', isolated = true, app = (a) => a, homeGitconfig = '' } = {}) {
     fs.rmSync(cHome, { recursive: true, force: true });
     fs.rmSync(cTmp, { recursive: true, force: true });
     fs.mkdirSync(cHome, { recursive: true });
     fs.mkdirSync(cTmp, { recursive: true });
+    if (homeGitconfig) fs.writeFileSync(path.join(cHome, '.gitconfig'), homeGitconfig);
     fs.writeFileSync(cFixtures, JSON.stringify(fx));
     for (const f of [cGhLog, cEvents]) fs.writeFileSync(f, '');
-    const r = spawnSync('python3', [harness, CREATE_APP, ...args], {
+    const r = spawnSync('python3', [...(isolated ? ['-I'] : []), harness, CREATE_APP, ...args], {
       input: PEM,
       encoding: 'utf8',
       timeout: 60000,
@@ -1074,13 +1122,12 @@ finally:
         FAKE_GH_LOG: cGhLog,
         FAKE_GH_FIXTURES: cFixtures,
         FAKE_GH_FAIL: fail,
+        FAKE_GH_FAIL_VARIABLE: failVariable,
         FAKE_EVENTS: cEvents,
         FAKE_MARKER: MARKER,
-        FAKE_CLIENT_ID: CLIENT_ID,
+        FAKE_APP: JSON.stringify(convertedApp(args[0], app)),
+        FAKE_GITHUB: cCanon,
         GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_COUNT: '1',
-        GIT_CONFIG_KEY_0: `url.${cCanon}.insteadOf`,
-        GIT_CONFIG_VALUE_0: CANONICAL,
         ...extraEnv,
       },
     });
@@ -1189,6 +1236,110 @@ finally:
   ok('the rule holds for every identity: mm-agent runs at a merged commit and is refused from an unmerged one',
     p.status === 0 && pAgent.status !== 0 && !pAgent.opened && /not on marvinamiranda\/\.github test/.test(pAgent.stderr), `${cTail(p)} / ${cTail(pAgent)}`);
   fs.rmSync(cHome, { recursive: true, force: true }); // mm-agent's key holds the marker by design
+
+  // ---- isolation: python3 -I, before anything else runs ----
+  const planted = path.join(root, 'checks-planted');
+  const plantedMarker = path.join(root, 'checks-planted-ran');
+  const plant = (file, where) => fs.writeFileSync(path.join(where, file),
+    `open(${JSON.stringify(plantedMarker)}, 'a').write(${JSON.stringify(file)} + '\\n')\nimport sys\nsys.exit(3)\n`);
+  function direct(pyFlags, extraEnv = {}) {
+    fs.rmSync(plantedMarker, { force: true });
+    fs.writeFileSync(cGhLog, '');
+    return spawnSync('python3', [...pyFlags, CREATE_APP, ...args], { encoding: 'utf8', timeout: 30000, input: '',
+      env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
+        FAKE_GH_LOG: cGhLog, FAKE_GH_FIXTURES: cFixtures, FAKE_GITHUB: cCanon, GIT_CONFIG_NOSYSTEM: '1', ...extraEnv } });
+  }
+  let iso = createApp(args, { isolated: false });
+  ok('refuses to run without python3 -I, before any gh call or page, nothing created',
+    iso.status !== 0 && /python3 -I/.test(iso.stderr) && !iso.opened && iso.gh.length === 0 && !fs.existsSync(checksDir()), `${cTail(iso)} gh=${iso.gh.length}`);
+  plant('secrets.py', cIdentity);
+  let d = direct(['-B']); // -B: no __pycache__ left in the checkout if a mutant imports the plant
+  ok('without -I, a secrets.py planted beside the script never runs: the refusal comes first',
+    d.status !== 0 && d.status !== 3 && /python3 -I/.test(d.stderr) && !fs.existsSync(plantedMarker), `exit ${d.status} ran=${readOr(plantedMarker).trim()} ${d.stderr.trim()}`);
+  fs.mkdirSync(planted, { recursive: true });
+  plant('sitecustomize.py', planted);
+  plant('usercustomize.py', planted);
+  d = direct(['-I', '-B'], { PYTHONPATH: planted, PYTHONUSERBASE: planted });
+  ok('with -I, neither the planted secrets.py nor a sitecustomize on PYTHONPATH runs, and the untracked file is refused',
+    d.status !== 0 && d.status !== 3 && !fs.existsSync(plantedMarker) && /uncommitted changes/.test(d.stderr), `exit ${d.status} ran=${readOr(plantedMarker).trim()} ${d.stderr.trim()}`);
+  fs.rmSync(path.join(cIdentity, 'secrets.py'), { force: true });
+  fs.rmSync(path.join(cIdentity, '__pycache__'), { recursive: true, force: true });
+
+  // ---- provenance reads test with a clean git configuration ----
+  const cEvil = path.join(root, 'checks-evil.git');
+  git(root, 'init', '-q', '--bare', cEvil);
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
+  const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8',
+    env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, FAKE_GITHUB: cCanon, GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${cEvil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
+  ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call (so the cases below can fail)',
+    control.stdout.startsWith(git(cSrc, 'rev-parse', 'HEAD')), control.stdout + control.stderr);
+  for (const [what, opts, local] of [
+    ['GIT_CONFIG_COUNT in the environment', { extraEnv: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${cEvil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } }],
+    ['GIT_CONFIG_PARAMETERS in the environment', { extraEnv: { GIT_CONFIG_PARAMETERS: `'url.${cEvil}.insteadof'='${CANONICAL}'` } }],
+    ['the global ~/.gitconfig', { homeGitconfig: `[url "${cEvil}"]\n\tinsteadOf = ${CANONICAL}\n` }],
+    ['the checkout\'s own .git/config', {}, true],
+  ]) {
+    if (local) git(cSrc, 'config', `url.${cEvil}.insteadOf`, CANONICAL);
+    const x = createApp(args, opts);
+    if (local) git(cSrc, 'config', '--unset', `url.${cEvil}.insteadOf`);
+    ok(`an insteadOf in ${what} pointing test at an unmerged commit is ignored: refused`,
+      x.status !== 0 && /not on marvinamiranda\/\.github test/.test(x.stderr) && !x.opened && x.gh.length === 0, `${cTail(x)} opened=${x.opened}`);
+  }
+  git(cSrc, 'reset', '-q', '--hard', merged);
+
+  // ---- an older merged commit runs, with a warning ----
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'merged later');
+  git(cSrc, 'push', '-q', cCanon, 'HEAD:refs/heads/test');
+  git(cSrc, 'reset', '-q', '--hard', merged);
+  let older = createApp(args);
+  git(cSrc, 'push', '-q', '-f', cCanon, 'HEAD:refs/heads/test');
+  ok('from a merged commit that is not test\'s tip it runs, and warns', older.status === 0 && /WARNING: .*not test's tip/.test(older.stdout), `${cTail(older)} ${older.stdout.split('\n').slice(0, 2).join(' | ')}`);
+  ok('from test\'s tip it does not warn', !/not test's tip/.test(r.stdout), r.stdout.split('\n').slice(0, 2).join(' | '));
+
+  // ---- a hidden edit under governance/ is still an edit ----
+  const manifestFile = path.join(cIdentity, 'mm-checks.manifest.json');
+  const headManifest = fs.readFileSync(manifestFile, 'utf8');
+  const widened = JSON.stringify({ ...manifest, default_permissions: { ...manifest.default_permissions, administration: 'write' } }, null, 2);
+  git(cSrc, 'update-index', '--skip-worktree', 'governance/identity/mm-checks.manifest.json');
+  fs.writeFileSync(manifestFile, widened);
+  let hidden = createApp(args);
+  fs.writeFileSync(manifestFile, headManifest);
+  git(cSrc, 'update-index', '--no-skip-worktree', 'governance/identity/mm-checks.manifest.json');
+  ok('an edit hidden from git status (skip-worktree) is refused as uncommitted', hidden.status !== 0 && /differs from|uncommitted/.test(hidden.stderr)
+    && !hidden.opened && hidden.gh.length === 0, `${cTail(hidden)} opened=${hidden.opened}`);
+
+  // ---- the manifest is the committed one, even if the file changes after the check ----
+  let toctou = createApp(args, { extraEnv: { FAKE_AFTER_PROVENANCE: JSON.stringify([manifestFile, widened]) } });
+  fs.writeFileSync(manifestFile, headManifest);
+  const posted = toctou.events.find((e) => e.event === 'form');
+  ok('a manifest changed on disk after the provenance check is not what the page posts: the committed one is',
+    toctou.status === 0 && posted && JSON.stringify(posted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions), `${cTail(toctou)} ${posted && JSON.stringify(posted.manifest.default_permissions)}`);
+
+  // ---- the App GitHub created must be the one the manifest describes ----
+  for (const [what, change] of [
+    ['owned by another account', (a) => ({ ...a, owner: { login: 'someone-else', type: 'User' } })],
+    ['with another name', (a) => ({ ...a, name: 'Something Else' })],
+    ['with a permission the manifest does not ask for', (a) => ({ ...a, permissions: { ...a.permissions, administration: 'write' } })],
+    ['missing a permission the manifest asks for', (a) => ({ ...a, permissions: { checks: 'write', metadata: 'read' } })],
+  ]) {
+    const x = createApp(args, { app: change });
+    ok(`an App ${what} is refused: its key discarded, nothing loaded or written, and the App named for deletion`,
+      x.status !== 0 && x.converted === 1 && x.sets.length === 0 && !fs.existsSync(checksDir()) && /not the one the manifest describes/.test(x.stderr)
+        && /[Dd]elete/.test(x.stderr) && filesWithMarker().length === 0 && !`${x.stdout}${x.stderr}`.includes(MARKER), `${cTail(x)} sets=${x.sets.length}`);
+  }
+  const foreignAgent = createApp(['mm-agent'], { app: (a) => ({ ...a, owner: { login: 'someone-else', type: 'User' } }) });
+  ok('...and for mm-agent too: no key file is written for an App that is not the manifest\'s',
+    foreignAgent.status !== 0 && !fs.existsSync(path.join(cHome, '.config', 'mm-agent', 'mm-agent', 'private-key.pem')), cTail(foreignAgent));
+
+  // ---- the recovery message whatever fails ----
+  let rec = createApp(args, { failVariable: 'prod-a' });
+  ok('when the variable fails after the secret loaded, the recovery names that repository as holding the key',
+    rec.status !== 0 && /hold the key: [^\n]*marvinamiranda\/prod-a/.test(rec.stderr) && /[Dd]elete/.test(rec.stderr), cTail(rec));
+  rec = createApp(args, { app: (a) => { const b = { ...a }; delete b.client_id; return b; } });
+  ok('when loading raises, the recovery still prints, naming the repository that holds the key, and it exits',
+    rec.status !== null && rec.status !== 0 && /hold the key: [^\n]*marvinamiranda\/prod-a/.test(rec.stderr) && !`${rec.stdout}${rec.stderr}`.includes(MARKER), cTail(rec));
 
   // ---- refusals: exit non-zero, before the page opens, nothing created ----
   const nothingDone = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.sets.length === 0 && !fs.existsSync(checksDir());

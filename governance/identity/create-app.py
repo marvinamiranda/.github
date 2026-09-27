@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Isolated mode, first, before any other import. Without -I, Python puts this
+# script's directory first on sys.path and honours PYTHONPATH, PYTHONSTARTUP and
+# user site-packages, so a planted secrets.py (or json.py, …) beside the script
+# would run as the owner, with the key about to be handed over, before any
+# check below. This check cannot stop code that loads before the script does
+# (sitecustomize or usercustomize on PYTHONPATH, a .pth file): that is exactly
+# why -I is required and documented, not merely checked. `sys` is built into
+# the interpreter, so importing it loads nothing from disk.
+import sys
+
+if not sys.flags.isolated:
+    sys.exit("create-app.py: refusing: run it isolated, so that nothing beside it or on PYTHONPATH is imported: "
+             "python3 -I governance/identity/create-app.py <name> [...]")
+
 """Register an organisation-owned GitHub App from a manifest (DELIVERY.md Appendix A).
 
 The owner runs this once per identity. It serves a one-page form on localhost that
@@ -6,11 +20,11 @@ posts the manifest to GitHub; the owner clicks "Create GitHub App"; GitHub redir
 back here with a one-time code, which is exchanged for the App's id and private key.
 The key is never printed. Where it goes depends on the identity (CUSTODY below):
 
-    python3 governance/identity/create-app.py mm-agent
-    python3 governance/identity/create-app.py mm-reviewer
+    python3 -I governance/identity/create-app.py mm-agent
+    python3 -I governance/identity/create-app.py mm-reviewer
         The key is written to ~/.config/mm-agent/<name>/private-key.pem (0600).
 
-    python3 governance/identity/create-app.py mm-checks --to-environment \\
+    python3 -I governance/identity/create-app.py mm-checks --to-environment \\
         --repo omni237 --repo omni237-ops
         The key goes straight into the environment secret CHECKS_APP_PRIVATE_KEY,
         and the client id into the variable CHECKS_APP_CLIENT_ID, of each
@@ -25,7 +39,8 @@ The key is never printed. Where it goes depends on the identity (CUSTODY below):
 Run it from a merged commit: check this repository out by the SHA of a commit
 on its test. It refuses anything else (governance/identity/provenance.sh, the
 rule bootstrap.sh --apply uses): a commit that is not on test as GitHub has it
-now, uncommitted changes under governance/, or files outside a git checkout.
+now, uncommitted changes under governance/ (by content), or files outside a
+git checkout. It reads the manifest from that commit, not from the file.
 
 Afterwards, install the App from the URL it prints.
 """
@@ -37,7 +52,6 @@ import pathlib
 import re
 import secrets
 import subprocess
-import sys
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -114,6 +128,10 @@ if provenance.returncode != 0:
     reason = provenance.stderr.strip() or f"provenance.sh exited {provenance.returncode}"
     refuse(f"{reason}. Check out a merged commit of {ORG}/.github by its SHA (git checkout <sha>) and run it from there.", 1)
 print(provenance.stdout.strip())
+checked = re.search(r"commit ([0-9a-f]{40})", provenance.stdout)
+if not checked:
+    refuse("provenance.sh did not name the commit it checked.", 1)
+CHECKED_COMMIT = checked.group(1)
 
 
 def gh(*argv, stdin_bytes=None):
@@ -207,7 +225,14 @@ if custody == "environment":
     for repo in repos:
         preflight(repo)
 
-manifest = json.loads(manifest_path.read_text())
+# From the commit provenance.sh checked, not from the file, which could change
+# after the check. `cat-file blob` prints the committed bytes with no textconv
+# or filter; `<commit>:./<file>` is relative to HERE.
+committed = subprocess.run(["git", "cat-file", "blob", f"{CHECKED_COMMIT}:./{manifest_path.name}"],
+                           cwd=HERE, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+if committed.returncode != 0:
+    refuse(f"{manifest_path.name} is not in commit {CHECKED_COMMIT[:12]}: {committed.stderr.strip()}", 1)
+manifest = json.loads(committed.stdout)
 manifest["redirect_url"] = f"http://127.0.0.1:{PORT}/callback"
 state = secrets.token_urlsafe(16)
 out_dir = AGENT_ROOT / name
@@ -241,22 +266,36 @@ def to_file(app, pem):
 
 def to_environment(app, pem):
     """mm-checks: the key into each repository's environment secret, on stdin. Returns (page, rc)."""
-    loaded = []
-    for repo in repos:
-        full = f"{ORG}/{repo}"
-        r = gh("secret", "set", KEY_SECRET, "--env", ENVIRONMENT, "--repo", full, stdin_bytes=pem.encode())
-        if r.returncode == 0:
+    holding, loaded, failure = [], [], None
+    try:
+        for repo in repos:
+            full = f"{ORG}/{repo}"
+            r = gh("secret", "set", KEY_SECRET, "--env", ENVIRONMENT, "--repo", full, stdin_bytes=pem.encode())
+            if r.returncode != 0:
+                failure = f"loading {KEY_SECRET} into {full} failed: {scrub(r.stderr.decode(errors='replace').strip(), pem)}"
+                break
+            holding.append(full)
             r = gh("variable", "set", CLIENT_ID_VARIABLE, "--env", ENVIRONMENT, "--repo", full, "--body", str(app["client_id"]))
-        if r.returncode != 0:
-            detail = scrub(r.stderr.decode(errors="replace").strip(), pem)
-            settings = f"https://github.com/organizations/{ORG}/settings/apps/{app['slug']}/advanced"
-            print(f"FAILED to load the key into {full} {ENVIRONMENT}: {detail}", file=sys.stderr)
-            print(f"Loaded into: {', '.join(loaded) or 'none'}. The key is not kept anywhere, so App "
-                  f"{app['slug']} (id {app['id']}) cannot be completed: delete it at {settings}, delete "
-                  f"{KEY_SECRET} from the environments listed, fix the cause and run this again.", file=sys.stderr)
-            return f"<p>Loading the key into <code>{full}</code> failed. See the terminal: delete this App and run again.</p>", 1
-        loaded.append(full)
-        print(f"{full}: {KEY_SECRET} and {CLIENT_ID_VARIABLE} set in {ENVIRONMENT}.")
+            if r.returncode != 0:
+                failure = f"setting {CLIENT_ID_VARIABLE} in {full} failed: {scrub(r.stderr.decode(errors='replace').strip(), pem)}"
+                break
+            loaded.append(full)
+            print(f"{full}: {KEY_SECRET} and {CLIENT_ID_VARIABLE} set in {ENVIRONMENT}.")
+    except Exception as e:  # reported below, with the recovery; the exit code says it failed
+        failure = f"{type(e).__name__} while loading the key: {scrub(str(e), pem)}"
+    finally:
+        # Whatever stopped the loop, including an exception or an interrupt: the
+        # key dies with this process, so an incomplete load needs the owner to
+        # delete this App and every copy of the key already uploaded.
+        if len(loaded) != len(repos):
+            settings = f"https://github.com/organizations/{ORG}/settings/apps/{app.get('slug')}/advanced"
+            print(f"FAILED: {failure or 'interrupted before every repository was loaded'}", file=sys.stderr)
+            print(f"These repositories hold the key: {', '.join(holding) or 'none'}. The key is not kept anywhere, "
+                  f"so App {app.get('slug')} (id {app.get('id')}) cannot be completed: delete it at {settings}, "
+                  f"delete {KEY_SECRET} from the environments of the repositories above, fix the cause and run this "
+                  f"again.", file=sys.stderr)
+    if len(loaded) != len(repos):
+        return "<p>Loading the key failed. See the terminal: delete this App and run again.</p>", 1
     # The App's id and client id only, which T5 pins the checks to. No key, no secret.
     private_dir()
     meta = {k: app[k] for k in ("id", "slug", "client_id", "html_url", "name")}
@@ -270,6 +309,20 @@ def to_environment(app, pem):
             f"{', '.join(loaded)}. No file was written and it was not shown anywhere.</p>"
             f"<p><b>Last step:</b> <a href='{install}'>install it</a> — choose <i>Only select "
             f"repositories</i>: {chosen}.</p>"), 0
+
+
+def not_the_manifests(app):
+    """Why the App GitHub created is not the one the manifest describes, or []."""
+    problems = []
+    owner = (app.get("owner") or {}).get("login")
+    if owner != ORG:
+        problems.append(f"it is owned by {owner!r}, not {ORG!r}")
+    if app.get("name") != manifest["name"]:
+        problems.append(f"it is named {app.get('name')!r}, not {manifest['name']!r}")
+    if app.get("permissions") != manifest["default_permissions"]:
+        problems.append(f"its permissions are {json.dumps(app.get('permissions'), sort_keys=True)}, "
+                        f"not {json.dumps(manifest['default_permissions'], sort_keys=True)}")
+    return problems
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -316,8 +369,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pem = app.pop("pem")
             for unused in ("client_secret", "webhook_secret"):
                 app.pop(unused, None)
-            page, rc = (to_environment if custody == "environment" else to_file)(app, pem)
-            del pem
+            # Before the key goes anywhere: the App must be the manifest's, in
+            # this organisation. Otherwise the key is dropped unused.
+            problems = not_the_manifests(app)
+            if problems:
+                del pem
+                settings = f"https://github.com/organizations/{ORG}/settings/apps/{app.get('slug')}/advanced"
+                print(f"FAILED: the App GitHub created is not the one the manifest describes: {'; '.join(problems)}. "
+                      f"Its key was discarded: nothing was written or loaded. Check it, then delete it at {settings} "
+                      f"(or wherever it was created) and run this again.", file=sys.stderr)
+                page, rc = "<p>The App created is not the one the manifest describes. See the terminal.</p>", 1
+            else:
+                page, rc = (to_environment if custody == "environment" else to_file)(app, pem)
+                del pem
             self._send(
                 f"<html><body style='font-family:sans-serif;max-width:40em;margin:3em auto'>"
                 f"<h2>Created <code>{app['slug']}</code> (App id {app['id']})</h2>{page}</body></html>"

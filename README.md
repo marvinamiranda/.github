@@ -169,8 +169,8 @@ node governance/areas-check.js <product checkout> [git-ref]
 Organisation GitHub Apps, created once by the owner:
 
 ```bash
-python3 governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
-python3 governance/identity/create-app.py mm-reviewer   # posts review/independent
+python3 -I governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
+python3 -I governance/identity/create-app.py mm-reviewer   # posts review/independent
 ```
 
 Their keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
@@ -179,6 +179,30 @@ by the same rule and script (`governance/identity/provenance.sh`): it refuses
 a commit that is not on this repository's `test` as GitHub has it now,
 uncommitted changes under `governance/`, and files outside a git checkout,
 before any `gh` call or page. Only reviewed code handles an App's private key.
+
+- **Always `python3 -I`** (isolated mode). Without it Python imports modules
+  from the script's own directory first and honours `PYTHONPATH`, so a planted
+  `secrets.py` or `json.py` beside the script would run as the owner just
+  before the key is handed over. `create-app.py` refuses to run without `-I`,
+  as its very first statement. That refusal cannot stop code that loads
+  before the script does (a `sitecustomize`/`usercustomize` on `PYTHONPATH` or
+  in user site-packages, a `.pth` file), which is why the flag is part of the
+  command, not just checked.
+- **`test` is read with a clean git configuration**, from `/`: no global or
+  system config, no `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, no `GIT_DIR`, no
+  TLS overrides. A `url.<x>.insteadOf` in any of them (or in the checkout's own
+  `.git/config`) could otherwise point the canonical URL at a repository whose
+  `test` is an unreviewed commit.
+- **Uncommitted means by content**: every file under `governance/` must hash to
+  its blob in `HEAD`, so an edit hidden from `git status` with skip-worktree or
+  assume-unchanged is refused too. The manifest is then read from that commit
+  (`git cat-file blob <commit>:./<name>.manifest.json`), not from the file,
+  which could change after the check.
+- A merged commit that is not `test`'s tip runs, with a warning.
+- **The App GitHub creates is checked** before its key is used: owned by
+  `marvinamiranda`, named as the manifest names it, with exactly the manifest's
+  permissions. Otherwise the key is discarded, nothing is written or loaded,
+  and it says to delete that App.
 The third, **MarvinaMiranda Checks** (`mm-checks`), is different: its key never
 touches the machine's disk. See [The Checks App](#the-checks-app-mm-checks).
 
@@ -339,7 +363,7 @@ gives the order):
 
 ```bash
 read -rs GH_TOKEN && export GH_TOKEN      # the one-day fine-grained token below
-python3 governance/identity/create-app.py mm-checks --to-environment --repo omni237 --repo omni237-ops
+python3 -I governance/identity/create-app.py mm-checks --to-environment --repo omni237 --repo omni237-ops
 unset GH_TOKEN
 ```
 
@@ -374,9 +398,10 @@ exists:
   that is another App's key, and replacing it breaks the gate until the new
   App is installed.
 
-If an upload fails part way, the key is gone with the process, so that App
-can never be completed: it names the App and the repositories that got the
-key. Delete the App (its settings, Advanced), delete the secret from those
+If loading fails part way (a failed `gh`, an exception, an interrupt), the
+key is gone with the process, so that App can never be completed. Whatever
+stopped it, it prints the App and every repository whose secret was set, even
+one whose variable then failed. Delete the App (its settings, Advanced), delete the secret from those
 repositories, fix the cause and run it again.
 
 The token, at github.com/settings/personal-access-tokens: resource owner

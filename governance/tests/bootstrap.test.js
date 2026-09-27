@@ -111,6 +111,28 @@ const body = JSON.stringify(fixtures[target]);
 process.stdout.write(jq ? execFileSync('jq', ['-r', jq], { input: body }) : body + '\\n');
 `, { mode: 0o755 });
 
+// git: the real one, except that the canonical URL of marvinamiranda/.github
+// is served by FAKE_GITHUB (a local bare repository) after git's own URL
+// rewriting: it asks the real git what the URL becomes under the caller's
+// configuration (\`ls-remote --get-url\`) and uses that when an insteadOf
+// rewrote it, as git would. provenance.sh reads test with a clean
+// configuration, so "GitHub" cannot be reached through git configuration.
+const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+fs.writeFileSync(path.join(stubBin, 'git'), `#!/usr/bin/env bash
+real=${JSON.stringify(REAL_GIT)}
+canonical=${JSON.stringify(CANONICAL)}
+pre=()
+if [ "\${1-}" = -C ]; then pre=(-C "$2"); fi
+hit=0
+for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
+if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
+url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
+if [ "$url" = "$canonical" ]; then url="$FAKE_GITHUB"; fi
+args=()
+for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
+exec "$real" "\${args[@]}"
+`, { mode: 0o755 });
+
 function labelsFromScript() {
   // The standard labels, exactly as bootstrap.sh defines them, plus the area.
   const src = fs.readFileSync(SCRIPT, 'utf8');
@@ -192,7 +214,6 @@ function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where 
   const r = spawnSync(BASH, [co.script, ...(repo ? ['--repo', 'prod', '--config-dir', cfg] : []), ...args], {
     encoding: 'utf8',
     env: {
-      ...extraEnv,
       PATH: [stubBin, process.env.PATH].join(':'),
       HOME: path.join(root, 'home'),
       TMPDIR: root,
@@ -202,9 +223,8 @@ function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where 
       FAKE_GH_WRITABLE: writable ? '1' : '0',
       MM_REVIEWER_APP_JSON: reviewer ? reviewerJson : path.join(root, 'no-such-reviewer.json'),
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: `url.${co.canon}.insteadOf`,
-      GIT_CONFIG_VALUE_0: CANONICAL,
+      FAKE_GITHUB: co.canon,
+      ...extraEnv,
     },
   });
   const calls = fs.readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -257,6 +277,28 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   fs.appendFileSync(co.script, '# a local edit\n');
   r = bootstrap(['--no-rulesets', '--apply'], { where: co });
   ok('--apply refuses a checkout with uncommitted changes', r.status !== 0 && /uncommitted/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+  // A redirect of the canonical URL to a repository whose test is this
+  // unmerged commit: ignored, because test is read with a clean configuration.
+  const planted = checkout('elsewhere');
+  const evil = path.join(root, `evil-${path.basename(path.dirname(planted.work))}.git`);
+  execFileSync('git', ['init', '-q', '--bare', evil]);
+  execFileSync('git', ['-C', planted.work, 'push', '-q', evil, 'HEAD:refs/heads/test']);
+  const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, process.env.PATH].join(':'),
+    HOME: path.join(root, 'home'), FAKE_GITHUB: planted.canon, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
+  ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call',
+    control.stdout.startsWith(execFileSync('git', ['-C', planted.work, 'rev-parse', 'HEAD']).toString().trim()), control.stdout + control.stderr);
+  r = bootstrap(['--no-rulesets', '--apply'], { where: planted,
+    extraEnv: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
+  ok('--apply ignores an insteadOf pointing test at the unmerged commit it runs from: refused, before any gh call',
+    r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+  // An edit hidden from git status is still an edit.
+  const skip = checkout('head');
+  execFileSync('git', ['-C', skip.work, 'update-index', '--skip-worktree', 'governance/bootstrap.sh']);
+  fs.appendFileSync(skip.script, '# hidden\n');
+  r = bootstrap(['--no-rulesets', '--apply'], { where: skip });
+  ok('--apply refuses an edit hidden with skip-worktree', r.status !== 0 && /differs from its commit/.test(r.stderr) && r.calls.length === 0, tail(r));
 
   const loose = fs.mkdtempSync(path.join(root, 'loose-'));
   fs.mkdirSync(path.join(loose, 'governance'));
