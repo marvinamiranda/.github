@@ -7,7 +7,8 @@
 # its git credential helper call this for every command, so no shell variable
 # ever holds a token.
 #
-# Reads ~/.config/mm-agent/<name>/{app.json,private-key.pem}, written by create-app.py.
+# Reads ~/.config/mm-agent/<name>/{app.json,private-key.pem}, written by
+# `python3 -I -S governance/identity/create-app.py <name>`.
 #
 # The cache: a token is reused for at most 5 minutes after it was minted,
 # although GitHub lets it live an hour. So once an installation is revoked or
@@ -30,7 +31,7 @@ DIR="$HOME/.config/mm-agent/$NAME"
 KEY="$DIR/private-key.pem"
 CACHE="$DIR/token.cache"
 REUSE_SECONDS=300
-[[ -r "$KEY" && -r "$DIR/app.json" ]] || { echo "missing $DIR — run create-app.py $NAME first" >&2; exit 1; }
+[[ -r "$KEY" && -r "$DIR/app.json" ]] || { echo "missing $DIR — the owner creates it with python3 -I -S governance/identity/create-app.py $NAME" >&2; exit 1; }
 
 is_installation_token() { [[ "$1" == ghs_?* ]]; }
 

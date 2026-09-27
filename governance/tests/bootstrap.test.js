@@ -112,7 +112,8 @@ process.stdout.write(jq ? execFileSync('jq', ['-r', jq], { input: body }) : body
 `, { mode: 0o755 });
 
 // git: the real one, except that the canonical URL of marvinamiranda/.github
-// is served by FAKE_GITHUB (a local bare repository) after git's own URL
+// is served by the local bare repository named in bin/fake-github (a file,
+// since the check reads test with \`env -i\`) after git's own URL
 // rewriting: it asks the real git what the URL becomes under the caller's
 // configuration (\`ls-remote --get-url\`) and uses that when an insteadOf
 // rewrote it, as git would. provenance.sh reads test with a clean
@@ -127,7 +128,8 @@ hit=0
 for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
-if [ "$url" = "$canonical" ]; then url="$FAKE_GITHUB"; fi
+if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(stubBin, 'fake-github'))})"; fi
+for a in "$@"; do if [ "$a" = ls-remote ]; then env | sed 's/=.*//' | sort | tr '\\n' ' ' >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; echo >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; fi; done
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -211,6 +213,7 @@ function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where 
   const co = where || checkout(on);
   fs.writeFileSync(fixtureFile, JSON.stringify(fx));
   fs.writeFileSync(ghLog, '');
+  fs.writeFileSync(path.join(stubBin, 'fake-github'), co.canon);
   const r = spawnSync(BASH, [co.script, ...(repo ? ['--repo', 'prod', '--config-dir', cfg] : []), ...args], {
     encoding: 'utf8',
     env: {
@@ -223,7 +226,6 @@ function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where 
       FAKE_GH_WRITABLE: writable ? '1' : '0',
       MM_REVIEWER_APP_JSON: reviewer ? reviewerJson : path.join(root, 'no-such-reviewer.json'),
       GIT_CONFIG_NOSYSTEM: '1',
-      FAKE_GITHUB: co.canon,
       ...extraEnv,
     },
   });
@@ -231,6 +233,7 @@ function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where 
   const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8'));
   return { ...r, calls, writes: calls.filter((c) => c.kind === 'write'), co, state };
 }
+const readLines = (f) => { try { return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean); } catch (e) { return []; } };
 const tail = (r) => `exit ${r.status}; ${(r.stderr || '').trim().split('\n').slice(-2).join(' | ')}`;
 const started = (r) => /== a\) Organisation issue types/.test(r.stdout);
 
@@ -284,8 +287,9 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   const evil = path.join(root, `evil-${path.basename(path.dirname(planted.work))}.git`);
   execFileSync('git', ['init', '-q', '--bare', evil]);
   execFileSync('git', ['-C', planted.work, 'push', '-q', evil, 'HEAD:refs/heads/test']);
+  fs.writeFileSync(path.join(stubBin, 'fake-github'), planted.canon);
   const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, process.env.PATH].join(':'),
-    HOME: path.join(root, 'home'), FAKE_GITHUB: planted.canon, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
+    HOME: path.join(root, 'home'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
   ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call',
     control.stdout.startsWith(execFileSync('git', ['-C', planted.work, 'rev-parse', 'HEAD']).toString().trim()), control.stdout + control.stderr);
   const homeConfig = path.join(root, 'home', '.gitconfig');
@@ -314,6 +318,38 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   fs.writeFileSync(path.join(untracked.work, 'governance', 'planted.sh'), 'echo planted\n');
   r = bootstrap(['--no-rulesets', '--apply'], { where: untracked });
   ok('--apply refuses an untracked file under governance/', r.status !== 0 && /uncommitted/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+  const hushed = checkout('head');
+  execFileSync('git', ['-C', hushed.work, 'config', 'status.showUntrackedFiles', 'no']);
+  fs.writeFileSync(path.join(hushed.work, 'governance', 'planted.sh'), 'echo planted\n');
+  r = bootstrap(['--no-rulesets', '--apply'], { where: hushed });
+  ok('--apply refuses an untracked file even with status.showUntrackedFiles=no', r.status !== 0 && /uncommitted/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+  // Replace refs and grafts: test's commit made to "descend" from an unmerged one.
+  const gitIn = (co, ...a) => execFileSync('git', ['-C', co.work, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a]).toString().trim();
+  for (const [what, plantIt] of [
+    ['a replace ref', (co, merged, local) => gitIn(co, 'replace', '--graft', merged, local)],
+    ['a .git/info/grafts entry', (co, merged, local) => { fs.mkdirSync(path.join(co.work, '.git', 'info'), { recursive: true }); fs.writeFileSync(path.join(co.work, '.git', 'info', 'grafts'), `${merged} ${local}\n`); }],
+  ]) {
+    const co = checkout('head');
+    const merged = gitIn(co, 'rev-parse', 'HEAD');
+    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+    plantIt(co, merged, gitIn(co, 'rev-parse', 'HEAD'));
+    r = bootstrap(['--no-rulesets', '--apply'], { where: co });
+    ok(`--apply ignores ${what} grafting test onto the unmerged commit it runs from: refused, before any gh call`,
+      r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+
+  // test is read with nothing from the environment but PATH.
+  const envLog = path.join(stubBin, 'ls-remote-env.log');
+  fs.writeFileSync(envLog, '');
+  const leaky = { HTTPS_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', ALL_PROXY: 'http://127.0.0.1:9', SSL_CERT_FILE: '/nonexistent/ca.pem',
+    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x' };
+  r = bootstrap(['--no-rulesets'], { extraEnv: leaky });
+  const seen = readLines(envLog);
+  const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
+  ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
+    r.status === 0 && seen.length >= 1 && leaked.length === 0, `${tail(r)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
 
   const loose = fs.mkdtempSync(path.join(root, 'loose-'));
   fs.mkdirSync(path.join(loose, 'governance'));

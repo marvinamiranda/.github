@@ -318,7 +318,7 @@ else
   {
     echo "No Reviewer App id, so no rulesets: $ORG/$SELF_REPO's own test-integration would require"
     echo "only 'governance tests', which a pull request here can rewrite. Create the Reviewer App"
-    echo "(python3 -I governance/identity/create-app.py mm-reviewer), then re-run with --reviewer-app-id <id>"
+    echo "(python3 -I -S governance/identity/create-app.py mm-reviewer), then re-run with --reviewer-app-id <id>"
     echo "or with $REVIEWER_APP_JSON present; or run with --no-rulesets."
   } >&2
   exit 1
