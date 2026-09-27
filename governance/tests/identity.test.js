@@ -1151,11 +1151,13 @@ finally:
   // ---- refusals: exit non-zero, before the page opens, nothing created ----
   const nothingDone = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.sets.length === 0 && !fs.existsSync(checksDir());
   for (const [what, a, opts, says] of [
-    ['mm-checks without --to-environment', ['mm-checks'], {}, /--to-environment/],
-    ['mm-checks with --repo but no --to-environment', ['mm-checks', '--repo', 'prod-a'], {}, /--to-environment/],
+    // Each refusal is identified by its own reason: several guards overlap, and
+    // a case that any of them satisfies proves none of them.
+    ['mm-checks without --to-environment', ['mm-checks'], {}, /may only go into each repository's governance-checks environment, never onto disk/],
+    ['mm-checks with --repo but no --to-environment', ['mm-checks', '--repo', 'prod-a'], {}, /may only go into each repository's governance-checks environment, never onto disk/],
     ['--to-environment with mm-agent', ['mm-agent', '--to-environment', '--repo', 'prod-a'], {}, /only for mm-checks/],
     ['--to-environment with mm-reviewer', ['mm-reviewer', '--to-environment', '--repo', 'prod-a'], {}, /only for mm-checks/],
-    ['--to-environment without a --repo', ['mm-checks', '--to-environment'], {}, /--repo/],
+    ['--to-environment without a --repo', ['mm-checks', '--to-environment'], {}, /--to-environment needs at least one --repo/],
     ['a --repo in another organisation', ['mm-checks', '--to-environment', '--repo', 'someone-else/prod-a'], {}, /marvinamiranda/],
     ['the same --repo twice', ['mm-checks', '--to-environment', '--repo', 'prod-a', '--repo', `${ORG}/prod-a`], {}, /twice/],
     ['a target repository without the governance-checks environment', args, { fx: allRepos({ 'prod-b': { env: 'missing' } }) }, /prod-b[\s\S]*governance-checks/],
