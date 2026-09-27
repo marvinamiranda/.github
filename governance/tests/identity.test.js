@@ -1055,6 +1055,7 @@ function run(t) {
   }
   if (cmd === 'add-generic-password') {
     if (process.env.FAKE_SECURITY_FAIL_ADD === '1') { process.stderr.write('security: SecKeychainItemCreateFromContent: failed\\n'); return 50; }
+    if (process.env.FAKE_SECURITY_FAIL_ADD === 'silent') return 0; // reports success, stores nothing
     const at = state.findIndex((it) => it.service === opt['-s'] && it.account === opt['-a']);
     if (at >= 0 && !flags.has('-U')) { process.stderr.write('security: The specified item already exists in the keychain.\\n'); return 45; }
     const item = { service: opt['-s'], account: opt['-a'], keychain, passwordSha: sha(opt['-w'] || ''), trusted: opt['-T'] === undefined ? null : opt['-T'], anyApp: flags.has('-A') };
@@ -1191,7 +1192,7 @@ finally:
       name: m.name, owner: { login: ORG, type: 'Organization' }, permissions: m.default_permissions, events: m.default_events,
       client_secret: 'fake-client-secret', webhook_secret: null });
   }
-  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM } = {}) {
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM } = {}) { // failKeychainAdd: false | true | 'silent'
     fs.rmSync(cHome, { recursive: true, force: true });
     fs.rmSync(cTmp, { recursive: true, force: true });
     fs.mkdirSync(cHome, { recursive: true });
@@ -1217,7 +1218,7 @@ finally:
         FAKE_GH_FAIL_VARIABLE: failVariable,
         FAKE_SECURITY_STATE: cSecState,
         FAKE_SECURITY_LOG: cSecLog,
-        FAKE_SECURITY_FAIL_ADD: failKeychainAdd ? '1' : '0',
+        FAKE_SECURITY_FAIL_ADD: failKeychainAdd === 'silent' ? 'silent' : failKeychainAdd ? '1' : '0',
         FAKE_EVENTS: cEvents,
         FAKE_MARKER: MARKER,
         FAKE_APP: JSON.stringify(convertedApp(args[0], app)),
@@ -1657,6 +1658,11 @@ finally:
   k = createApp(['mm-runners', '--to-keychain', SVC], { pem: bigPem });
   ok('a key whose security -i line would pass 4000 characters is never sent: nothing stored, the App named for deletion',
     k.status !== 0 && adds(k).length === 0 && k.kc.length === 0 && /[Dd]elete/.test(k.stderr) && !`${k.stdout}${k.stderr}`.includes(Buffer.from(bigPem).toString('base64').slice(0, 40)), cTail(k));
+
+  // security says it stored the key but the item is not there: not trusted.
+  k = createApp(['mm-runners', '--to-keychain', SVC], { failKeychainAdd: 'silent' });
+  ok('a store that reports success but leaves no item is a failure: no app.json, the App named for deletion',
+    k.status !== 0 && /not in the Keychain after the store/.test(k.stderr) && /[Dd]elete/.test(k.stderr) && !fs.existsSync(path.join(runnersDir(), 'app.json')), cTail(k));
 
   // A store that fails: the recovery always prints, and nothing is left behind.
   k = createApp(['mm-runners', '--to-keychain', SVC], { failKeychainAdd: true });
