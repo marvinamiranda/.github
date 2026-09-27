@@ -900,6 +900,304 @@ function zshOrSkip(what) {
   }
 })();
 
+// ------------------------ create-app.py: the Checks App's key custody ----
+// create-app.py runs under a Python harness that stands in for everything
+// outside it: the browser (it fetches the local page and follows the callback),
+// GitHub's manifest conversion (it answers with a fake PEM carrying a unique
+// marker), and the fixed port (it binds an ephemeral one). The fake PEM
+// reaches the harness on stdin, so it is never on disk; a stub `gh` first on
+// PATH answers the preflight reads and records every call's argv, and only a
+// hash of its stdin. Nothing here reaches the network.
+//
+// The proof that no key reached the disk is a grep of this suite's whole
+// temporary tree, HOME and TMPDIR included, for the marker.
+(function checksApp() {
+  const CREATE_APP = path.join(IDENTITY_SRC, 'create-app.py');
+  const REPOS = ['prod-a', 'prod-b'];
+  const ENV = 'governance-checks';
+  const MARKER = `MM-CHECKS-FAKE-PEM-${crypto.randomBytes(12).toString('hex')}`;
+  const PEM = `-----BEGIN RSA PRIVATE KEY-----\n${MARKER}\n${crypto.randomBytes(48).toString('base64')}\n-----END RSA PRIVATE KEY-----\n`;
+  const PEM_SHA = (s) => crypto.createHash('sha256').update(s).digest('hex');
+  const CLIENT_ID = 'Iv23.fakechecksclient';
+  const cBin = path.join(root, 'checks-bin');
+  const cHome = path.join(root, 'checks-home');
+  const cTmp = path.join(root, 'checks-tmp');
+  const cFixtures = path.join(root, 'checks-fixtures.json');
+  const cGhLog = path.join(root, 'checks-gh.log');
+  const cEvents = path.join(root, 'checks-events.log');
+  const harness = path.join(root, 'checks-harness.py');
+  fs.mkdirSync(cBin, { recursive: true });
+
+  const hasPython = spawnSync('python3', ['-c', 'import sys; sys.exit(sys.version_info < (3, 8))']).status === 0;
+  if (!hasPython) {
+    ok('python3 3.8+ is available for the create-app.py cases', false, 'no python3');
+    return;
+  }
+
+  // gh: `api <path>` answers from the fixtures (a 404 when absent); `secret
+  // set` and `variable set` succeed unless FAKE_GH_FAIL names the repository.
+  // It records argv and the SHA-256 of stdin, never stdin itself.
+  fs.writeFileSync(path.join(cBin, 'gh'), `#!/usr/bin/env node
+const fs = require('fs');
+const crypto = require('crypto');
+const args = process.argv.slice(2);
+let input = '';
+try { input = fs.readFileSync(0, 'utf8'); } catch (e) { input = ''; }
+fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify({ args, stdinSha: input ? crypto.createHash('sha256').update(input).digest('hex') : null,
+  stdinLength: input.length, token: process.env.GH_TOKEN === undefined ? null : process.env.GH_TOKEN }) + '\\n');
+if (args[0] === 'api') {
+  const fixtures = JSON.parse(fs.readFileSync(process.env.FAKE_GH_FIXTURES, 'utf8'));
+  const target = args.slice(1).filter((a) => !a.startsWith('-'))[0];
+  if (!(target in fixtures)) { process.stderr.write('gh: Not Found (HTTP 404)\\n'); process.exit(1); }
+  process.stdout.write(JSON.stringify(fixtures[target]) + '\\n');
+  process.exit(0);
+}
+if ((args[0] === 'secret' || args[0] === 'variable') && args[1] === 'set') {
+  const repo = args[args.indexOf('--repo') + 1] || '';
+  if (process.env.FAKE_GH_FAIL && repo.endsWith('/' + process.env.FAKE_GH_FAIL)) { process.stderr.write('HTTP 403: Resource not accessible\\n'); process.exit(1); }
+  process.stdout.write('set\\n');
+  process.exit(0);
+}
+process.stderr.write('stub gh: unexpected ' + args.join(' ') + '\\n');
+process.exit(98);
+`, { mode: 0o755 });
+
+  fs.writeFileSync(harness, `import html, http.client, http.server, json, os, re, runpy, sys, threading, urllib.request, webbrowser
+pem = sys.stdin.read()
+marker = os.environ['FAKE_MARKER']
+def log(**kw):
+    with open(os.environ['FAKE_EVENTS'], 'a') as f:
+        f.write(json.dumps(kw) + '\\n')
+class Resp:
+    def __init__(self, body): self.body = body.encode()
+    def read(self, *a): return self.body
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+def fake_urlopen(req, *a, **k):
+    url = getattr(req, 'full_url', req)
+    method = req.get_method() if hasattr(req, 'get_method') else 'GET'
+    m = re.fullmatch(r'https://api\\.github\\.com/app-manifests/([^/]+)/conversions', url)
+    if m and method == 'POST':
+        log(event='conversion', code=m.group(1))
+        return Resp(json.dumps({'id': 4242, 'slug': 'fake-checks', 'client_id': os.environ['FAKE_CLIENT_ID'],
+            'html_url': 'https://github.com/apps/fake-checks', 'name': 'MarvinaMiranda Checks', 'pem': pem,
+            'client_secret': 'fake-client-secret', 'webhook_secret': None}))
+    log(event='network', url=url)
+    raise RuntimeError('no network in this test: ' + url)
+urllib.request.urlopen = fake_urlopen
+servers = []
+Base = http.server.HTTPServer
+class Ephemeral(Base):
+    def __init__(self, addr, handler, *a, **k):
+        log(event='bind', port=addr[1])
+        super().__init__((addr[0], 0), handler, *a, **k)
+        servers.append(self)
+http.server.HTTPServer = Ephemeral
+def browser(url, *a, **k):
+    log(event='page', url=url)
+    def walk():
+        port = servers[0].server_address[1]
+        c = http.client.HTTPConnection('127.0.0.1', port, timeout=20)
+        c.request('GET', '/')
+        page = c.getresponse().read().decode()
+        state = re.search(r'[?&]state=([^&\\'"]+)', page).group(1)
+        value = re.search(r"name='manifest' value=\\"([^\\"]*)\\"", page).group(1)
+        log(event='form', manifest=json.loads(html.unescape(value)))
+        c = http.client.HTTPConnection('127.0.0.1', port, timeout=60)
+        c.request('GET', '/callback?state=' + state + '&code=fakecode')
+        r = c.getresponse()
+        body = r.read().decode()
+        log(event='callback', status=r.status, marker=marker in body)
+    t = threading.Thread(target=walk, daemon=True)
+    walkers.append(t)
+    t.start()
+    return True
+walkers = []
+webbrowser.open = browser
+sys.argv = [sys.argv[1]] + sys.argv[2:]
+try:
+    runpy.run_path(sys.argv[0], run_name='__main__')
+finally:
+    for t in walkers:
+        t.join(30)
+`);
+
+  // A healthy target: default branch test, the environment with a custom
+  // policy whose one rule is test, and a public key the credential can read.
+  function repoFixtures(r, { env = 'ok', rules = [{ id: 1, name: 'test', type: 'branch' }], secret = false } = {}) {
+    const base = `repos/${ORG}/${r}`;
+    const e = `${base}/environments/${ENV}`;
+    const fx = { [base]: { name: r, full_name: `${ORG}/${r}`, default_branch: 'test' } };
+    if (env === 'missing') return fx;
+    fx[e] = { name: ENV, deployment_branch_policy: env === 'protected' ? { protected_branches: true, custom_branch_policies: false }
+      : env === 'open' ? null : { protected_branches: false, custom_branch_policies: true } };
+    fx[`${e}/deployment-branch-policies?per_page=100`] = { total_count: rules.length, branch_policies: rules };
+    fx[`${e}/secrets/public-key`] = { key_id: 'k1', key: 'AAAA' };
+    if (secret) fx[`${e}/secrets/CHECKS_APP_PRIVATE_KEY`] = { name: 'CHECKS_APP_PRIVATE_KEY', updated_at: '2026-09-27T00:00:00Z' };
+    return fx;
+  }
+  const allRepos = (opts = {}) => Object.assign({}, ...REPOS.map((r) => repoFixtures(r, opts[r] || {})));
+
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '' } = {}) {
+    fs.rmSync(cHome, { recursive: true, force: true });
+    fs.rmSync(cTmp, { recursive: true, force: true });
+    fs.mkdirSync(cHome, { recursive: true });
+    fs.mkdirSync(cTmp, { recursive: true });
+    fs.writeFileSync(cFixtures, JSON.stringify(fx));
+    for (const f of [cGhLog, cEvents]) fs.writeFileSync(f, '');
+    const r = spawnSync('python3', [harness, CREATE_APP, ...args], {
+      input: PEM,
+      encoding: 'utf8',
+      timeout: 60000,
+      env: {
+        PATH: [cBin, process.env.PATH].join(':'),
+        HOME: cHome,
+        TMPDIR: cTmp,
+        LANG: 'C',
+        GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
+        FAKE_GH_LOG: cGhLog,
+        FAKE_GH_FIXTURES: cFixtures,
+        FAKE_GH_FAIL: fail,
+        FAKE_EVENTS: cEvents,
+        FAKE_MARKER: MARKER,
+        FAKE_CLIENT_ID: CLIENT_ID,
+        ...extraEnv,
+      },
+    });
+    const gh = records(cGhLog);
+    const events = records(cEvents);
+    return {
+      ...r,
+      gh,
+      events,
+      sets: gh.filter((c) => (c.args[0] === 'secret' || c.args[0] === 'variable') && c.args[1] === 'set'),
+      opened: events.some((e) => e.event === 'page' || e.event === 'bind'),
+      converted: events.filter((e) => e.event === 'conversion').length,
+    };
+  }
+  const cTail = (r) => `exit ${r.status}; ${(r.stderr || '').trim().split('\n').slice(-2).join(' | ')}`;
+
+  // Every file under the suite's temporary tree (HOME and TMPDIR are inside
+  // it) that holds the marker.
+  function filesWithMarker(dir = root) {
+    const hits = [];
+    const walk = (d) => {
+      for (const ent of listOr(d).map((n) => path.join(d, n))) {
+        let st;
+        try { st = fs.lstatSync(ent); } catch (e) { continue; }
+        if (st.isDirectory()) walk(ent);
+        else if (st.isFile() && fs.readFileSync(ent).includes(MARKER)) hits.push(ent);
+      }
+    };
+    walk(dir);
+    return hits;
+  }
+  const keyFile = () => path.join(cHome, '.config', 'mm-agent', 'mm-checks', 'private-key.pem');
+  const checksDir = () => path.join(cHome, '.config', 'mm-agent', 'mm-checks');
+  const argvHasKey = (r) => r.gh.some((c) => c.args.some((a) => a.includes(MARKER) || a.includes('PRIVATE KEY')));
+
+  // ---- the manifest ----
+  let manifest = {};
+  try { manifest = JSON.parse(fs.readFileSync(path.join(IDENTITY_SRC, 'mm-checks.manifest.json'), 'utf8')); } catch (e) { manifest = { default_permissions: {} }; }
+  ok('mm-checks.manifest.json: default_permissions is exactly checks write, statuses write, metadata read',
+    JSON.stringify(Object.entries(manifest.default_permissions).sort()) === JSON.stringify([['checks', 'write'], ['metadata', 'read'], ['statuses', 'write']]),
+    JSON.stringify(manifest.default_permissions));
+  ok('mm-checks.manifest.json: no webhook, no events, private, named "MarvinaMiranda Checks"',
+    manifest.hook_attributes && manifest.hook_attributes.active === false && Array.isArray(manifest.default_events)
+      && manifest.default_events.length === 0 && manifest.public === false && manifest.name === 'MarvinaMiranda Checks',
+    JSON.stringify({ hook: manifest.hook_attributes, events: manifest.default_events, public: manifest.public, name: manifest.name }));
+
+  // ---- the flow ----
+  const args = ['mm-checks', '--to-environment', ...REPOS.flatMap((r) => ['--repo', r])];
+  let r = createApp(args);
+  ok('create-app.py mm-checks --to-environment completes against a stubbed GitHub',
+    r.status === 0 && r.converted === 1 && r.events.some((e) => e.event === 'callback' && e.status === 200), cTail(r));
+  const form = r.events.find((e) => e.event === 'form');
+  ok('the page posts mm-checks.manifest.json, with the local callback as its redirect',
+    form && JSON.stringify(form.manifest.default_permissions) === JSON.stringify(manifest.default_permissions)
+      && form.manifest.hook_attributes.active === false && /^http:\/\/127\.0\.0\.1:\d+\/callback$/.test(form.manifest.redirect_url),
+    form && JSON.stringify(form.manifest));
+  for (const repo of REPOS) {
+    const secrets = r.sets.filter((c) => c.args[0] === 'secret' && c.args.includes(`${ORG}/${repo}`));
+    const vars = r.sets.filter((c) => c.args[0] === 'variable' && c.args.includes(`${ORG}/${repo}`));
+    ok(`${repo}: exactly one CHECKS_APP_PRIVATE_KEY secret in environment governance-checks, the PEM arriving on stdin`,
+      secrets.length === 1 && secrets[0].args[2] === 'CHECKS_APP_PRIVATE_KEY'
+        && secrets[0].args.join(' ').includes(`--env ${ENV}`) && secrets[0].stdinSha === PEM_SHA(PEM),
+      JSON.stringify(secrets.map((c) => ({ args: c.args, sha: c.stdinSha }))));
+    ok(`${repo}: exactly one CHECKS_APP_CLIENT_ID variable in environment governance-checks, holding the client id`,
+      vars.length === 1 && vars[0].args[2] === 'CHECKS_APP_CLIENT_ID' && vars[0].args.join(' ').includes(`--env ${ENV}`)
+        && vars[0].args[vars[0].args.indexOf('--body') + 1] === CLIENT_ID && vars[0].stdinSha === null,
+      JSON.stringify(vars.map((c) => c.args)));
+  }
+  ok('no set call went to any other repository or environment',
+    r.sets.length === 2 * REPOS.length && r.sets.every((c) => c.args.join(' ').includes(`--env ${ENV}`)), JSON.stringify(r.sets.map((c) => c.args)));
+  ok('the PEM is in no gh call\'s argv', !argvHasKey(r), '');
+  ok('the PEM reached gh on stdin exactly once per repository, and on no other call',
+    r.gh.filter((c) => c.stdinSha === PEM_SHA(PEM)).length === REPOS.length
+      && r.gh.every((c) => c.stdinSha === null || c.stdinSha === PEM_SHA(PEM)), JSON.stringify(r.gh.map((c) => c.stdinSha)));
+  ok('no file under the temporary tree (HOME and TMPDIR included) holds the PEM\'s marker', filesWithMarker().length === 0, filesWithMarker().join(', '));
+  ok('no private-key.pem for mm-checks', !fs.existsSync(keyFile()), keyFile());
+  ok('no temporary file is left behind in TMPDIR', listOr(cTmp).length === 0, listOr(cTmp).join(', '));
+  ok('the PEM is never printed, nor shown on the callback page',
+    !`${r.stdout}${r.stderr}`.includes(MARKER) && !/PRIVATE KEY/.test(`${r.stdout}${r.stderr}`)
+      && r.events.some((e) => e.event === 'callback' && e.marker === false), '');
+  const meta = readOr(path.join(checksDir(), 'app.json'));
+  ok('app.json records the App\'s id and client id and holds no secret',
+    meta !== '' && JSON.parse(meta).id === 4242 && JSON.parse(meta).client_id === CLIENT_ID
+      && !/PRIVATE KEY|pem|client_secret|fake-client-secret/.test(meta), meta);
+  ok('it tells the owner to install the App on the selected repositories only',
+    /apps\/fake-checks\/installations\/new/.test(r.stdout) && /prod-a/.test(r.stdout) && /prod-b/.test(r.stdout) && !/All repositories/.test(r.stdout), r.stdout);
+
+  // ---- refusals: exit non-zero, before the page opens, nothing created ----
+  const nothingDone = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.sets.length === 0 && !fs.existsSync(checksDir());
+  for (const [what, a, opts, says] of [
+    ['mm-checks without --to-environment', ['mm-checks'], {}, /--to-environment/],
+    ['mm-checks with --repo but no --to-environment', ['mm-checks', '--repo', 'prod-a'], {}, /--to-environment/],
+    ['--to-environment with mm-agent', ['mm-agent', '--to-environment', '--repo', 'prod-a'], {}, /only for mm-checks/],
+    ['--to-environment with mm-reviewer', ['mm-reviewer', '--to-environment', '--repo', 'prod-a'], {}, /only for mm-checks/],
+    ['--to-environment without a --repo', ['mm-checks', '--to-environment'], {}, /--repo/],
+    ['a --repo in another organisation', ['mm-checks', '--to-environment', '--repo', 'someone-else/prod-a'], {}, /marvinamiranda/],
+    ['the same --repo twice', ['mm-checks', '--to-environment', '--repo', 'prod-a', '--repo', `${ORG}/prod-a`], {}, /twice/],
+    ['a target repository without the governance-checks environment', args, { fx: allRepos({ 'prod-b': { env: 'missing' } }) }, /prod-b[\s\S]*governance-checks/],
+    ['an environment that allows protected branches', args, { fx: allRepos({ 'prod-a': { env: 'protected' } }) }, /prod-a[\s\S]*deployment/],
+    ['an environment open to every branch', args, { fx: allRepos({ 'prod-a': { env: 'open' } }) }, /prod-a[\s\S]*deployment/],
+    ['an environment that also allows refs/pull/*', args,
+      { fx: allRepos({ 'prod-a': { rules: [{ id: 1, name: 'test', type: 'branch' }, { id: 2, name: 'refs/pull/*', type: 'branch' }] } }) }, /prod-a[\s\S]*refs\/pull\/\*/],
+    ['an environment that also allows *', args,
+      { fx: allRepos({ 'prod-b': { rules: [{ id: 1, name: 'test', type: 'branch' }, { id: 3, name: '*', type: 'branch' }] } }) }, /prod-b[\s\S]*\*/],
+    ['an environment whose one rule is a tag named test', args,
+      { fx: allRepos({ 'prod-a': { rules: [{ id: 1, name: 'test', type: 'tag' }] } }) }, /prod-a/],
+    ['an environment with no rule at all', args, { fx: allRepos({ 'prod-a': { rules: [] } }) }, /prod-a/],
+    ['a secret already in the environment, without --replace', args, { fx: allRepos({ 'prod-b': { secret: true } }) }, /--replace/],
+    ['a shell carrying the Agent App\'s identity', args, { extraEnv: { GH_TOKEN: 'mm-agent-sentinel-not-a-token' } }, /not the owner's credential/],
+    ['an installation token as GH_TOKEN', args, { extraEnv: { GH_TOKEN: 'ghs_FAKEINSTALLATIONTOKEN' } }, /not the owner's credential/],
+    ['an agent\'s gh config directory', args, { extraEnv: { GH_TOKEN: '', GH_CONFIG_DIR: path.join(cHome, '.config', 'mm-agent', 'mm-agent', 'gh') } }, /not the owner's credential/],
+  ]) {
+    const x = createApp(a, opts);
+    ok(`refuses ${what}: non-zero, before the page opens, nothing created`, nothingDone(x) && says.test(x.stderr), `${cTail(x)} opened=${x.opened} sets=${x.sets.length}`);
+  }
+  const unknown = createApp(['mm-nobody']);
+  ok('refuses an identity it has no custody rule for', nothingDone(unknown), cTail(unknown));
+
+  r = createApp([...args, '--replace'], { fx: allRepos({ 'prod-b': { secret: true } }) });
+  ok('with --replace, an existing secret is overwritten, still from stdin',
+    r.status === 0 && r.sets.filter((c) => c.stdinSha === PEM_SHA(PEM)).length === REPOS.length && !argvHasKey(r), cTail(r));
+
+  // ---- unchanged: mm-agent's key still goes to its directory ----
+  r = createApp(['mm-agent']);
+  const agentKey = path.join(cHome, '.config', 'mm-agent', 'mm-agent', 'private-key.pem');
+  ok('mm-agent (no flags) still writes its key to ~/.config/mm-agent/mm-agent/private-key.pem, 0600, and uploads nothing',
+    r.status === 0 && readOr(agentKey) === PEM && (fs.statSync(agentKey).mode & 0o777) === 0o600 && r.sets.length === 0, cTail(r));
+  fs.rmSync(cHome, { recursive: true, force: true }); // that key holds the marker by design
+
+  // ---- a failed upload: says so, names the App to delete, leaves no key ----
+  r = createApp(args, { fail: 'prod-b' });
+  ok('an upload that fails exits non-zero and names the App to delete',
+    r.status !== 0 && /prod-b/.test(r.stderr) && /[Dd]elete/.test(r.stderr) && /fake-checks/.test(r.stderr), cTail(r));
+  ok('...and still leaves no key on disk, and prints none',
+    filesWithMarker().length === 0 && !fs.existsSync(keyFile()) && !`${r.stdout}${r.stderr}`.includes(MARKER), filesWithMarker().join(', '));
+})();
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`\n${total - failed}/${total} passed`);
 process.exit(failed ? 1 : 0);
