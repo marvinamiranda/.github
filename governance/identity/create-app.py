@@ -39,6 +39,14 @@ The key is never printed. Where it goes depends on the identity (CUSTODY below):
         must exist and allow only the repository's default branch (bootstrap.sh
         creates it so), and must not hold the secret already unless --replace.
 
+    python3 -I -S governance/identity/create-app.py mm-runners --to-keychain marvinamiranda.ephemeral-runner-pool
+        The key goes straight into the login Keychain as a generic password
+        (service as given, account the App's client id), base64-encoded on one
+        line, which is how the runner pool controller reads it. It reaches
+        `security` inside a command on stdin (`security -i`), never as an
+        argument, and is never written to disk or printed. An item already
+        there for that service is refused unless --replace.
+
 Run it from a merged commit: check this repository out by the SHA of a commit
 on its test. It refuses anything else (governance/identity/provenance.sh, the
 rule bootstrap.sh --apply uses): a commit that is not on test as GitHub has it
@@ -48,6 +56,7 @@ git checkout. It reads the manifest from that commit, not from the file.
 Afterwards, install the App from the URL it prints.
 """
 import argparse
+import base64
 import http.server
 import json
 import os
@@ -69,11 +78,22 @@ AGENT_ROOT = pathlib.Path.home() / ".config" / "mm-agent"
 # agent session on the machine, which is acceptable for the identities agents
 # themselves act as. "environment": only a GitHub environment secret, because
 # that key can post merge-gating checks (marvinamiranda/.github#9).
+# "keychain": only the owner's login Keychain, because that key registers
+# runners that receive gate jobs (marvinamiranda/.github#17); only the pool
+# controller reads it, and no agent acts as that App.
 CUSTODY = {
     "mm-agent": "file",
     "mm-reviewer": "file",
     "mm-checks": "environment",
+    "mm-runners": "keychain",
 }
+KEYCHAIN = "login.keychain"
+KEYCHAIN_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+# `security -i` reads a command line into a 4096-byte buffer and runs whatever
+# does not fit as a further command, echoing it in an "unknown command" error:
+# a longer line would print part of the key. Measured on macOS 27: lines of up
+# to 4095 characters ran whole, longer ones were split. Refused well before.
+KEYCHAIN_LINE_MAX = 4000
 ENVIRONMENT = "governance-checks"
 KEY_SECRET = "CHECKS_APP_PRIVATE_KEY"
 CLIENT_ID_VARIABLE = "CHECKS_APP_CLIENT_ID"
@@ -93,8 +113,10 @@ parser.add_argument("--to-environment", action="store_true",
                     help=f"mm-checks only, and required for it: load the key into each --repo's {ENVIRONMENT} environment")
 parser.add_argument("--repo", action="append", default=[], metavar="REPO",
                     help=f"a repository in {ORG} to load the key into; one per repository")
+parser.add_argument("--to-keychain", metavar="SERVICE",
+                    help="mm-runners only, and required for it: store the key in the login Keychain under this service")
 parser.add_argument("--replace", action="store_true",
-                    help=f"overwrite a {KEY_SECRET} already in the environment")
+                    help=f"overwrite a {KEY_SECRET} already in the environment, or a Keychain item for the service")
 args = parser.parse_args()
 
 name = args.name
@@ -103,12 +125,24 @@ manifest_path = HERE / f"{name}.manifest.json"
 if custody is None or not manifest_path.is_file():
     refuse(f"usage: create-app.py <{'|'.join(CUSTODY)}> (no custody rule or no {manifest_path.name} for {name!r})")
 if args.to_environment and custody != "environment":
-    refuse(f"--to-environment is only for mm-checks; {name}'s key is written to ~/.config/mm-agent/{name}/.")
+    refuse(f"--to-environment is only for mm-checks; {name}'s key goes "
+           + ("into the login Keychain." if custody == "keychain" else f"to ~/.config/mm-agent/{name}/."))
+if args.to_keychain is not None and custody != "keychain":
+    refuse(f"--to-keychain is only for mm-runners; {name}'s key goes "
+           + ("into the governance-checks environment." if custody == "environment" else f"to ~/.config/mm-agent/{name}/."))
 if custody == "environment" and not args.to_environment:
     refuse(f"{name}'s key may only go into each repository's {ENVIRONMENT} environment, never onto disk: "
            f"pass --to-environment and one --repo per repository.")
-if not args.to_environment and (args.repo or args.replace):
-    refuse("--repo and --replace go with --to-environment.")
+if custody == "keychain" and args.to_keychain is None:
+    refuse(f"{name}'s key may only go into the login Keychain, never onto disk: pass --to-keychain <service>.")
+if args.repo and not args.to_environment:
+    refuse("--repo goes with --to-environment.")
+if args.replace and not (args.to_environment or args.to_keychain is not None):
+    refuse("--replace goes with --to-environment or --to-keychain.")
+SERVICE = args.to_keychain
+if custody == "keychain" and not re.fullmatch(KEYCHAIN_NAME_RE, SERVICE):
+    refuse(f"--to-keychain {SERVICE!r}: the service name may hold only letters, digits, '.', '_' and '-' "
+           f"(it travels inside a security -i command line).")
 
 repos = []
 if custody == "environment":
@@ -215,10 +249,28 @@ def preflight(repo):
 
 
 def scrub(text: str, pem: str) -> str:
-    """Whatever gh printed, without the key in it."""
+    """Whatever gh or security printed, without the key in it, in either encoding."""
     text = text.replace(pem.strip(), "[key removed]")
+    text = text.replace(base64.b64encode(pem.encode()).decode(), "[key removed]")
     return re.sub(r"-----BEGIN[^-]*-----.*?(-----END[^-]*-----|$)", "[key removed]", text, flags=re.S)
 
+
+def security(*argv, stdin_text=None):
+    """Run the security on PATH. Only the store sends stdin, and only it carries the key."""
+    return subprocess.run(["security", *argv], input=stdin_text,
+                          stdin=None if stdin_text is not None else subprocess.DEVNULL, capture_output=True, text=True)
+
+
+if custody == "keychain":
+    # Whether an item exists already: attributes only, never -w or -g, so no
+    # secret is read. 44 is "could not be found".
+    found = security("find-generic-password", "-s", SERVICE, KEYCHAIN)
+    if found.returncode == 0 and not args.replace:
+        refuse(f"the login Keychain already holds an item for service {SERVICE!r}, another App's key. "
+               f"Pass --replace to remove it once the new key is in hand.", 1)
+    if found.returncode not in (0, 44):
+        refuse(f"security cannot read the login Keychain: {found.stderr.strip()}", 1)
+    print(f"Keychain: {KEYCHAIN}, service {SERVICE!r}: {'present, will be replaced' if found.returncode == 0 else 'free'}.")
 
 if custody == "environment":
     why = not_the_owner()
@@ -318,6 +370,63 @@ def to_environment(app, pem):
             f"repositories</i>: {chosen}.</p>"), 0
 
 
+def to_keychain(app, pem):
+    """mm-runners: the key into the login Keychain, inside a command on stdin. Returns (page, rc)."""
+    client_id = str(app.get("client_id") or "")
+    stored, removed, failure = False, 0, None
+    try:
+        encoded = base64.b64encode(pem.encode()).decode()
+        line = f"add-generic-password -a {client_id} -s {SERVICE} -w {encoded} {KEYCHAIN}\n"
+        if not re.fullmatch(KEYCHAIN_NAME_RE, client_id):
+            failure = f"the App's client id {client_id!r} cannot travel in a security -i command line"
+        elif len(line) > KEYCHAIN_LINE_MAX:
+            failure = (f"the key is too long for one security -i line ({len(line)} > {KEYCHAIN_LINE_MAX} characters); "
+                       f"security would split it and print part of it")
+        if failure is None and args.replace:
+            # Only now, with the new key in hand: every item for the service goes,
+            # so the controller never finds an older App's key first.
+            while True:
+                r = security("delete-generic-password", "-s", SERVICE, KEYCHAIN)
+                if r.returncode == 44:
+                    break
+                if r.returncode != 0 or removed >= 16:
+                    failure = f"removing the previous item failed: {scrub(r.stderr.strip(), pem)}"
+                    break
+                removed += 1
+        if failure is None:
+            r = security("-i", stdin_text=line)
+            if r.returncode != 0:
+                failure = f"security add-generic-password failed: {scrub((r.stderr + r.stdout).strip(), pem)}"
+            elif security("find-generic-password", "-s", SERVICE, "-a", client_id, KEYCHAIN).returncode != 0:
+                failure = "the item is not in the Keychain after the store"
+            else:
+                stored = True
+        del encoded, line
+    except Exception as e:  # reported below, with the recovery
+        failure = f"{type(e).__name__} while storing the key: {scrub(str(e), pem)}"
+    finally:
+        if not stored:
+            settings = f"https://github.com/organizations/{ORG}/settings/apps/{app.get('slug')}/advanced"
+            print(f"FAILED: {failure or 'interrupted before the key was stored'}", file=sys.stderr)
+            print(f"The key was not stored and is not kept anywhere"
+                  f"{f'; {removed} previous item(s) for {SERVICE!r} were removed' if removed else ''}. "
+                  f"App {app.get('slug')} (id {app.get('id')}) cannot be completed: delete it at {settings}, "
+                  f"fix the cause and run this again.", file=sys.stderr)
+    if not stored:
+        return "<p>Storing the key failed. See the terminal: delete this App and run again.</p>", 1
+    private_dir()
+    meta = {"app_id": app["id"], "client_id": client_id, "slug": app["slug"], "keychain_service": SERVICE}
+    write_private(out_dir / "app.json", json.dumps(meta, indent=2))
+    install = f"https://github.com/apps/{app['slug']}/installations/new"
+    print(f"Created {app['slug']} (id {app['id']}). Key: only in the login Keychain, service {SERVICE!r}, "
+          f"account {client_id}; no file written.")
+    print(f"Install: {install} (Only select repositories: omni237 and omni237-ops)")
+    return (f"<p>The private key went only into the login Keychain (service <code>{SERVICE}</code>). "
+            f"No file was written and it was not shown anywhere.</p>"
+            f"<p><b>Last step:</b> <a href='{install}'>install it</a> — choose <i>Only select "
+            f"repositories</i>: omni237 and omni237-ops.</p>"), 0
+
+
 def not_the_manifests(app):
     """Why the App GitHub created is not the one the manifest describes, or []."""
     problems = []
@@ -387,7 +496,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       f"(or wherever it was created) and run this again.", file=sys.stderr)
                 page, rc = "<p>The App created is not the one the manifest describes. See the terminal.</p>", 1
             else:
-                page, rc = (to_environment if custody == "environment" else to_file)(app, pem)
+                page, rc = {"environment": to_environment, "keychain": to_keychain, "file": to_file}[custody](app, pem)
                 del pem
             self._send(
                 f"<html><body style='font-family:sans-serif;max-width:40em;margin:3em auto'>"

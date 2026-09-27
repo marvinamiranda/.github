@@ -126,10 +126,13 @@ pre=()
 if [ "\${1-}" = -C ]; then pre=(-C "$2"); fi
 hit=0
 for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
+# Stands in for a system gitconfig (Homebrew's is writable by the owner's
+# account): git reads it unless GIT_CONFIG_NOSYSTEM=1.
+if [ -f ${JSON.stringify(path.join(stubBin, 'system-gitconfig'))} ]; then export GIT_CONFIG_SYSTEM=${JSON.stringify(path.join(stubBin, 'system-gitconfig'))}; fi
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
 if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(stubBin, 'fake-github'))})"; fi
-for a in "$@"; do if [ "$a" = ls-remote ]; then env | sed 's/=.*//' | sort | tr '\\n' ' ' >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; echo >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; fi; done
+for a in "$@"; do if [ "$a" = ls-remote ]; then { env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; fi; done
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -350,6 +353,20 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
   ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
     r.status === 0 && seen.length >= 1 && leaked.length === 0, `${tail(r)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
+  ok('the ls-remote of test runs with GIT_TERMINAL_PROMPT=0', seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)),
+    seen.map((l) => l.slice(-40)).join(' | '));
+
+  // A planted system gitconfig redirecting test to the unmerged commit: ignored.
+  const sysConfig = path.join(stubBin, 'system-gitconfig');
+  fs.writeFileSync(sysConfig, `[url "${evil}"]\n\tinsteadOf = ${CANONICAL}\n`);
+  fs.writeFileSync(path.join(stubBin, 'fake-github'), planted.canon);
+  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, process.env.PATH].join(':'), HOME: path.join(root, 'home') } });
+  r = bootstrap(['--no-rulesets', '--apply'], { where: planted });
+  fs.rmSync(sysConfig, { force: true });
+  ok('control: a planted system gitconfig does redirect the canonical URL for an ordinary git call',
+    sysControl.stdout.startsWith(execFileSync('git', ['-C', planted.work, 'rev-parse', 'HEAD']).toString().trim()), sysControl.stdout + sysControl.stderr);
+  ok('--apply ignores an insteadOf in the system gitconfig (GIT_CONFIG_NOSYSTEM=1): refused, before any gh call',
+    r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
 
   const loose = fs.mkdtempSync(path.join(root, 'loose-'));
   fs.mkdirSync(path.join(loose, 'governance'));

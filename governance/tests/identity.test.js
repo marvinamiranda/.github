@@ -937,6 +937,7 @@ function zshOrSkip(what) {
   const MARKER = `MM-CHECKS-FAKE-PEM-${crypto.randomBytes(12).toString('hex')}`;
   const PEM = `-----BEGIN RSA PRIVATE KEY-----\n${MARKER}\n${crypto.randomBytes(48).toString('base64')}\n-----END RSA PRIVATE KEY-----\n`;
   const PEM_SHA = (s) => crypto.createHash('sha256').update(s).digest('hex');
+  const PEM_B64 = Buffer.from(PEM).toString('base64'); // how the Keychain holds it: one line
   const CLIENT_ID = 'Iv23.fakechecksclient';
   const cBin = path.join(root, 'checks-bin');
   const cHome = path.join(root, 'checks-home');
@@ -945,6 +946,8 @@ function zshOrSkip(what) {
   const cGhLog = path.join(root, 'checks-gh.log');
   const cEvents = path.join(root, 'checks-events.log');
   const harness = path.join(root, 'checks-harness.py');
+  const cSecState = path.join(root, 'checks-keychain.json');
+  const cSecLog = path.join(root, 'checks-security.log');
   fs.mkdirSync(cBin, { recursive: true });
 
   // git: the real one, except that the canonical URL of marvinamiranda/.github
@@ -963,10 +966,13 @@ pre=()
 if [ "\${1-}" = -C ]; then pre=(-C "$2"); fi
 hit=0
 for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
+# Stands in for a system gitconfig (Homebrew's /opt/homebrew/etc/gitconfig is
+# writable by the owner's account): git reads it unless GIT_CONFIG_NOSYSTEM=1.
+if [ -f ${JSON.stringify(path.join(cBin, 'system-gitconfig'))} ]; then export GIT_CONFIG_SYSTEM=${JSON.stringify(path.join(cBin, 'system-gitconfig'))}; fi
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
 if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(cBin, 'fake-github'))})"; fi
-for a in "$@"; do if [ "$a" = ls-remote ]; then env | sed 's/=.*//' | sort | tr '\\n' ' ' >> ${JSON.stringify(path.join(cBin, 'ls-remote-env.log'))}; echo >> ${JSON.stringify(path.join(cBin, 'ls-remote-env.log'))}; fi; done
+for a in "$@"; do if [ "$a" = ls-remote ]; then { env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(cBin, 'ls-remote-env.log'))}; fi; done
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -1005,6 +1011,83 @@ if ((args[0] === 'secret' || args[0] === 'variable') && args[1] === 'set') {
 }
 process.stderr.write('stub gh: unexpected ' + args.join(' ') + '\\n');
 process.exit(98);
+`, { mode: 0o755 });
+
+  // security: the macOS keychain CLI. Keeps its items in a JSON state file
+  // holding each password's SHA-256 only, never the password. Commands come in
+  // argv, or with -i one per line on stdin. It logs every call: argv as given
+  // (so a secret put in argv shows up, on disk, and fails the marker search),
+  // and stdin commands with the -w value replaced by its hash.
+  fs.writeFileSync(path.join(cBin, 'security'), `#!/usr/bin/env node
+const fs = require('fs');
+const crypto = require('crypto');
+const argv = process.argv.slice(2);
+const stateFile = process.env.FAKE_SECURITY_STATE;
+const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : [];
+const log = (entry) => fs.appendFileSync(process.env.FAKE_SECURITY_LOG, JSON.stringify(entry) + '\\n');
+const sha = (v) => crypto.createHash('sha256').update(v).digest('hex');
+function tokens(line) {
+  const out = []; let cur = null; let q = null;
+  for (const ch of line) {
+    if (q) { if (ch === q) q = null; else cur += ch; continue; }
+    if (ch === '"' || ch === "'") { q = ch; cur = cur || ''; continue; }
+    if (/\\s/.test(ch)) { if (cur !== null) { out.push(cur); cur = null; } continue; }
+    cur = (cur || '') + ch;
+  }
+  if (cur !== null) out.push(cur);
+  return out;
+}
+function run(t) {
+  const cmd = t[0]; const opt = {}; const flags = new Set(); const pos = [];
+  for (let i = 1; i < t.length; i++) {
+    if (['-a', '-s', '-w', '-l', '-j', '-T', '-p'].includes(t[i])) opt[t[i]] = t[++i];
+    else if (t[i].startsWith('-')) flags.add(t[i]);
+    else pos.push(t[i]);
+  }
+  const keychain = pos[0] || null;
+  const match = (it) => it.service === opt['-s'] && (opt['-a'] === undefined || it.account === opt['-a']);
+  if (cmd === 'find-generic-password') {
+    if (flags.has('-w') || flags.has('-g')) { process.stderr.write('stub security: refusing to reveal a secret\\n'); return 97; }
+    const it = state.find(match);
+    if (!it) { process.stderr.write('security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\\n'); return 44; }
+    process.stdout.write('keychain: "' + (it.keychain || '') + '"\\n    "acct"<blob>="' + it.account + '"\\n    "svce"<blob>="' + it.service + '"\\n');
+    return 0;
+  }
+  if (cmd === 'add-generic-password') {
+    if (process.env.FAKE_SECURITY_FAIL_ADD === '1') { process.stderr.write('security: SecKeychainItemCreateFromContent: failed\\n'); return 50; }
+    const at = state.findIndex((it) => it.service === opt['-s'] && it.account === opt['-a']);
+    if (at >= 0 && !flags.has('-U')) { process.stderr.write('security: The specified item already exists in the keychain.\\n'); return 45; }
+    const item = { service: opt['-s'], account: opt['-a'], keychain, passwordSha: sha(opt['-w'] || ''), trusted: opt['-T'] === undefined ? null : opt['-T'], anyApp: flags.has('-A') };
+    if (at >= 0) state[at] = item; else state.push(item);
+    return 0;
+  }
+  if (cmd === 'delete-generic-password') {
+    const at = state.findIndex(match);
+    if (at < 0) { process.stderr.write('security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\\n'); return 44; }
+    state.splice(at, 1);
+    return 0;
+  }
+  process.stderr.write('stub security: unexpected ' + t.join(' ') + '\\n');
+  return 98;
+}
+let rc = 0;
+if (argv.includes('-i')) {
+  let input = '';
+  try { input = fs.readFileSync(0, 'utf8'); } catch (e) { input = ''; }
+  for (const line of input.split('\\n').filter((l) => l.trim())) {
+    const t = tokens(line);
+    const w = t.indexOf('-w');
+    const shown = t.map((v, i) => (i === w + 1 && w >= 0 ? { passwordSha: sha(v), length: v.length } : v));
+    log({ via: 'stdin', argv, command: shown });
+    const code = run(t);
+    if (code) rc = code;
+  }
+} else {
+  log({ via: 'argv', argv });
+  rc = run(argv);
+}
+fs.writeFileSync(stateFile, JSON.stringify(state));
+process.exit(rc);
 `, { mode: 0o755 });
 
   fs.writeFileSync(harness, `import html, http.client, http.server, json, os, re, runpy, sys, threading, urllib.request, webbrowser
@@ -1108,16 +1191,18 @@ finally:
       name: m.name, owner: { login: ORG, type: 'Organization' }, permissions: m.default_permissions, events: m.default_events,
       client_secret: 'fake-client-secret', webhook_secret: null });
   }
-  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '' } = {}) {
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM } = {}) {
     fs.rmSync(cHome, { recursive: true, force: true });
     fs.rmSync(cTmp, { recursive: true, force: true });
     fs.mkdirSync(cHome, { recursive: true });
     fs.mkdirSync(cTmp, { recursive: true });
     if (homeGitconfig) fs.writeFileSync(path.join(cHome, '.gitconfig'), homeGitconfig);
+    fs.writeFileSync(cSecState, JSON.stringify(keychain));
+    fs.writeFileSync(cSecLog, '');
     fs.writeFileSync(cFixtures, JSON.stringify(fx));
     for (const f of [cGhLog, cEvents]) fs.writeFileSync(f, '');
     const r = spawnSync('python3', [...pyFlags, harness, CREATE_APP, ...args], {
-      input: PEM,
+      input: pem,
       encoding: 'utf8',
       timeout: 60000,
       env: {
@@ -1130,6 +1215,9 @@ finally:
         FAKE_GH_FIXTURES: cFixtures,
         FAKE_GH_FAIL: fail,
         FAKE_GH_FAIL_VARIABLE: failVariable,
+        FAKE_SECURITY_STATE: cSecState,
+        FAKE_SECURITY_LOG: cSecLog,
+        FAKE_SECURITY_FAIL_ADD: failKeychainAdd ? '1' : '0',
         FAKE_EVENTS: cEvents,
         FAKE_MARKER: MARKER,
         FAKE_APP: JSON.stringify(convertedApp(args[0], app)),
@@ -1146,6 +1234,8 @@ finally:
       sets: gh.filter((c) => (c.args[0] === 'secret' || c.args[0] === 'variable') && c.args[1] === 'set'),
       opened: events.some((e) => e.event === 'page' || e.event === 'bind'),
       converted: events.filter((e) => e.event === 'conversion').length,
+      sec: records(cSecLog),
+      kc: JSON.parse(readOr(cSecState, '[]')),
     };
   }
   const cTail = (r) => `exit ${r.status}; ${(r.stderr || '').trim().split('\n').slice(-2).join(' | ')}`;
@@ -1159,7 +1249,7 @@ finally:
         let st;
         try { st = fs.lstatSync(ent); } catch (e) { continue; }
         if (st.isDirectory()) walk(ent);
-        else if (st.isFile() && fs.readFileSync(ent).includes(MARKER)) hits.push(ent);
+        else if (st.isFile() && (fs.readFileSync(ent).includes(MARKER) || fs.readFileSync(ent).includes(PEM_B64))) hits.push(ent);
       }
     };
     walk(dir);
@@ -1413,6 +1503,22 @@ finally:
   const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
   ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
     drill.status === 0 && seen.length >= 1 && leaked.length === 0, `${cTail(drill)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
+  ok('the ls-remote of test runs with GIT_TERMINAL_PROMPT=0, so a private repository fails instead of prompting',
+    seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)), seen.map((l) => l.slice(-40)).join(' | '));
+
+  // ---- a planted system gitconfig cannot redirect test either ----
+  const sysConfig = path.join(cBin, 'system-gitconfig');
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
+  fs.writeFileSync(sysConfig, `[url "${cEvil}"]\n\tinsteadOf = ${CANONICAL}\n`);
+  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome } });
+  drill = createApp(args);
+  fs.rmSync(sysConfig, { force: true });
+  ok('control: a planted system gitconfig does redirect the canonical URL for an ordinary git call',
+    sysControl.stdout.startsWith(git(cSrc, 'rev-parse', 'HEAD')), sysControl.stdout + sysControl.stderr);
+  ok('an insteadOf in the system gitconfig pointing test at an unmerged commit is ignored (GIT_CONFIG_NOSYSTEM=1): refused',
+    drill.status !== 0 && /not on marvinamiranda\/\.github test/.test(drill.stderr) && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
+  git(cSrc, 'reset', '-q', '--hard', merged);
 
   // ---- an untracked file counts even when git status is told to hide them ----
   git(cSrc, 'config', 'status.showUntrackedFiles', 'no');
@@ -1473,6 +1579,90 @@ finally:
     r.status !== 0 && /prod-b/.test(r.stderr) && /[Dd]elete/.test(r.stderr) && /fake-checks/.test(r.stderr), cTail(r));
   ok('...and still leaves no key on disk, and prints none',
     filesWithMarker().length === 0 && !fs.existsSync(keyFile()) && !`${r.stdout}${r.stderr}`.includes(MARKER), filesWithMarker().join(', '));
+
+  // ------------------- mm-runners: the key into the login Keychain only ----
+  let rManifest = {};
+  try { rManifest = JSON.parse(fs.readFileSync(path.join(IDENTITY_SRC, 'mm-runners.manifest.json'), 'utf8')); } catch (e) { rManifest = { default_permissions: {} }; }
+  ok('mm-runners.manifest.json: default_permissions is exactly organization_self_hosted_runners write, actions read, metadata read',
+    JSON.stringify(Object.entries(rManifest.default_permissions).sort())
+      === JSON.stringify([['actions', 'read'], ['metadata', 'read'], ['organization_self_hosted_runners', 'write']]), JSON.stringify(rManifest.default_permissions));
+  ok('mm-runners.manifest.json: no webhook, no events, private, named "MarvinaMiranda Runners"',
+    rManifest.hook_attributes && rManifest.hook_attributes.active === false && Array.isArray(rManifest.default_events)
+      && rManifest.default_events.length === 0 && rManifest.public === false && rManifest.name === 'MarvinaMiranda Runners', JSON.stringify(rManifest));
+
+  const SVC = 'marvinamiranda.ephemeral-runner-pool';
+  const runnersDir = () => path.join(cHome, '.config', 'mm-agent', 'mm-runners');
+  const secArgvHasKey = (x) => x.sec.some((c) => c.argv.some((a) => a.includes(MARKER) || a.includes(PEM_B64) || a.includes('PRIVATE KEY')));
+  const adds = (x) => x.sec.filter((c) => (c.command || c.argv)[0] === 'add-generic-password');
+  let k = createApp(['mm-runners', '--to-keychain', SVC]);
+  ok('create-app.py mm-runners --to-keychain completes against a stubbed GitHub and a stubbed security',
+    k.status === 0 && k.converted === 1 && k.events.some((e) => e.event === 'callback' && e.status === 200), cTail(k));
+  const add = adds(k)[0];
+  ok('the key reaches security exactly once, as one add-generic-password on stdin (security -i), never in argv',
+    adds(k).length === 1 && add.via === 'stdin' && add.argv.includes('-i') && !secArgvHasKey(k), JSON.stringify(k.sec.map((c) => ({ via: c.via, argv: c.argv }))));
+  const pw = add && add.command[add.command.indexOf('-w') + 1];
+  ok('...holding the PEM base64-encoded on one line, in the login keychain, service as given, account the client id',
+    pw && pw.passwordSha === PEM_SHA(PEM_B64) && add.command.includes('login.keychain')
+      && add.command[add.command.indexOf('-s') + 1] === SVC && add.command[add.command.indexOf('-a') + 1] === CLIENT_ID
+      && !add.command.includes('-A'), add && JSON.stringify(add.command));
+  ok('...and the Keychain then holds exactly that one item', k.kc.length === 1 && k.kc[0].service === SVC && k.kc[0].account === CLIENT_ID
+    && k.kc[0].passwordSha === PEM_SHA(PEM_B64), JSON.stringify(k.kc));
+  ok('no file under the temporary tree holds the PEM or its base64', filesWithMarker().length === 0, filesWithMarker().join(', '));
+  ok('no private-key.pem for mm-runners, and no temporary file left', !fs.existsSync(path.join(runnersDir(), 'private-key.pem')) && listOr(cTmp).length === 0, listOr(cTmp).join(', '));
+  ok('the key is never printed, in either encoding', !`${k.stdout}${k.stderr}`.includes(MARKER) && !`${k.stdout}${k.stderr}`.includes(PEM_B64)
+    && k.events.some((e) => e.event === 'callback' && e.marker === false), '');
+  const rMeta = readOr(path.join(runnersDir(), 'app.json'));
+  let rMetaJson = {};
+  try { rMetaJson = JSON.parse(rMeta); } catch (e) { rMetaJson = {}; }
+  ok('app.json is exactly { app_id, client_id, slug, keychain_service } and holds no secret',
+    JSON.stringify(Object.keys(rMetaJson).sort()) === JSON.stringify(['app_id', 'client_id', 'keychain_service', 'slug'])
+      && rMetaJson.app_id === 4242 && rMetaJson.client_id === CLIENT_ID && rMetaJson.keychain_service === SVC && !/PRIVATE KEY|secret/.test(rMeta), rMeta);
+  ok('it makes no gh call, and tells the owner to install the App on selected repositories only',
+    k.gh.length === 0 && /apps\/fake-checks\/installations\/new/.test(k.stdout) && /[Ss]elect/.test(k.stdout), `gh=${k.gh.length} ${k.stdout.slice(-200)}`);
+
+  // Refusals: non-zero, before the page opens, nothing in the Keychain.
+  const kNothing = (x) => x.status !== 0 && !x.opened && x.converted === 0 && adds(x).length === 0 && !fs.existsSync(runnersDir());
+  const oldItem = [{ service: SVC, account: 'Iv23.previousapp', keychain: 'login.keychain', passwordSha: 'old' }];
+  for (const [what, a, opts, says] of [
+    ['mm-runners without --to-keychain', ['mm-runners'], {}, /may only go into the login Keychain/],
+    ['--to-keychain with mm-agent', ['mm-agent', '--to-keychain', SVC], {}, /--to-keychain is only for mm-runners/],
+    ['--to-keychain with mm-reviewer', ['mm-reviewer', '--to-keychain', SVC], {}, /--to-keychain is only for mm-runners/],
+    ['--to-keychain with mm-checks', ['mm-checks', '--to-keychain', SVC], {}, /--to-keychain is only for mm-runners/],
+    ['--to-keychain with --to-environment', ['mm-runners', '--to-keychain', SVC, '--to-environment', '--repo', 'prod-a'], {}, /--to-environment is only for mm-checks/],
+    ['a service name with a space', ['mm-runners', '--to-keychain', 'bad service'], {}, /service/],
+    ['a service name with a quote', ['mm-runners', '--to-keychain', 'svc"x'], {}, /service/],
+    ['an existing Keychain item, without --replace', ['mm-runners', '--to-keychain', SVC], { keychain: oldItem }, /--replace/],
+  ]) {
+    const x = createApp(a, opts);
+    ok(`refuses ${what}: non-zero, before the page opens, nothing stored`, kNothing(x) && says.test(x.stderr), `${cTail(x)} opened=${x.opened} adds=${adds(x).length}`);
+  }
+  ok('the existence check reads no secret: find-generic-password without -w or -g', k.sec.concat(createApp(['mm-runners', '--to-keychain', SVC], { keychain: oldItem }).sec)
+    .filter((c) => (c.command || c.argv).includes('find-generic-password')).every((c) => !(c.command || c.argv).includes('-w') && !(c.command || c.argv).includes('-g')), '');
+
+  // --replace: the old item goes, only after the new key is in hand, and the new one is the only one.
+  k = createApp(['mm-runners', '--to-keychain', SVC, '--replace'], { keychain: oldItem });
+  ok('with --replace, the previous item is deleted and the new key stored: one item, the new App\'s',
+    k.status === 0 && k.kc.length === 1 && k.kc[0].account === CLIENT_ID && k.kc[0].passwordSha === PEM_SHA(PEM_B64) && !secArgvHasKey(k), `${cTail(k)} ${JSON.stringify(k.kc)}`);
+  k = createApp(['mm-runners', '--to-keychain', SVC, '--replace'], { keychain: oldItem, app: (a) => ({ ...a, owner: { login: 'someone-else', type: 'User' } }) });
+  ok('with --replace, an App that is not the manifest\'s leaves the previous item untouched', k.status !== 0 && JSON.stringify(k.kc) === JSON.stringify(oldItem), JSON.stringify(k.kc));
+
+  // The App must be the manifest's before its key is stored.
+  k = createApp(['mm-runners', '--to-keychain', SVC], { app: (a) => ({ ...a, permissions: { ...a.permissions, workflows: 'write' } }) });
+  ok('an App with a permission the manifest does not ask for: nothing stored, the App named for deletion',
+    k.status !== 0 && adds(k).length === 0 && k.kc.length === 0 && /not the one the manifest describes/.test(k.stderr) && filesWithMarker().length === 0, cTail(k));
+
+  // A key too long for one \`security -i\` line (4095 characters): security would
+  // split it and echo the remainder as an "unknown command". Refused unsent.
+  const bigPem = `-----BEGIN RSA PRIVATE KEY-----\n${MARKER}\n${crypto.randomBytes(3200).toString('base64')}\n-----END RSA PRIVATE KEY-----\n`;
+  k = createApp(['mm-runners', '--to-keychain', SVC], { pem: bigPem });
+  ok('a key whose security -i line would pass 4000 characters is never sent: nothing stored, the App named for deletion',
+    k.status !== 0 && adds(k).length === 0 && k.kc.length === 0 && /[Dd]elete/.test(k.stderr) && !`${k.stdout}${k.stderr}`.includes(Buffer.from(bigPem).toString('base64').slice(0, 40)), cTail(k));
+
+  // A store that fails: the recovery always prints, and nothing is left behind.
+  k = createApp(['mm-runners', '--to-keychain', SVC], { failKeychainAdd: true });
+  ok('a Keychain store that fails exits non-zero, names the App to delete, and leaves no key on disk',
+    k.status !== 0 && /[Dd]elete/.test(k.stderr) && /fake-checks/.test(k.stderr) && filesWithMarker().length === 0
+      && !`${k.stdout}${k.stderr}`.includes(PEM_B64) && !fs.existsSync(path.join(runnersDir(), 'app.json')), cTail(k));
 })();
 
 fs.rmSync(root, { recursive: true, force: true });
