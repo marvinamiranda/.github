@@ -55,6 +55,9 @@
 #                   anyone else, or holds anything but one classic token.
 #   GH_CONFIG_DIR   an EMPTY directory of this identity's, so the real gh finds
 #                   no stored login.
+#   MM_REAL_GH_BIN  the absolute path of the real gh found before the shim was
+#                   installed, for helpers that must call it directly. Unset
+#                   when this environment is locked.
 #   git identity    author and committer are the App's bot user.
 #   git credentials for github.com: the helper list is reset, then one helper
 #                   mints a token for each operation, and tells git to stop
@@ -106,7 +109,7 @@ install_file() {
 
 # The variables every environment here sets alike, one command per line, valid
 # in bash and zsh: $1 GH_CONFIG_DIR, $2 ZDOTDIR, $3 git author, $4 git email,
-# $5 the github.com credential helper.
+# $5 the github.com credential helper, $6 the real gh path (empty when locked).
 body_lines() {
   printf 'export GH_TOKEN=%s\n' "$(q "$SENTINEL")"
   printf 'unset GITHUB_TOKEN\n'
@@ -117,6 +120,11 @@ body_lines() {
   printf 'export GIT_CONFIG_COUNT=2\n'
   printf 'export GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0=\n'
   printf 'export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1=%s\n' "$(q "$5")"
+  if [[ -n "${6:-}" ]]; then
+    printf 'export MM_REAL_GH_BIN=%s\n' "$(q "$6")"
+  else
+    printf 'unset MM_REAL_GH_BIN\n'
+  fi
 }
 
 # Lines that record the owner's ZDOTDIR, for the zsh startup files to source
@@ -245,7 +253,7 @@ locked() {
   { printf '#!/bin/sh\n'
     printf 'echo "gh: refused: this shell has no GitHub identity, because governance/identity/agent-env.sh failed. Fix what it said, then eval it again." >&2\n'
     printf 'exit 1\n'; } | install_file "$LOCK/bin/gh" 755 2>/dev/null || true
-  lock_body="$(body_lines "$LOCK/gh" "$LOCK/zdotdir" "" "" '!f(){ echo quit=true; }; f')"
+  lock_body="$(body_lines "$LOCK/gh" "$LOCK/zdotdir" "" "" '!f(){ echo quit=true; }; f' "")"
   write_zdotdir "$LOCK/zdotdir" "$LOCK/bin" "$lock_body" 2>/dev/null || true
   # `function gh`, not `gh()`: zsh parses the whole eval before running any
   # of it, and with an alias named gh, `gh() {` is a parse error that throws
@@ -274,11 +282,19 @@ trap on_exit EXIT
 # stack, and the gh found here is the real one, never a shim.
 clean_path=""
 real_gh=""
+root_canon="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ROOT" 2>/dev/null)" \
+  || locked "python3 is required to verify the real gh path"
+[[ "$root_canon" == /* ]] || locked "cannot resolve the mm-agent directory for real gh verification"
 IFS=: read -r -a path_dirs <<<"$PATH"
 for d in ${path_dirs[@]+"${path_dirs[@]}"}; do
   case "$d" in "$ROOT" | "$ROOT"/*) continue ;; esac
   clean_path="${clean_path:+$clean_path:}$d"
-  if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then real_gh="$d/gh"; fi
+  if [[ -z "$real_gh" && "$d" == /* && -f "$d/gh" && -x "$d/gh" ]]; then
+    candidate_canon="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$d/gh" 2>/dev/null)" || continue
+    [[ "$candidate_canon" == /* && -f "$candidate_canon" && -x "$candidate_canon" ]] || continue
+    case "$candidate_canon" in "$root_canon" | "$root_canon"/*) continue ;; esac
+    real_gh="$candidate_canon"
+  fi
 done
 
 [[ $# -eq 1 ]] || locked "usage: agent-env.sh <mm-agent|mm-reviewer>"
@@ -392,7 +408,7 @@ fi
 # off PATH; it execs the copy, and never falls through to the real gh. Then the
 # zsh startup files. Rewritten whenever what they hold changes, or one is
 # missing; the stamp that says they are current is written last.
-body="$(body_lines "$GH_DIR" "$ZD" "$bot" "$email" "$helper")"
+body="$(body_lines "$GH_DIR" "$ZD" "$bot" "$email" "$helper" "$real_gh")"
 stamp="$real_gh"$'\n'"$body"
 current=1
 for f in "$BIN/gh" "$ZD/reassert.zsh" "$ZD/.zshenv" "$ZD/.zprofile" "$ZD/.zshrc" "$ZD/.zlogin" "$ZD/.zlogout" "$SHIM/.installed"; do
@@ -463,6 +479,7 @@ $body
 $(path_lines "$BIN")
 else
 echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is gone ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
+unset MM_REAL_GH_BIN
 GH_TOKEN=$(q "$SENTINEL"); export GH_TOKEN
 false
 fi
