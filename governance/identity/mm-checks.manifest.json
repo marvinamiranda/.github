@@ -1,0 +1,13 @@
+{
+  "name": "MarvinaMiranda Checks",
+  "url": "https://github.com/marvinamiranda",
+  "description": "Posts the merge-gating governance checks (governance/issue-link, All checks accounted for) from default-branch code. Its key lives only in each repository's governance-checks environment, never on a machine.",
+  "public": false,
+  "hook_attributes": { "url": "https://example.invalid/unused", "active": false },
+  "default_permissions": {
+    "checks": "write",
+    "statuses": "write",
+    "metadata": "read"
+  },
+  "default_events": []
+}

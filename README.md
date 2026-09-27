@@ -24,7 +24,7 @@ holds `workflows: write`.
 | Issue-link matcher and its tests | `governance/issue-link.js`, `governance/tests/issue-link.test.js` |
 | Areas checker and its tests | `governance/areas-check.js`, `governance/tests/areas-check.test.js` |
 | How to find and prefactor hot shared files | `governance/HOTSPOTS-GUIDE.md` |
-| Bootstrap: issue types, default branch, labels, rulesets, Project | `governance/bootstrap.sh` |
+| Bootstrap: issue types, default branch, labels, rulesets, Project, the `governance-checks` environment | `governance/bootstrap.sh` |
 | Agent identities: App manifests, creation, tokens, the agent shell's `gh` shim, posting a review | `governance/identity/` |
 | Tests of the workflow's pin check, the bootstrap and the identity scripts | `governance/tests/` |
 
@@ -166,14 +166,45 @@ node governance/areas-check.js <product checkout> [git-ref]
 
 ## Identities (DELIVERY §9, Appendix A)
 
-Two organisation GitHub Apps, created once by the owner:
+Organisation GitHub Apps, created once by the owner:
 
 ```bash
-python3 governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
-python3 governance/identity/create-app.py mm-reviewer   # posts review/independent
+python3 -I governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
+python3 -I governance/identity/create-app.py mm-reviewer   # posts review/independent
 ```
 
-Keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
+Their keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
+Run `create-app.py` **from a merged commit**, like `bootstrap.sh --apply`, and
+by the same rule and script (`governance/identity/provenance.sh`): it refuses
+a commit that is not on this repository's `test` as GitHub has it now,
+uncommitted changes under `governance/`, and files outside a git checkout,
+before any `gh` call or page. Only reviewed code handles an App's private key.
+
+- **Always `python3 -I`** (isolated mode). Without it Python imports modules
+  from the script's own directory first and honours `PYTHONPATH`, so a planted
+  `secrets.py` or `json.py` beside the script would run as the owner just
+  before the key is handed over. `create-app.py` refuses to run without `-I`,
+  as its very first statement. That refusal cannot stop code that loads
+  before the script does (a `sitecustomize`/`usercustomize` on `PYTHONPATH` or
+  in user site-packages, a `.pth` file), which is why the flag is part of the
+  command, not just checked.
+- **`test` is read with a clean git configuration**, from `/`: no global or
+  system config, no `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, no `GIT_DIR`, no
+  TLS overrides. A `url.<x>.insteadOf` in any of them (or in the checkout's own
+  `.git/config`) could otherwise point the canonical URL at a repository whose
+  `test` is an unreviewed commit.
+- **Uncommitted means by content**: every file under `governance/` must hash to
+  its blob in `HEAD`, so an edit hidden from `git status` with skip-worktree or
+  assume-unchanged is refused too. The manifest is then read from that commit
+  (`git cat-file blob <commit>:./<name>.manifest.json`), not from the file,
+  which could change after the check.
+- A merged commit that is not `test`'s tip runs, with a warning.
+- **The App GitHub creates is checked** before its key is used: owned by
+  `marvinamiranda`, named as the manifest names it, with exactly the manifest's
+  permissions. Otherwise the key is discarded, nothing is written or loaded,
+  and it says to delete that App.
+The third, **MarvinaMiranda Checks** (`mm-checks`), is different: its key never
+touches the machine's disk. See [The Checks App](#the-checks-app-mm-checks).
 
 **Install or refresh an identity** from a checkout of a merged commit, by the
 script's absolute path:
@@ -305,6 +336,89 @@ machine, keeping builder and reviewer sessions apart is procedural: both keys
 sit under the same user. The known follow-up is to post reviews from a workflow
 in a locked repository that holds the reviewer key as a secret.
 
+### The Checks App (`mm-checks`)
+
+"MarvinaMiranda Checks" posts the merge-gating governance checks
+(`governance/issue-link`, `All checks accounted for`) from default-branch code
+(Epic [.github#7](https://github.com/marvinamiranda/.github/issues/7)). Its
+key can make any pull request in an adopted repository mergeable, so every
+agent session on the machine being able to read `~/.config/mm-agent/` rules
+that directory out. The key lives in one place only: the secret
+`CHECKS_APP_PRIVATE_KEY` of each adopted repository's `governance-checks`
+environment. That environment allows only jobs on the default branch, `test`
+(bootstrap step g). The jobs that use it run on `[self-hosted,
+gate-ephemeral]`, single-use VMs
+([decision E](https://github.com/marvinamiranda/.github/issues/8#issuecomment-5853703168)),
+but the environment's branch rule is the control whatever the runner is.
+
+Permissions (`governance/identity/mm-checks.manifest.json`): exactly Checks
+write, Commit statuses write and Metadata read. No webhook, no events. It has
+no token helper and no `agent-env.sh` identity on purpose: nothing on the
+machine acts as it.
+
+**Create it** (the owner, from a checkout of a merged commit, after bootstrap
+step g has created the environments, and with every agent session closed; the
+checklist on [.github#8](https://github.com/marvinamiranda/.github/issues/8)
+gives the order):
+
+```bash
+read -rs GH_TOKEN && export GH_TOKEN      # the one-day fine-grained token below
+python3 -I governance/identity/create-app.py mm-checks --to-environment --repo omni237 --repo omni237-ops
+unset GH_TOKEN
+```
+
+Click **Continue to GitHub**, then **Create GitHub App**. The manifest
+conversion returns the key once. `create-app.py` sends it to
+`gh secret set CHECKS_APP_PRIVATE_KEY --env governance-checks --repo <repo>`
+**on stdin** (never in argv, where any local process could read it; `gh`
+encrypts it with the environment's public key before it leaves), and sets the
+variable `CHECKS_APP_CLIENT_ID` to the App's client id. It writes no
+`private-key.pem` and no temporary file, and prints the key nowhere. It writes
+`~/.config/mm-agent/mm-checks/app.json` with the App's id, slug and client id
+(no secret). Then install the App from the URL it prints on **only the
+selected repositories** you named.
+
+It refuses, exiting non-zero before the page opens and so before any App
+exists:
+
+- a checkout that is not merged code (see
+  [Identities](#identities-delivery-9-appendix-a));
+- `mm-checks` without `--to-environment`, or `--to-environment` with any other
+  identity; `--to-environment` with no `--repo`, a repository outside
+  `marvinamiranda`, or one named twice;
+- a shell carrying an agent identity: `GH_TOKEN`/`GITHUB_TOKEN` holding an
+  `agent-env.sh` sentinel or an App installation token (`ghs_`), or
+  `GH_CONFIG_DIR` under `~/.config/mm-agent/`. The key goes up with the owner's
+  credential only;
+- a repository whose `governance-checks` environment is missing, allows
+  protected branches or every ref, or has any rule besides the default branch
+  as a branch rule. Run the bootstrap's step g first;
+- a credential that cannot read the environment's secrets;
+- an environment already holding `CHECKS_APP_PRIVATE_KEY`, unless `--replace`:
+  that is another App's key, and replacing it breaks the gate until the new
+  App is installed.
+
+If loading fails part way (a failed `gh`, an exception, an interrupt), the
+key is gone with the process, so that App can never be completed. Whatever
+stopped it, it prints the App and every repository whose secret was set, even
+one whose variable then failed. Delete the App (its settings, Advanced), delete the secret from those
+repositories, fix the cause and run it again.
+
+The token, at github.com/settings/personal-access-tokens: resource owner
+`marvinamiranda`, expiring the next day, repository access to each `--repo`
+only, and:
+
+| Repository permission | Access | For |
+|---|---|---|
+| Environments | Read and write | the secret, the variable, the environment's public key |
+| Actions | Read | reading the environment and its deployment rules |
+| Metadata | Read (always included) | the repository's default branch |
+
+Known limit (accepted on
+[.github#8](https://github.com/marvinamiranda/.github/issues/8)): while it
+runs, the key is in the memory of `create-app.py` and `gh`, both processes of
+the owner's account, which is already the root of trust.
+
 ## Bootstrap
 
 Run it **from a merged commit**: check this repository out by the SHA of a
@@ -313,7 +427,8 @@ that is not on `test` as GitHub has it now, read from
 `https://github.com/marvinamiranda/.github.git` and never from `origin`. It
 also refuses a checkout with uncommitted changes, and files outside a git
 checkout. It prints the commit it runs from. A dry run from anywhere else
-warns and carries on.
+warns and carries on. The rule is `governance/identity/provenance.sh`, which
+`create-app.py` applies too, always rather than only for `--apply`.
 
 **First, straight after this repository's own pull request merges**, before
 any product repository moves its pin to that commit: this repository's own
@@ -356,6 +471,22 @@ governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # als
   [omni237-ops#160](https://github.com/marvinamiranda/omni237-ops/pull/160) was
   squash-merged into `test` by `app/marvinamiranda-agent` (commit `2be0641`,
   2026-09-25 17:52 UTC).
+- **The `governance-checks` environment** (step g) is part of every run
+  with a `--repo`, `--no-rulesets` included, so step 2 creates it and every
+  later run checks it. It holds the Checks App's key
+  ([The Checks App](#the-checks-app-mm-checks)), so which refs may use it is
+  the control: custom deployment branches (`protected_branches: false`,
+  `custom_branch_policies: true`) with exactly one rule, the branch `test`.
+  Any other rule (`refs/pull/*`, `*`, a tag) and any other policy (protected
+  branches, or none, which admits every ref) is drift: a dry run reports it,
+  `--apply` removes it, rules first, then adds `test`, so a failure part way
+  leaves fewer refs allowed, not more. A repository with no `test` branch gets
+  no environment, with a warning. For an environment adopted before the Checks
+  App exists:
+  ```bash
+  governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets            # dry run
+  governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply
+  ```
 - **Step 5** needs the Reviewer App's id (`--reviewer-app-id`, or
   `~/.config/mm-agent/mm-reviewer/app.json`). Without it the run stops before
   changing anything. This repository's own `test-integration` would otherwise
@@ -376,7 +507,8 @@ github.com/settings/personal-access-tokens:
 | Repository access | `.github` and each `--repo` (or all) | |
 | Organization: Issue Types | Read and write | a) Epic, Decision, Spike |
 | Organization: Projects | Read and write | f) only with `--project` |
-| Repository: Administration | Read and write | b) the default branch; e) rulesets |
+| Repository: Actions | Read | g) the `governance-checks` environment and its rules |
+| Repository: Administration | Read and write | b) the default branch; e) rulesets; g) the environment |
 | Repository: Contents | Read | each repository's `.github/governance/` and `test` |
 | Repository: Issues | Read and write | c) labels |
 | Repository: Metadata | Read (always included) | repositories, ruleset lists |
@@ -399,7 +531,8 @@ login warns. `--help` prints the same list.
 
 Reads each repository's `.github/governance/` from `test` (`--config-dir
 <dir>/<repo>/` overrides it for local testing). Dry run by default; idempotent;
-never deletes. Labels and Project fields outside the standard are reported for
+never deletes, except g)'s drift: a deployment rule that would release the
+Checks App's key to another ref. Labels and Project fields outside the standard are reported for
 the owner to retire; legacy rulesets on `test` or `main` are set to enforcement
 `disabled`, never deleted. `--help` lists the options. Payloads are kept, and
 their path printed, when a run fails.

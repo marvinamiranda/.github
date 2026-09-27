@@ -45,7 +45,8 @@
 #     Issue Types: read and write      a) Epic, Decision, Spike
 #     Projects: read and write         f) only with --project
 #   Repository permissions:
-#     Administration: read and write   b) the default branch; e) rulesets
+#     Actions: read                    g) read the governance-checks environment and its rules
+#     Administration: read and write   b) the default branch; e) rulesets; g) the environment
 #     Contents: read                   each repository's .github/governance/ and test
 #     Issues: read and write           c) labels
 #     Metadata: read                   always included: repositories, ruleset lists
@@ -82,9 +83,16 @@
 #      all that runs.
 #   f) with --project: the Project, its Status/Priority/Size fields, and a link
 #      to each repo
+#   g) per repo (not with --self-only): the governance-checks environment,
+#      which holds the Checks App's key (governance/identity/create-app.py
+#      mm-checks). Custom deployment branches with exactly one rule, the branch
+#      test: only default-branch jobs get the key. Any other rule (refs/pull/*,
+#      *, a tag) or policy (protected branches, none) is drift: reported in a
+#      dry run, removed by --apply. It runs with --no-rulesets too.
 #
 # What it never does: delete a label, a ruleset, a field, a field option or an
-# issue. Anything that exists and is not in the standard is REPORTED so the
+# issue. The one deletion is g)'s drift: a deployment rule that would release
+# the Checks App's key to another ref. Anything that exists and is not in the standard is REPORTED so the
 # owner can retire it deliberately. Identities are GitHub Apps, created and
 # installed by the owner (governance/identity/, DELIVERY Appendix A).
 #
@@ -106,7 +114,6 @@ OWNER_USER_ID=1245936
 # This repository. Its own test and main get rulesets too: it holds the code
 # every other repository's required checks run.
 SELF_REPO=".github"
-SELF_URL="https://github.com/$ORG/$SELF_REPO.git"
 SELF_CHECKS="governance tests"
 CONFIG_DIR=""
 CONFIG_REF="test"
@@ -279,27 +286,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # test as GitHub has it now, read from its canonical URL (never from whatever
 # `origin` points at), with no uncommitted changes. A commit that only exists
 # in this clone, or on a pull request branch, could hold a bypass nobody
-# reviewed. Checked before any gh call.
-not_reviewed=""
-if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  head_sha="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
-  info "Running from $ORG/$SELF_REPO commit $head_sha"
-  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- .)" ]]; then
-    not_reviewed="this checkout has uncommitted changes"
-  elif ! test_sha="$(git ls-remote "$SELF_URL" refs/heads/test 2>"$WORK/ls-remote.err" | cut -f1)" \
-      || [[ ! "$test_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    not_reviewed="$ORG/$SELF_REPO test could not be read from $SELF_URL: $(tr '\n' ' ' <"$WORK/ls-remote.err")"
-  elif ! git -C "$SCRIPT_DIR" cat-file -e "$test_sha^{commit}" 2>/dev/null \
-      && ! git -C "$SCRIPT_DIR" fetch --quiet --no-tags "$SELF_URL" "$test_sha" 2>"$WORK/fetch.err"; then
-    not_reviewed="$ORG/$SELF_REPO test (${test_sha:0:12}) could not be fetched: $(tr '\n' ' ' <"$WORK/fetch.err")"
-  elif git -C "$SCRIPT_DIR" merge-base --is-ancestor "$head_sha" "$test_sha"; then
-    info "That commit is on $ORG/$SELF_REPO test (read now: ${test_sha:0:12})."
-  else
-    not_reviewed="commit ${head_sha:0:12} is not on $ORG/$SELF_REPO test (read now: ${test_sha:0:12}), so it has not been merged"
-  fi
-else
-  not_reviewed="this is not a git checkout, so its commit cannot be checked"
-fi
+# reviewed. Checked before any gh call. The rule is identity/provenance.sh,
+# which create-app.py runs too.
+# shellcheck source=identity/provenance.sh disable=SC1091
+. "$SCRIPT_DIR/identity/provenance.sh"
+mm_provenance "$SCRIPT_DIR" "$WORK"
+[[ -z "$PROVENANCE_HEAD" ]] || info "Running from $ORG/$SELF_REPO commit $PROVENANCE_HEAD"
+[[ -n "$PROVENANCE_PROBLEM" ]] || info "That commit is on $ORG/$SELF_REPO test (read now: ${PROVENANCE_TEST:0:12})."
+not_reviewed="$PROVENANCE_PROBLEM"
 if [[ -n "$not_reviewed" ]]; then
   if [[ $APPLY -eq 1 ]]; then
     echo "Refusing --apply: $not_reviewed. Check out a merged commit of $ORG/$SELF_REPO by its SHA." >&2
@@ -324,7 +318,7 @@ else
   {
     echo "No Reviewer App id, so no rulesets: $ORG/$SELF_REPO's own test-integration would require"
     echo "only 'governance tests', which a pull request here can rewrite. Create the Reviewer App"
-    echo "(governance/identity/create-app.py mm-reviewer), then re-run with --reviewer-app-id <id>"
+    echo "(python3 -I governance/identity/create-app.py mm-reviewer), then re-run with --reviewer-app-id <id>"
     echo "or with $REVIEWER_APP_JSON present; or run with --no-rulesets."
   } >&2
   exit 1
@@ -769,6 +763,87 @@ if [[ $WANT_PROJECT -eq 1 ]]; then
   fi
   info "Views (Frontier, By milestone, By Epic, In flight, Decisions) are not managed here: POST orgs/$ORG/projectsV2/<n>/views creates them once."
 fi
+
+# ------------------------------------ g) the governance-checks environment ----
+# The Checks App's private key lives only in this environment's secret
+# (marvinamiranda/.github#9), so which refs may use the environment decides who
+# can post the merge-gating checks. Only jobs on the default branch, test:
+# a custom deployment-branch policy (never "protected branches", which admits
+# every protected branch, nor none, which admits every ref) whose one rule is
+# the branch `test`. Any other rule, `refs/pull/*`, `*` or a tag, would release
+# the key to that ref: it is drift, reported, and removed by --apply (the one
+# thing this script deletes, since keeping it is the hole). Drift goes before
+# the rule is added, so a failure part way leaves fewer refs allowed, not more.
+# create-app.py mm-checks --to-environment checks the same shape before it
+# creates the App.
+CHECKS_ENV="governance-checks"
+CHECKS_ENV_BRANCH="test"
+section "g) Environment $CHECKS_ENV"
+(( ! SELF_ONLY )) || info "skipped (--self-only)"
+for repo in ${REPOS[@]+"${REPOS[@]}"}; do
+  info "[$repo]"
+  env_path="repos/$ORG/$repo/environments/$CHECKS_ENV"
+  fetch "repos/$ORG/$repo"
+  current_default="$(jq -r .default_branch <<<"$BODY")"
+  if [[ "$current_default" != "$CHECKS_ENV_BRANCH" ]]; then
+    # In a dry run b) above would make test the default; after --apply it has.
+    if [[ $APPLY -eq 0 ]] && fetch "repos/$ORG/$repo/branches/$CHECKS_ENV_BRANCH"; then
+      info "default branch '$current_default'; b) makes it '$CHECKS_ENV_BRANCH', the one ref $CHECKS_ENV allows."
+    else
+      warn "$repo's default branch is '$current_default', not $CHECKS_ENV_BRANCH: $CHECKS_ENV not created or changed, so the Checks App's key cannot be loaded into it."
+      continue
+    fi
+  fi
+  jq -n '{deployment_branch_policy: {protected_branches: false, custom_branch_policies: true}}' >"$WORK/env-$repo.json"
+  planned_before=$PLANNED
+  env_put=0
+  if fetch "$env_path"; then
+    have_policy="$(jq -c '.deployment_branch_policy | if . == null then null else {protected_branches, custom_branch_policies} end' <<<"$BODY")"
+    if [[ "$have_policy" == '{"protected_branches":false,"custom_branch_policies":true}' ]]; then
+      info "$CHECKS_ENV: exists, custom deployment branches."
+    else
+      warn "DRIFT: $CHECKS_ENV deployment branches are $have_policy (null: every ref); wants custom branch policies only."
+      mutate_json PUT "$env_path" "$WORK/env-$repo.json"
+      env_put=1
+    fi
+  else
+    info "$CHECKS_ENV: absent — will be created."
+    mutate_json PUT "$env_path" "$WORK/env-$repo.json"
+    env_put=1
+  fi
+
+  # The rules. After a PUT in a dry run they cannot be read yet: none are assumed.
+  rules='[]'
+  if (( ! env_put || APPLY )); then
+    if fetch "$env_path/deployment-branch-policies?per_page=100"; then
+      rules="$(jq -c '.branch_policies // []' <<<"$BODY")"
+      if [[ "$(jq -r '.total_count // 0' <<<"$BODY")" != "$(jq -r length <<<"$rules")" ]]; then
+        echo "$repo $CHECKS_ENV lists $(jq -r '.total_count' <<<"$BODY") deployment rules but returned $(jq -r length <<<"$rules"); fix them by hand first." >&2
+        exit 1
+      fi
+    elif (( APPLY )); then
+      echo "$repo $CHECKS_ENV: its deployment rules cannot be read after the PUT." >&2
+      exit 1
+    fi
+  fi
+  kept=0
+  while IFS="$(printf '\t')" read -r rule_id rule_name rule_type; do
+    [[ -n "$rule_id" ]] || continue
+    if [[ "$rule_name" == "$CHECKS_ENV_BRANCH" && "$rule_type" == "branch" && $kept -eq 0 ]]; then
+      info "rule '$rule_name' ($rule_type): kept."
+      kept=1
+    else
+      warn "DRIFT: rule '$rule_name' ($rule_type, id $rule_id) would release the Checks App's key to that ref; removed by --apply."
+      mutate gh api -X DELETE "$env_path/deployment-branch-policies/$rule_id" --silent
+    fi
+  done < <(jq -r '.[] | [.id, .name, (.type // "")] | @tsv' <<<"$rules")
+  if (( ! kept )); then
+    jq -n --arg b "$CHECKS_ENV_BRANCH" '{name: $b, type: "branch"}' >"$WORK/env-rule-$repo.json"
+    mutate_json POST "$env_path/deployment-branch-policies" "$WORK/env-rule-$repo.json"
+  fi
+  (( PLANNED != planned_before )) || info "$CHECKS_ENV: up to date."
+
+done
 
 section "Summary"
 if [[ $APPLY -eq 1 ]]; then

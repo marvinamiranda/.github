@@ -21,6 +21,12 @@ const path = require('path');
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
   : path.join(__dirname, '..', 'bootstrap.sh');
+// The provenance rule bootstrap.sh sources, beside it as in the repository.
+const PROVENANCE = path.join(path.dirname(SCRIPT), 'identity', 'provenance.sh');
+function withProvenance(governanceDir) {
+  fs.mkdirSync(path.join(governanceDir, 'identity'), { recursive: true });
+  fs.copyFileSync(PROVENANCE, path.join(governanceDir, 'identity', 'provenance.sh'));
+}
 const BASH = process.env.BOOTSTRAP_BASH ? path.resolve(process.env.BOOTSTRAP_BASH) : 'bash';
 const ORG = 'marvinamiranda';
 const CANONICAL = `https://github.com/${ORG}/.github.git`;
@@ -62,19 +68,69 @@ if (args[0] === 'auth' && args[1] === 'status') {
   process.exit(0);
 }
 if (args[0] !== 'api') { log('write'); process.exit(99); }
+// With FAKE_GH_WRITABLE=1, writes to a governance-checks environment and its
+// deployment-branch policies succeed and change the fixtures, as GitHub would;
+// every other write is still refused.
+if (args.some((a) => ['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input'].includes(a) || /^--(method|input|field|raw-field)=/.test(a))) {
+  log('write');
+  if (process.env.FAKE_GH_WRITABLE !== '1') process.exit(99);
+  const method = args[args.indexOf('-X') + 1];
+  const input = args.includes('--input') ? JSON.parse(fs.readFileSync(args[args.indexOf('--input') + 1], 'utf8')) : null;
+  const p = args.slice(1).filter((a, i, all) => !a.startsWith('-') && !['-X', '--input'].includes(all[i - 1]))[0];
+  const env = /^(repos[/][^/]+[/][^/]+[/]environments[/]governance-checks)$/.exec(p);
+  const list = /^(repos[/][^/]+[/][^/]+[/]environments[/]governance-checks)[/]deployment-branch-policies(?:[/]([0-9]+))?$/.exec(p);
+  const listKey = (e) => e + '/deployment-branch-policies?per_page=100';
+  if (env && method === 'PUT') {
+    fixtures[p] = { name: 'governance-checks', deployment_branch_policy: input.deployment_branch_policy };
+    if (input.deployment_branch_policy && input.deployment_branch_policy.custom_branch_policies && !fixtures[listKey(p)]) fixtures[listKey(p)] = { total_count: 0, branch_policies: [] };
+  } else if (list && method === 'POST' && !list[2]) {
+    const l = fixtures[listKey(list[1])];
+    const id = 1000 + l.branch_policies.length + Math.floor(Math.random() * 1000);
+    l.branch_policies.push({ id, name: input.name, type: input.type });
+    l.total_count = l.branch_policies.length;
+  } else if (list && method === 'DELETE' && list[2]) {
+    const l = fixtures[listKey(list[1])];
+    l.branch_policies = l.branch_policies.filter((b) => String(b.id) !== list[2]);
+    l.total_count = l.branch_policies.length;
+  } else process.exit(99);
+  fs.writeFileSync(process.env.FAKE_GH_FIXTURES, JSON.stringify(fixtures));
+  process.stdout.write('{}\\n');
+  process.exit(0);
+}
 let jq = null, target = null;
 for (let i = 1; i < args.length; i++) {
   const a = args[i];
-  if (['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input'].includes(a) || /^--(method|input|field|raw-field)=/.test(a)) { log('write'); process.exit(99); }
   if (a === '--jq') jq = args[++i];
   else if (a === '-H') i++;
-  else if (a === '--paginate') {}
+  else if (a === '--paginate' || a === '--silent') {}
   else target = a;
 }
 log('read');
 if (!(target in fixtures)) { process.stderr.write('gh: Not Found (HTTP 404)\\n'); process.exit(1); }
 const body = JSON.stringify(fixtures[target]);
 process.stdout.write(jq ? execFileSync('jq', ['-r', jq], { input: body }) : body + '\\n');
+`, { mode: 0o755 });
+
+// git: the real one, except that the canonical URL of marvinamiranda/.github
+// is served by FAKE_GITHUB (a local bare repository) after git's own URL
+// rewriting: it asks the real git what the URL becomes under the caller's
+// configuration (\`ls-remote --get-url\`) and uses that when an insteadOf
+// rewrote it, as git would. provenance.sh reads test with a clean
+// configuration, so "GitHub" cannot be reached through git configuration.
+const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+fs.writeFileSync(path.join(stubBin, 'git'), `#!/usr/bin/env bash
+real=${JSON.stringify(REAL_GIT)}
+canonical=${JSON.stringify(CANONICAL)}
+pre=()
+if [ "\${1-}" = -C ]; then pre=(-C "$2"); fi
+hit=0
+for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
+if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
+url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
+if [ "$url" = "$canonical" ]; then url="$FAKE_GITHUB"; fi
+args=()
+for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
+exec "$real" "\${args[@]}"
 `, { mode: 0o755 });
 
 function labelsFromScript() {
@@ -97,8 +153,21 @@ function fixtures(extra = {}) {
     [`repos/${ORG}/.github/branches/test`]: { name: 'test', commit: { sha: '2'.repeat(40) } },
     [`repos/${ORG}/prod/rulesets?includes_parents=true&per_page=100`]: [],
     [`repos/${ORG}/.github/rulesets?includes_parents=true&per_page=100`]: [],
+    ...environment('prod'),
     ...extra,
   };
+}
+
+// The governance-checks environment as the bootstrap leaves it: custom
+// deployment branches, one rule, the default branch. `rules: null` leaves the
+// environment out altogether.
+const ENV_PATH = (repo) => `repos/${ORG}/${repo}/environments/governance-checks`;
+const RULES_PATH = (repo) => `${ENV_PATH(repo)}/deployment-branch-policies?per_page=100`;
+function environment(repo, { policy = { protected_branches: false, custom_branch_policies: true }, rules = [{ id: 1, name: 'test', type: 'branch' }] } = {}) {
+  if (rules === null) return { [ENV_PATH(repo)]: undefined, [RULES_PATH(repo)]: undefined };
+  const out = { [ENV_PATH(repo)]: { name: 'governance-checks', deployment_branch_policy: policy } };
+  if (policy && policy.custom_branch_policies) out[RULES_PATH(repo)] = { total_count: rules.length, branch_policies: rules };
+  return out;
 }
 
 // A clone holding bootstrap.sh, and the canonical repository it is checked
@@ -112,6 +181,7 @@ function checkout(on) {
   fs.mkdirSync(path.join(work, 'governance'), { recursive: true });
   fs.copyFileSync(SCRIPT, path.join(work, 'governance', 'bootstrap.sh'));
   fs.chmodSync(path.join(work, 'governance', 'bootstrap.sh'), 0o755);
+  withProvenance(path.join(work, 'governance'));
   git(root, 'init', '-q', work);
   git(work, 'add', '.');
   git(work, 'commit', '-q', '-m', 'bootstrap');
@@ -137,29 +207,29 @@ function checkout(on) {
 }
 
 // `repo: false` runs without the default `--repo prod --config-dir <cfg>`.
-function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null, repo = true, extraEnv = {} } = {}) {
+function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null, repo = true, extraEnv = {}, writable = false } = {}) {
   const co = where || checkout(on);
   fs.writeFileSync(fixtureFile, JSON.stringify(fx));
   fs.writeFileSync(ghLog, '');
   const r = spawnSync(BASH, [co.script, ...(repo ? ['--repo', 'prod', '--config-dir', cfg] : []), ...args], {
     encoding: 'utf8',
     env: {
-      ...extraEnv,
       PATH: [stubBin, process.env.PATH].join(':'),
       HOME: path.join(root, 'home'),
       TMPDIR: root,
       LANG: 'C',
       FAKE_GH_FIXTURES: fixtureFile,
       FAKE_GH_LOG: ghLog,
+      FAKE_GH_WRITABLE: writable ? '1' : '0',
       MM_REVIEWER_APP_JSON: reviewer ? reviewerJson : path.join(root, 'no-such-reviewer.json'),
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: `url.${co.canon}.insteadOf`,
-      GIT_CONFIG_VALUE_0: CANONICAL,
+      FAKE_GITHUB: co.canon,
+      ...extraEnv,
     },
   });
   const calls = fs.readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-  return { ...r, calls, writes: calls.filter((c) => c.kind === 'write'), co };
+  const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8'));
+  return { ...r, calls, writes: calls.filter((c) => c.kind === 'write'), co, state };
 }
 const tail = (r) => `exit ${r.status}; ${(r.stderr || '').trim().split('\n').slice(-2).join(' | ')}`;
 const started = (r) => /== a\) Organisation issue types/.test(r.stdout);
@@ -208,9 +278,47 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   r = bootstrap(['--no-rulesets', '--apply'], { where: co });
   ok('--apply refuses a checkout with uncommitted changes', r.status !== 0 && /uncommitted/.test(r.stderr) && r.calls.length === 0, tail(r));
 
+  // A redirect of the canonical URL to a repository whose test is this
+  // unmerged commit: ignored, because test is read with a clean configuration.
+  const planted = checkout('elsewhere');
+  const evil = path.join(root, `evil-${path.basename(path.dirname(planted.work))}.git`);
+  execFileSync('git', ['init', '-q', '--bare', evil]);
+  execFileSync('git', ['-C', planted.work, 'push', '-q', evil, 'HEAD:refs/heads/test']);
+  const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, process.env.PATH].join(':'),
+    HOME: path.join(root, 'home'), FAKE_GITHUB: planted.canon, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
+  ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call',
+    control.stdout.startsWith(execFileSync('git', ['-C', planted.work, 'rev-parse', 'HEAD']).toString().trim()), control.stdout + control.stderr);
+  const homeConfig = path.join(root, 'home', '.gitconfig');
+  for (const [what, extraEnv, setup, undo] of [
+    ['GIT_CONFIG_COUNT in the environment', { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL }],
+    ['GIT_CONFIG_PARAMETERS in the environment', { GIT_CONFIG_PARAMETERS: `'url.${evil}.insteadof'='${CANONICAL}'` }],
+    ['the global ~/.gitconfig', {}, () => fs.writeFileSync(homeConfig, `[url "${evil}"]\n\tinsteadOf = ${CANONICAL}\n`), () => fs.rmSync(homeConfig, { force: true })],
+    ['the checkout\'s own .git/config', {}, () => execFileSync('git', ['-C', planted.work, 'config', `url.${evil}.insteadOf`, CANONICAL]),
+      () => execFileSync('git', ['-C', planted.work, 'config', '--unset', `url.${evil}.insteadOf`])],
+  ]) {
+    if (setup) setup();
+    r = bootstrap(['--no-rulesets', '--apply'], { where: planted, extraEnv });
+    if (undo) undo();
+    ok(`--apply ignores an insteadOf in ${what} pointing test at the unmerged commit it runs from: refused, before any gh call`,
+      r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+
+  // An edit hidden from git status is still an edit.
+  const skip = checkout('head');
+  execFileSync('git', ['-C', skip.work, 'update-index', '--skip-worktree', 'governance/bootstrap.sh']);
+  fs.appendFileSync(skip.script, '# hidden\n');
+  r = bootstrap(['--no-rulesets', '--apply'], { where: skip });
+  ok('--apply refuses an edit hidden with skip-worktree', r.status !== 0 && /differs from its commit/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+  const untracked = checkout('head');
+  fs.writeFileSync(path.join(untracked.work, 'governance', 'planted.sh'), 'echo planted\n');
+  r = bootstrap(['--no-rulesets', '--apply'], { where: untracked });
+  ok('--apply refuses an untracked file under governance/', r.status !== 0 && /uncommitted/.test(r.stderr) && r.calls.length === 0, tail(r));
+
   const loose = fs.mkdtempSync(path.join(root, 'loose-'));
   fs.mkdirSync(path.join(loose, 'governance'));
   fs.copyFileSync(SCRIPT, path.join(loose, 'governance', 'bootstrap.sh'));
+  withProvenance(path.join(loose, 'governance'));
   r = bootstrap(['--no-rulesets', '--apply'], { where: { script: path.join(loose, 'governance', 'bootstrap.sh'), canon: path.join(root, 'none.git') } });
   ok('--apply refuses to run from outside a git checkout', r.status !== 0 && /Refusing --apply/.test(r.stderr) && r.calls.length === 0, tail(r));
 }
@@ -319,6 +427,88 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   const inE = [...r.stdout.slice(rulesetsAt).matchAll(/^\s+\[([^\]]+)\]$/gm)].map((m) => m[1]);
   ok('a run with --repo applies this repository\'s rulesets before any product repository\'s',
     r.status === 0 && inE[0] === '.github' && inE.includes('prod'), `${tail(r)} order=${JSON.stringify(inE)} all=${JSON.stringify(order)}`);
+}
+
+// ------------------------------ g) the governance-checks environment ----
+// The Checks App's key lives only here (.github#9): custom deployment branches,
+// exactly one rule, the default branch. Anything else is drift.
+{
+  const WANT_ENV = { deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } };
+  const WANT_RULE = [{ name: 'test', type: 'branch' }];
+  const envPlan = (stdout) => {
+    const out = { put: [], post: [], del: [] };
+    for (const m of stdout.matchAll(/DRY-RUN would run: gh api -X (PUT|POST) repos\/[^/]+\/prod\/environments\/governance-checks(\S*) --input - <<JSON\n([\s\S]*?)\n\s*JSON\n/g)) {
+      (m[1] === 'PUT' && m[2] === '' ? out.put : out.post).push(JSON.parse(m[3]));
+    }
+    for (const m of stdout.matchAll(/DRY-RUN would run: gh api -X DELETE repos\/[^/]+\/prod\/environments\/governance-checks\/deployment-branch-policies\/(\d+)/g)) out.del.push(Number(m[1]));
+    return out;
+  };
+  const rulesIn = (state) => ((state[RULES_PATH('prod')] || {}).branch_policies || []).map((b) => ({ name: b.name, type: b.type }));
+  const policyIn = (state) => (state[ENV_PATH('prod')] || {}).deployment_branch_policy;
+  const envSection = (r) => r.stdout.slice(r.stdout.indexOf('== g)'));
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  // Absent: planned exactly, then applied, then a second run writes nothing.
+  let r = bootstrap(['--no-rulesets'], { fx: fixtures(environment('prod', { rules: null })) });
+  let plan = envPlan(r.stdout);
+  ok('a dry run with no governance-checks environment plans it: custom branch policies, protected branches false',
+    r.status === 0 && plan.put.length === 1 && same(plan.put[0], WANT_ENV) && r.writes.length === 0, `${tail(r)} ${JSON.stringify(plan)}`);
+  ok('...and exactly one deployment rule: the default branch, test, as a branch rule',
+    same(plan.post, WANT_RULE) && plan.del.length === 0, JSON.stringify(plan));
+
+  r = bootstrap(['--no-rulesets', '--apply'], { fx: fixtures(environment('prod', { rules: null })), writable: true });
+  ok('--apply creates governance-checks with custom policies and exactly one rule, test',
+    r.status === 0 && same(policyIn(r.state), WANT_ENV.deployment_branch_policy) && same(rulesIn(r.state), WANT_RULE) && r.writes.length === 2,
+    `${tail(r)} policy=${JSON.stringify(policyIn(r.state))} rules=${JSON.stringify(rulesIn(r.state))} writes=${r.writes.length}`);
+  const again = bootstrap(['--no-rulesets', '--apply'], { fx: r.state, writable: true });
+  ok('the same --apply again makes no write call', again.status === 0 && again.writes.length === 0 && /0 change\(s\) applied/.test(again.stdout)
+    && /governance-checks: up to date/.test(again.stdout), `${tail(again)} writes=${JSON.stringify(again.writes.map((w) => w.args.join(' ')))}`);
+
+  // Drift: every rule but the default branch is reported, then removed.
+  for (const [what, extra] of [
+    ['refs/pull/*', { id: 2, name: 'refs/pull/*', type: 'branch' }],
+    ['*', { id: 3, name: '*', type: 'branch' }],
+    ['a tag rule named test', { id: 4, name: 'test', type: 'tag' }],
+  ]) {
+    const fx = fixtures(environment('prod', { rules: [{ id: 1, name: 'test', type: 'branch' }, extra] }));
+    r = bootstrap(['--no-rulesets'], { fx });
+    plan = envPlan(r.stdout);
+    ok(`a dry run reports an extra ${what} rule as drift and plans its removal, keeping test`,
+      r.status === 0 && new RegExp(`DRIFT: .*'${extra.name.replace(/\*/g, '\\*')}' \\(${extra.type}`).test(envSection(r))
+        && same(plan.del, [extra.id]) && plan.post.length === 0 && plan.put.length === 0 && r.writes.length === 0, `${tail(r)} ${JSON.stringify(plan)}`);
+    r = bootstrap(['--no-rulesets', '--apply'], { fx, writable: true });
+    ok(`--apply removes the ${what} rule and leaves only test`, r.status === 0 && same(rulesIn(r.state), WANT_RULE)
+      && same(policyIn(r.state), WANT_ENV.deployment_branch_policy), `${tail(r)} rules=${JSON.stringify(rulesIn(r.state))}`);
+    const second = bootstrap(['--no-rulesets', '--apply'], { fx: r.state, writable: true });
+    ok(`...and a second --apply after removing ${what} writes nothing`, second.status === 0 && second.writes.length === 0, tail(second));
+  }
+  // Only a tag rule named test: the tag goes, the branch rule is created.
+  r = bootstrap(['--no-rulesets', '--apply'], { fx: fixtures(environment('prod', { rules: [{ id: 4, name: 'test', type: 'tag' }] })), writable: true });
+  ok('an environment whose only rule is a tag named test ends with the branch rule alone', r.status === 0 && same(rulesIn(r.state), WANT_RULE), JSON.stringify(rulesIn(r.state)));
+
+  // The environment's own policy: protected branches, or none at all.
+  for (const [what, policy] of [['protected branches', { protected_branches: true, custom_branch_policies: false }], ['every branch (no policy)', null]]) {
+    const fx = fixtures(environment('prod', { policy }));
+    r = bootstrap(['--no-rulesets'], { fx });
+    plan = envPlan(r.stdout);
+    ok(`a dry run reports an environment allowing ${what} as drift and plans the custom policy`,
+      r.status === 0 && /DRIFT: .*deployment/.test(envSection(r)) && plan.put.length === 1 && same(plan.put[0], WANT_ENV) && same(plan.post, WANT_RULE),
+      `${tail(r)} ${JSON.stringify(plan)}`);
+    r = bootstrap(['--no-rulesets', '--apply'], { fx, writable: true });
+    ok(`--apply turns an environment allowing ${what} into custom policies with only test`,
+      r.status === 0 && same(policyIn(r.state), WANT_ENV.deployment_branch_policy) && same(rulesIn(r.state), WANT_RULE), `${tail(r)} ${JSON.stringify(policyIn(r.state))}`);
+  }
+
+  // Not with --self-only, and not for a repository test is not the default of.
+  r = bootstrap(['--self-only'], { repo: false });
+  ok('--self-only reads and plans no environment', r.status === 0 && !r.calls.some((c) => c.args.some((a) => /environments/.test(a)))
+    && /== g\) [^\n]*\n\s+skipped \(--self-only\)/.test(r.stdout), tail(r));
+  const noTest = fixtures({ ...environment('prod', { rules: null }), [`repos/${ORG}/prod`]: { name: 'prod', full_name: `${ORG}/prod`, default_branch: 'main' },
+    [`repos/${ORG}/prod/branches/test`]: undefined });
+  r = bootstrap(['--no-rulesets'], { fx: noTest });
+  plan = envPlan(r.stdout);
+  ok('a repository with no test branch gets no environment, with a warning', r.status === 0 && plan.put.length === 0 && plan.post.length === 0
+    && /WARNING: .*governance-checks/.test(envSection(r)), `${tail(r)} ${JSON.stringify(plan)}`);
 }
 
 // -------------------------------------- the credential for --apply ----
