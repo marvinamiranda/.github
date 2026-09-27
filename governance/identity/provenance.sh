@@ -24,7 +24,9 @@
 # outside any checkout: `env -i` keeps PATH alone, so no GIT_CONFIG_COUNT or
 # GIT_CONFIG_PARAMETERS, no GIT_DIR, no proxy (HTTPS_PROXY, ALL_PROXY) and no
 # CA override (SSL_CERT_FILE, SSL_CERT_DIR, GIT_SSL_*) reaches it; no global
-# or system config either. Otherwise a `url.<x>.insteadOf` anywhere in the
+# or system config either (GIT_CONFIG_NOSYSTEM=1 matters: Homebrew's system
+# gitconfig is writable by the owner's account). GIT_TERMINAL_PROMPT=0: should
+# the repository ever need credentials, the read fails instead of prompting. Otherwise a `url.<x>.insteadOf` anywhere in the
 # owner's configuration (or the checkout's own), or a proxy with its own CA,
 # could answer for the canonical URL with an unreviewed commit. The fetch of that
 # exact commit may use the ordinary configuration: it is asked for by SHA, so a
@@ -84,7 +86,7 @@ mm_provenance() {
     PROVENANCE_PROBLEM="this checkout has uncommitted changes: $hidden differs from its commit, though git status does not show it"
   elif ! PROVENANCE_TEST="$(cd / && env -i PATH="$PATH" \
         GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null \
-        git ls-remote "$MM_PROVENANCE_URL" refs/heads/test 2>"$scratch/ls-remote.err" | cut -f1)" \
+        GIT_TERMINAL_PROMPT=0 git ls-remote "$MM_PROVENANCE_URL" refs/heads/test 2>"$scratch/ls-remote.err" | cut -f1)" \
       || [[ ! "$PROVENANCE_TEST" =~ ^[0-9a-f]{40}$ ]]; then
     PROVENANCE_PROBLEM="$MM_PROVENANCE_REPO test could not be read from $MM_PROVENANCE_URL: $(tr '\n' ' ' <"$scratch/ls-remote.err")"
   elif ! mm_git -C "$dir" cat-file -e "$PROVENANCE_TEST^{commit}" 2>/dev/null \

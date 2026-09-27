@@ -1,0 +1,13 @@
+{
+  "name": "MarvinaMiranda Runners",
+  "url": "https://github.com/marvinamiranda",
+  "description": "Mints just-in-time runner configurations for the single-use gate-ephemeral runner pool (miranda-infrastructure#584). Install on selected repositories only. Its key lives only in the owner's login Keychain.",
+  "public": false,
+  "hook_attributes": { "url": "https://example.invalid/unused", "active": false },
+  "default_permissions": {
+    "organization_self_hosted_runners": "write",
+    "actions": "read",
+    "metadata": "read"
+  },
+  "default_events": []
+}

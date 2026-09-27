@@ -213,8 +213,11 @@ before any `gh` call or page. Only reviewed code handles an App's private key.
   `marvinamiranda`, named as the manifest names it, with exactly the manifest's
   permissions. Otherwise the key is discarded, nothing is written or loaded,
   and it says to delete that App.
-The third, **MarvinaMiranda Checks** (`mm-checks`), is different: its key never
-touches the machine's disk. See [The Checks App](#the-checks-app-mm-checks).
+Two more are different: their keys never touch the machine's disk.
+**MarvinaMiranda Checks** (`mm-checks`) keeps its key in a GitHub environment
+secret ([The Checks App](#the-checks-app-mm-checks)), and **MarvinaMiranda
+Runners** (`mm-runners`) in the login Keychain
+([The Runners App](#the-runners-app-mm-runners)).
 
 **Install or refresh an identity** from a checkout of a merged commit, by the
 script's absolute path:
@@ -428,6 +431,81 @@ Known limit (accepted on
 [.github#8](https://github.com/marvinamiranda/.github/issues/8)): while it
 runs, the key is in the memory of `create-app.py` and `gh`, both processes of
 the owner's account, which is already the root of trust.
+
+### The Runners App (`mm-runners`)
+
+"MarvinaMiranda Runners" mints just-in-time runner configurations for the
+single-use `gate-ephemeral` pool
+([miranda-infrastructure#584](https://github.com/marvinamiranda/miranda-infrastructure/issues/584)),
+whose VMs run the jobs that hold the Checks App's key. It is a dedicated App,
+not the Agent App, which holds far broader rights (`workflows: write` among
+them). Only the pool controller uses its key, so it has no token helper and no
+`agent-env.sh` identity.
+
+Permissions (`governance/identity/mm-runners.manifest.json`): exactly
+organisation Self-hosted runners write (generate a JIT config, list and delete
+runners), Actions read and Metadata read. No webhook, no events. **Actions read
+is a repository permission**, needed to see queued jobs, which no organisation
+runner endpoint exposes. Install the App on **only the selected repositories
+omni237 and omni237-ops**, so it reaches nothing else.
+
+**Create it** (the owner, from a checkout of a merged commit, with every agent
+session closed; step 4 of the checklist on
+[.github#8](https://github.com/marvinamiranda/.github/issues/8)):
+
+```bash
+python3 -I -S governance/identity/create-app.py mm-runners --to-keychain marvinamiranda.ephemeral-runner-pool
+```
+
+Click **Continue to GitHub**, then **Create GitHub App**. The key goes into the
+login Keychain as a generic password, with service
+`marvinamiranda.ephemeral-runner-pool` and account = the App's client id. It is
+stored **base64-encoded on one line**, which the controller decodes after
+`security find-generic-password -s <service> -w`.
+
+**How the key reaches `security` without argv.**
+`security add-generic-password -w <key>` would put the key in argv, where any
+local process can read it. A bare trailing `-w` prompts on the terminal
+instead, so it cannot take the key from a pipe. `create-app.py` therefore runs
+`security -i` and writes the whole
+`add-generic-password -a <client id> -s <service> -w <base64> login.keychain`
+command to its stdin. The key is in no process's arguments, and `security`
+does not echo input from a pipe.
+- **Line-length limit.** `security -i` reads a line into a 4096-byte buffer
+  and runs whatever does not fit as a further command, printing it in an
+  "unknown command" error. Measured here: lines of up to 4095 characters ran
+  whole, and longer ones were split. A GitHub App's RSA-2048 key is about 2,272 characters
+  in base64, so it fits. `create-app.py` refuses to send any line over 4000
+  characters.
+- **Confirming the store.** It checks `security`'s exit status, then that the
+  item is there, with a `find-generic-password` that reads no secret (no
+  `-w`, no `-g`).
+- **What is written.** No `private-key.pem` and no temporary file, and the
+  key is printed nowhere. `~/.config/mm-agent/mm-runners/app.json` holds
+  `{ app_id, client_id, slug, keychain_service }` and no secret.
+
+It refuses, before the page opens and so before any App exists:
+- `mm-runners` without `--to-keychain`;
+- `--to-keychain` with any other identity;
+- a service name that is not letters, digits, `.`, `_` and `-`, because it
+  travels inside the `security -i` line;
+- a checkout that is not merged code, or a run without `-I -S` (see
+  [Identities](#identities-delivery-9-appendix-a));
+- an item already in the login Keychain for that service, unless `--replace`.
+  With `--replace`, the existing items are deleted **only after** the new key
+  is in hand and the App has been checked, so the controller never finds an
+  older App's key first.
+
+The App GitHub creates is checked before its key is stored: owned by
+`marvinamiranda`, named "MarvinaMiranda Runners", with exactly the manifest's
+permissions. If storing fails for any reason, it prints which App to delete.
+
+Known limit (accepted on
+[.github#17](https://github.com/marvinamiranda/.github/issues/17) and
+[.github#8](https://github.com/marvinamiranda/.github/issues/8)): any process in
+the owner's macOS account can read this Keychain item. That account is already
+the root of trust (miranda-infrastructure#549). The mitigation is on #584,
+which deletes any runner it did not create.
 
 ## Bootstrap
 
