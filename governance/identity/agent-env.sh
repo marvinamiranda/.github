@@ -303,7 +303,7 @@ case "$NAME" in mm-agent | mm-reviewer) ;; *) locked "unknown identity: $NAME (m
 DIR="$ROOT/$NAME"
 APP_JSON="$DIR/app.json"
 GH_DIR="$DIR/gh"
-[[ -r "$APP_JSON" ]] || locked "missing $APP_JSON; run create-app.py $NAME first"
+[[ -r "$APP_JSON" ]] || locked "missing $APP_JSON; the owner creates it with python3 -I -S governance/identity/create-app.py $NAME"
 [[ -x "$HERE/gh-shim.sh" && -x "$HERE/app-token.sh" ]] || locked "gh-shim.sh or app-token.sh is missing beside $0"
 [[ -n "$real_gh" ]] || locked "no gh on PATH"
 command -v git >/dev/null || locked "git is required"

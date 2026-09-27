@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-# Isolated mode, first, before any other import. Without -I, Python puts this
-# script's directory first on sys.path and honours PYTHONPATH, PYTHONSTARTUP and
-# user site-packages, so a planted secrets.py (or json.py, …) beside the script
-# would run as the owner, with the key about to be handed over, before any
-# check below. This check cannot stop code that loads before the script does
-# (sitecustomize or usercustomize on PYTHONPATH, a .pth file): that is exactly
-# why -I is required and documented, not merely checked. `sys` is built into
-# the interpreter, so importing it loads nothing from disk.
+# Isolated mode (-I) and no site (-S), first, before any other import.
+# Without -I, Python puts this script's directory first on sys.path and
+# honours PYTHONPATH, PYTHONSTARTUP and user site-packages, so a planted
+# secrets.py (or json.py, …) beside the script would run as the owner, with
+# the key about to be handed over, before any check below. Without -S, every
+# .pth file in site-packages runs at start-up, even under -I, and Homebrew's
+# site-packages is writable by the owner's account. This check cannot stop
+# code that loads before the script does (a .pth file, sitecustomize,
+# usercustomize): that is exactly why -I -S is required and documented, not
+# merely checked. `sys` is built into the interpreter, so importing it loads
+# nothing from disk.
 import sys
 
-if not sys.flags.isolated:
-    sys.exit("create-app.py: refusing: run it isolated, so that nothing beside it or on PYTHONPATH is imported: "
-             "python3 -I governance/identity/create-app.py <name> [...]")
+if not (sys.flags.isolated and sys.flags.no_site):
+    sys.exit("create-app.py: refusing: run it isolated and without site-packages, so that nothing beside it, on "
+             "PYTHONPATH or in a .pth file runs first: python3 -I -S governance/identity/create-app.py <name> [...]")
 
 """Register an organisation-owned GitHub App from a manifest (DELIVERY.md Appendix A).
 
@@ -20,11 +23,11 @@ posts the manifest to GitHub; the owner clicks "Create GitHub App"; GitHub redir
 back here with a one-time code, which is exchanged for the App's id and private key.
 The key is never printed. Where it goes depends on the identity (CUSTODY below):
 
-    python3 -I governance/identity/create-app.py mm-agent
-    python3 -I governance/identity/create-app.py mm-reviewer
+    python3 -I -S governance/identity/create-app.py mm-agent
+    python3 -I -S governance/identity/create-app.py mm-reviewer
         The key is written to ~/.config/mm-agent/<name>/private-key.pem (0600).
 
-    python3 -I governance/identity/create-app.py mm-checks --to-environment \\
+    python3 -I -S governance/identity/create-app.py mm-checks --to-environment \\
         --repo omni237 --repo omni237-ops
         The key goes straight into the environment secret CHECKS_APP_PRIVATE_KEY,
         and the client id into the variable CHECKS_APP_CLIENT_ID, of each
@@ -228,8 +231,12 @@ if custody == "environment":
 # From the commit provenance.sh checked, not from the file, which could change
 # after the check. `cat-file blob` prints the committed bytes with no textconv
 # or filter; `<commit>:./<file>` is relative to HERE.
-committed = subprocess.run(["git", "cat-file", "blob", f"{CHECKED_COMMIT}:./{manifest_path.name}"],
-                           cwd=HERE, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+# Replace refs and grafts ignored, as in provenance.sh: a refs/replace entry
+# for the manifest's blob would otherwise hand cat-file other bytes.
+committed = subprocess.run(["git", "-c", "advice.graftFileDeprecated=false", "cat-file", "blob",
+                            f"{CHECKED_COMMIT}:./{manifest_path.name}"],
+                           cwd=HERE, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"})
 if committed.returncode != 0:
     refuse(f"{manifest_path.name} is not in commit {CHECKED_COMMIT[:12]}: {committed.stderr.strip()}", 1)
 manifest = json.loads(committed.stdout)

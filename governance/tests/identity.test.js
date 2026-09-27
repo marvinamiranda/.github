@@ -955,6 +955,7 @@ function zshOrSkip(what) {
   // stands for GitHub. So a configuration that redirects the canonical URL
   // behaves here as it would on the owner's machine.
   const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  fs.writeFileSync(path.join(cBin, 'fake-github'), cCanon); // where "GitHub" is: read by the fake git, whatever its environment
   fs.writeFileSync(path.join(cBin, 'git'), `#!/usr/bin/env bash
 real=${JSON.stringify(REAL_GIT)}
 canonical=${JSON.stringify(CANONICAL)}
@@ -964,7 +965,8 @@ hit=0
 for a in "$@"; do if [ "$a" = "$canonical" ]; then hit=1; fi; done
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
-if [ "$url" = "$canonical" ]; then url="$FAKE_GITHUB"; fi
+if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(cBin, 'fake-github'))})"; fi
+for a in "$@"; do if [ "$a" = ls-remote ]; then env | sed 's/=.*//' | sort | tr '\\n' ' ' >> ${JSON.stringify(path.join(cBin, 'ls-remote-env.log'))}; echo >> ${JSON.stringify(path.join(cBin, 'ls-remote-env.log'))}; fi; done
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -1023,6 +1025,9 @@ def fake_urlopen(req, *a, **k):
     if m and method == 'POST':
         log(event='conversion', code=m.group(1))
         app = json.loads(os.environ['FAKE_APP'])
+        if os.environ.get('FAKE_APP_AS_POSTED') == '1':  # as GitHub does: the App the page posted
+            for key, field in (('name', 'name'), ('permissions', 'default_permissions'), ('events', 'default_events')):
+                app[key] = posted_manifest[0][field]
         app['pem'] = pem
         return Resp(json.dumps(app))
     log(event='network', url=url)
@@ -1045,7 +1050,8 @@ def browser(url, *a, **k):
         page = c.getresponse().read().decode()
         state = re.search(r'[?&]state=([^&\\'"]+)', page).group(1)
         value = re.search(r"name='manifest' value=\\"([^\\"]*)\\"", page).group(1)
-        log(event='form', manifest=json.loads(html.unescape(value)))
+        posted_manifest.append(json.loads(html.unescape(value)))
+        log(event='form', manifest=posted_manifest[0])
         c = http.client.HTTPConnection('127.0.0.1', port, timeout=60)
         c.request('GET', '/callback?state=' + state + '&code=fakecode')
         r = c.getresponse()
@@ -1056,6 +1062,7 @@ def browser(url, *a, **k):
     t.start()
     return True
 walkers = []
+posted_manifest = []
 webbrowser.open = browser
 import subprocess
 _run = subprocess.run
@@ -1101,7 +1108,7 @@ finally:
       name: m.name, owner: { login: ORG, type: 'Organization' }, permissions: m.default_permissions, events: m.default_events,
       client_secret: 'fake-client-secret', webhook_secret: null });
   }
-  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', isolated = true, app = (a) => a, homeGitconfig = '' } = {}) {
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '' } = {}) {
     fs.rmSync(cHome, { recursive: true, force: true });
     fs.rmSync(cTmp, { recursive: true, force: true });
     fs.mkdirSync(cHome, { recursive: true });
@@ -1109,7 +1116,7 @@ finally:
     if (homeGitconfig) fs.writeFileSync(path.join(cHome, '.gitconfig'), homeGitconfig);
     fs.writeFileSync(cFixtures, JSON.stringify(fx));
     for (const f of [cGhLog, cEvents]) fs.writeFileSync(f, '');
-    const r = spawnSync('python3', [...(isolated ? ['-I'] : []), harness, CREATE_APP, ...args], {
+    const r = spawnSync('python3', [...pyFlags, harness, CREATE_APP, ...args], {
       input: PEM,
       encoding: 'utf8',
       timeout: 60000,
@@ -1126,7 +1133,6 @@ finally:
         FAKE_EVENTS: cEvents,
         FAKE_MARKER: MARKER,
         FAKE_APP: JSON.stringify(convertedApp(args[0], app)),
-        FAKE_GITHUB: cCanon,
         GIT_CONFIG_NOSYSTEM: '1',
         ...extraEnv,
       },
@@ -1247,16 +1253,16 @@ finally:
   const plantedMarker = path.join(root, 'checks-planted-ran');
   const plant = (file, where) => fs.writeFileSync(path.join(where, file),
     `open(${JSON.stringify(plantedMarker)}, 'a').write(${JSON.stringify(file)} + '\\n')\nimport sys\nsys.exit(3)\n`);
-  function direct(pyFlags, extraEnv = {}) {
+  function direct(pyFlags, extraEnv = {}, python = 'python3') {
     fs.rmSync(plantedMarker, { force: true });
     fs.writeFileSync(cGhLog, '');
     // A target no fixture knows: should a mutant get past every earlier check,
     // the preflight refuses before the real browser or port 8765 is touched.
-    return spawnSync('python3', [...pyFlags, CREATE_APP, 'mm-checks', '--to-environment', '--repo', 'no-such-repo'], { encoding: 'utf8', timeout: 30000, input: '',
+    return spawnSync(python, [...pyFlags, CREATE_APP, 'mm-checks', '--to-environment', '--repo', 'no-such-repo'], { encoding: 'utf8', timeout: 30000, input: '',
       env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
-        FAKE_GH_LOG: cGhLog, FAKE_GH_FIXTURES: cFixtures, FAKE_GITHUB: cCanon, GIT_CONFIG_NOSYSTEM: '1', ...extraEnv } });
+        FAKE_GH_LOG: cGhLog, FAKE_GH_FIXTURES: cFixtures, GIT_CONFIG_NOSYSTEM: '1', ...extraEnv } });
   }
-  let iso = createApp(args, { isolated: false });
+  let iso = createApp(args, { pyFlags: [] });
   ok('refuses to run without python3 -I, before any gh call or page, nothing created',
     iso.status !== 0 && /python3 -I/.test(iso.stderr) && !iso.opened && iso.gh.length === 0 && !fs.existsSync(checksDir()), `${cTail(iso)} gh=${iso.gh.length}`);
   plant('secrets.py', cIdentity);
@@ -1266,7 +1272,7 @@ finally:
   fs.mkdirSync(planted, { recursive: true });
   plant('sitecustomize.py', planted);
   plant('usercustomize.py', planted);
-  d = direct(['-I', '-B'], { PYTHONPATH: planted, PYTHONUSERBASE: planted });
+  d = direct(['-I', '-S', '-B'], { PYTHONPATH: planted, PYTHONUSERBASE: planted });
   ok('with -I, neither the planted secrets.py nor a sitecustomize on PYTHONPATH runs, and the untracked file is refused',
     d.status !== 0 && d.status !== 3 && !fs.existsSync(plantedMarker) && /uncommitted changes/.test(d.stderr), `exit ${d.status} ran=${readOr(plantedMarker).trim()} ${d.stderr.trim()}`);
   fs.rmSync(path.join(cIdentity, 'secrets.py'), { force: true });
@@ -1278,7 +1284,7 @@ finally:
   git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
   git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
   const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8',
-    env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, FAKE_GITHUB: cCanon, GIT_CONFIG_NOSYSTEM: '1',
+    env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${cEvil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
   ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call (so the cases below can fail)',
     control.stdout.startsWith(git(cSrc, 'rev-parse', 'HEAD')), control.stdout + control.stderr);
@@ -1347,6 +1353,75 @@ finally:
   rec = createApp(args, { app: (a) => { const b = { ...a }; delete b.client_id; return b; } });
   ok('when loading raises, the recovery still prints, naming the repository that holds the key, and it exits',
     rec.status !== null && rec.status !== 0 && /hold the key: [^\n]*marvinamiranda\/prod-a/.test(rec.stderr) && !`${rec.stdout}${rec.stderr}`.includes(MARKER), cTail(rec));
+
+  // ---- -S: no site-packages, so no .pth file runs ----
+  iso = createApp(args, { pyFlags: ['-I'] });
+  ok('refuses to run with -I but without -S, before any gh call or page, nothing created',
+    iso.status !== 0 && /python3 -I -S/.test(iso.stderr) && !iso.opened && iso.gh.length === 0 && !fs.existsSync(checksDir()), `${cTail(iso)} gh=${iso.gh.length}`);
+  // A .pth in site-packages runs at start-up even under -I (Homebrew's is
+  // user-writable). A throwaway venv gives a site-packages this suite owns.
+  const venv = path.join(root, 'checks-venv');
+  const made = spawnSync('python3', ['-m', 'venv', '--without-pip', venv], { encoding: 'utf8' });
+  const vpy = path.join(venv, 'bin', 'python3');
+  const site = made.status === 0 ? spawnSync(vpy, ['-c', 'import site; print(site.getsitepackages()[0])'], { encoding: 'utf8' }).stdout.trim() : '';
+  if (!site) {
+    ok('a throwaway venv for the .pth drill', false, made.stderr);
+  } else {
+    fs.writeFileSync(path.join(site, 'planted.pth'), `import os; open(${JSON.stringify(plantedMarker)}, 'a').write('pth\\n')\n`);
+    d = direct(['-I', '-B'], {}, vpy);
+    ok('control: under -I alone a planted .pth runs before the script, which then refuses for want of -S',
+      fs.existsSync(plantedMarker) && d.status !== 0 && /python3 -I -S/.test(d.stderr) && readOr(cGhLog) === '', `ran=${fs.existsSync(plantedMarker)} ${d.stderr.trim()}`);
+    d = direct(['-I', '-S', '-B'], {}, vpy);
+    ok('with -I -S the planted .pth never runs', !fs.existsSync(plantedMarker), `exit ${d.status} ran=${readOr(plantedMarker).trim()} ${d.stderr.trim()}`);
+  }
+
+  // ---- replace refs and grafts cannot make an unmerged commit look merged ----
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  const unmerged = git(cSrc, 'rev-parse', 'HEAD');
+  git(cSrc, 'replace', '--graft', merged, unmerged); // test's commit now "descends" from the unmerged one
+  let drill = createApp(args);
+  git(cSrc, 'replace', '-d', merged);
+  ok('a replace ref grafting test onto an unmerged commit is ignored: refused', drill.status !== 0 && /not on marvinamiranda\/\.github test/.test(drill.stderr)
+    && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
+  const graftFile = path.join(cSrc, '.git', 'info', 'grafts');
+  fs.mkdirSync(path.dirname(graftFile), { recursive: true });
+  fs.writeFileSync(graftFile, `${merged} ${unmerged}\n`);
+  drill = createApp(args);
+  fs.rmSync(graftFile, { force: true });
+  ok('a .git/info/grafts entry grafting test onto an unmerged commit is ignored: refused', drill.status !== 0 && /not on marvinamiranda\/\.github test/.test(drill.stderr)
+    && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
+  git(cSrc, 'reset', '-q', '--hard', merged);
+  // The reviewer's drill: at a merged commit, a replace ref swaps the manifest's
+  // blob for one asking administration: write. The committed bytes are what count.
+  const blob = git(cSrc, 'rev-parse', `${merged}:governance/identity/mm-checks.manifest.json`);
+  const evilBlob = execFileSync('git', ['-C', cSrc, 'hash-object', '-w', '--stdin'], { input: widened, env: gitEnv }).toString().trim();
+  git(cSrc, 'replace', blob, evilBlob);
+  drill = createApp(args, { extraEnv: { FAKE_APP_AS_POSTED: '1' } });
+  git(cSrc, 'replace', '-d', blob);
+  const drillPosted = drill.events.find((e) => e.event === 'form');
+  ok('a replace ref swapping the manifest\'s blob is ignored: the page posts the committed manifest',
+    drillPosted && JSON.stringify(drillPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
+    `${cTail(drill)} posted=${drillPosted && JSON.stringify(drillPosted.manifest.default_permissions)}`);
+
+  // ---- test is read with nothing from the environment but PATH ----
+  const envLog = path.join(cBin, 'ls-remote-env.log');
+  fs.writeFileSync(envLog, '');
+  const leaky = { HTTPS_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', ALL_PROXY: 'http://127.0.0.1:9', SSL_CERT_FILE: '/nonexistent/ca.pem',
+    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x' };
+  drill = createApp(args, { extraEnv: leaky });
+  const seen = readOr(envLog).trim().split('\n').filter(Boolean);
+  const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
+  ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
+    drill.status === 0 && seen.length >= 1 && leaked.length === 0, `${cTail(drill)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
+
+  // ---- an untracked file counts even when git status is told to hide them ----
+  git(cSrc, 'config', 'status.showUntrackedFiles', 'no');
+  fs.writeFileSync(path.join(cIdentity, 'planted.txt'), 'untracked\n');
+  drill = createApp(args);
+  fs.rmSync(path.join(cIdentity, 'planted.txt'));
+  git(cSrc, 'config', '--unset', 'status.showUntrackedFiles');
+  ok('status.showUntrackedFiles=no does not hide an untracked file: refused', drill.status !== 0 && /uncommitted changes/.test(drill.stderr)
+    && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
 
   // ---- refusals: exit non-zero, before the page opens, nothing created ----
   const nothingDone = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.sets.length === 0 && !fs.existsSync(checksDir());

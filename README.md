@@ -169,8 +169,8 @@ node governance/areas-check.js <product checkout> [git-ref]
 Organisation GitHub Apps, created once by the owner:
 
 ```bash
-python3 -I governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
-python3 -I governance/identity/create-app.py mm-reviewer   # posts review/independent
+python3 -I -S governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
+python3 -I -S governance/identity/create-app.py mm-reviewer   # posts review/independent
 ```
 
 Their keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
@@ -180,22 +180,32 @@ a commit that is not on this repository's `test` as GitHub has it now,
 uncommitted changes under `governance/`, and files outside a git checkout,
 before any `gh` call or page. Only reviewed code handles an App's private key.
 
-- **Always `python3 -I`** (isolated mode). Without it Python imports modules
-  from the script's own directory first and honours `PYTHONPATH`, so a planted
-  `secrets.py` or `json.py` beside the script would run as the owner just
-  before the key is handed over. `create-app.py` refuses to run without `-I`,
-  as its very first statement. That refusal cannot stop code that loads
-  before the script does (a `sitecustomize`/`usercustomize` on `PYTHONPATH` or
-  in user site-packages, a `.pth` file), which is why the flag is part of the
-  command, not just checked.
-- **`test` is read with a clean git configuration**, from `/`: no global or
-  system config, no `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, no `GIT_DIR`, no
-  TLS overrides. A `url.<x>.insteadOf` in any of them (or in the checkout's own
-  `.git/config`) could otherwise point the canonical URL at a repository whose
-  `test` is an unreviewed commit.
+- **Always `python3 -I -S`** (isolated mode, no site). Without `-I` Python
+  imports modules from the script's own directory first and honours
+  `PYTHONPATH`, so a planted `secrets.py` or `json.py` beside the script would
+  run as the owner just before the key is handed over. Without `-S` every
+  `.pth` file in site-packages runs at start-up, even under `-I`, and
+  Homebrew's site-packages is writable by the owner's account.
+  `create-app.py` refuses to run without both, as its very first statement.
+  That refusal cannot stop code that loads before the script does (a `.pth`
+  file, a `sitecustomize`/`usercustomize`), which is why the flags are part of
+  the command, not just checked.
+- **`test` is read with an empty environment and a clean git configuration**,
+  from `/`: `env -i` keeps only `PATH`, so no `GIT_CONFIG_COUNT`/
+  `GIT_CONFIG_PARAMETERS`, no `GIT_DIR`, no proxy (`HTTPS_PROXY`, `ALL_PROXY`)
+  and no CA override (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_*`) reaches it,
+  and no global or system config is read. A `url.<x>.insteadOf` in any of
+  them (or in the checkout's own `.git/config`), or a proxy with its own CA,
+  could otherwise answer for the canonical URL with an unreviewed commit.
+- **Replace refs and grafts are ignored** by every git call in the check and
+  by the manifest read (`GIT_NO_REPLACE_OBJECTS=1`, `GIT_GRAFT_FILE=/dev/null`).
+  A `refs/replace/*` entry or a `.git/info/grafts` line in the checkout could
+  otherwise make an unmerged commit look like an ancestor of `test`, or hand
+  the manifest's blob other bytes.
 - **Uncommitted means by content**: every file under `governance/` must hash to
   its blob in `HEAD`, so an edit hidden from `git status` with skip-worktree or
-  assume-unchanged is refused too. The manifest is then read from that commit
+  assume-unchanged is refused too, and untracked files count even when
+  `status.showUntrackedFiles=no` is configured. The manifest is then read from that commit
   (`git cat-file blob <commit>:./<name>.manifest.json`), not from the file,
   which could change after the check.
 - A merged commit that is not `test`'s tip runs, with a warning.
@@ -363,7 +373,7 @@ gives the order):
 
 ```bash
 read -rs GH_TOKEN && export GH_TOKEN      # the one-day fine-grained token below
-python3 -I governance/identity/create-app.py mm-checks --to-environment --repo omni237 --repo omni237-ops
+python3 -I -S governance/identity/create-app.py mm-checks --to-environment --repo omni237 --repo omni237-ops
 unset GH_TOKEN
 ```
 
