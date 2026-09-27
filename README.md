@@ -174,6 +174,11 @@ python3 governance/identity/create-app.py mm-reviewer   # posts review/independe
 ```
 
 Their keys go to `~/.config/mm-agent/<name>/` (0600) and are never printed.
+Run `create-app.py` **from a merged commit**, like `bootstrap.sh --apply`, and
+by the same rule and script (`governance/identity/provenance.sh`): it refuses
+a commit that is not on this repository's `test` as GitHub has it now,
+uncommitted changes under `governance/`, and files outside a git checkout,
+before any `gh` call or page. Only reviewed code handles an App's private key.
 The third, **MarvinaMiranda Checks** (`mm-checks`), is different: its key never
 touches the machine's disk. See [The Checks App](#the-checks-app-mm-checks).
 
@@ -352,6 +357,8 @@ selected repositories** you named.
 It refuses, exiting non-zero before the page opens and so before any App
 exists:
 
+- a checkout that is not merged code (see
+  [Identities](#identities-delivery-9-appendix-a));
 - `mm-checks` without `--to-environment`, or `--to-environment` with any other
   identity; `--to-environment` with no `--repo`, a repository outside
   `marvinamiranda`, or one named twice;
@@ -395,7 +402,8 @@ that is not on `test` as GitHub has it now, read from
 `https://github.com/marvinamiranda/.github.git` and never from `origin`. It
 also refuses a checkout with uncommitted changes, and files outside a git
 checkout. It prints the commit it runs from. A dry run from anywhere else
-warns and carries on.
+warns and carries on. The rule is `governance/identity/provenance.sh`, which
+`create-app.py` applies too, always rather than only for `--apply`.
 
 **First, straight after this repository's own pull request merges**, before
 any product repository moves its pin to that commit: this repository's own

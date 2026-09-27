@@ -114,7 +114,6 @@ OWNER_USER_ID=1245936
 # This repository. Its own test and main get rulesets too: it holds the code
 # every other repository's required checks run.
 SELF_REPO=".github"
-SELF_URL="https://github.com/$ORG/$SELF_REPO.git"
 SELF_CHECKS="governance tests"
 CONFIG_DIR=""
 CONFIG_REF="test"
@@ -287,27 +286,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # test as GitHub has it now, read from its canonical URL (never from whatever
 # `origin` points at), with no uncommitted changes. A commit that only exists
 # in this clone, or on a pull request branch, could hold a bypass nobody
-# reviewed. Checked before any gh call.
-not_reviewed=""
-if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  head_sha="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
-  info "Running from $ORG/$SELF_REPO commit $head_sha"
-  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- .)" ]]; then
-    not_reviewed="this checkout has uncommitted changes"
-  elif ! test_sha="$(git ls-remote "$SELF_URL" refs/heads/test 2>"$WORK/ls-remote.err" | cut -f1)" \
-      || [[ ! "$test_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    not_reviewed="$ORG/$SELF_REPO test could not be read from $SELF_URL: $(tr '\n' ' ' <"$WORK/ls-remote.err")"
-  elif ! git -C "$SCRIPT_DIR" cat-file -e "$test_sha^{commit}" 2>/dev/null \
-      && ! git -C "$SCRIPT_DIR" fetch --quiet --no-tags "$SELF_URL" "$test_sha" 2>"$WORK/fetch.err"; then
-    not_reviewed="$ORG/$SELF_REPO test (${test_sha:0:12}) could not be fetched: $(tr '\n' ' ' <"$WORK/fetch.err")"
-  elif git -C "$SCRIPT_DIR" merge-base --is-ancestor "$head_sha" "$test_sha"; then
-    info "That commit is on $ORG/$SELF_REPO test (read now: ${test_sha:0:12})."
-  else
-    not_reviewed="commit ${head_sha:0:12} is not on $ORG/$SELF_REPO test (read now: ${test_sha:0:12}), so it has not been merged"
-  fi
-else
-  not_reviewed="this is not a git checkout, so its commit cannot be checked"
-fi
+# reviewed. Checked before any gh call. The rule is identity/provenance.sh,
+# which create-app.py runs too.
+# shellcheck source=identity/provenance.sh disable=SC1091
+. "$SCRIPT_DIR/identity/provenance.sh"
+mm_provenance "$SCRIPT_DIR" "$WORK"
+[[ -z "$PROVENANCE_HEAD" ]] || info "Running from $ORG/$SELF_REPO commit $PROVENANCE_HEAD"
+[[ -n "$PROVENANCE_PROBLEM" ]] || info "That commit is on $ORG/$SELF_REPO test (read now: ${PROVENANCE_TEST:0:12})."
+not_reviewed="$PROVENANCE_PROBLEM"
 if [[ -n "$not_reviewed" ]]; then
   if [[ $APPLY -eq 1 ]]; then
     echo "Refusing --apply: $not_reviewed. Check out a merged commit of $ORG/$SELF_REPO by its SHA." >&2

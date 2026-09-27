@@ -22,6 +22,11 @@ The key is never printed. Where it goes depends on the identity (CUSTODY below):
         must exist and allow only the repository's default branch (bootstrap.sh
         creates it so), and must not hold the secret already unless --replace.
 
+Run it from a merged commit: check this repository out by the SHA of a commit
+on its test. It refuses anything else (governance/identity/provenance.sh, the
+rule bootstrap.sh --apply uses): a commit that is not on test as GitHub has it
+now, uncommitted changes under governance/, or files outside a git checkout.
+
 Afterwards, install the App from the URL it prints.
 """
 import argparse
@@ -99,6 +104,16 @@ if custody == "environment":
         if repo in repos:
             refuse(f"--repo {repo} is given twice.")
         repos.append(repo)
+
+# Provenance: only merged code handles an App's private key. The same rule as
+# bootstrap.sh --apply, from the same script: this checkout's HEAD must be on
+# marvinamiranda/.github test as GitHub has it now, with nothing uncommitted
+# under governance/. Checked before any gh call and before the page opens.
+provenance = subprocess.run(["bash", str(HERE / "provenance.sh")], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+if provenance.returncode != 0:
+    reason = provenance.stderr.strip() or f"provenance.sh exited {provenance.returncode}"
+    refuse(f"{reason}. Check out a merged commit of {ORG}/.github by its SHA (git checkout <sha>) and run it from there.", 1)
+print(provenance.stdout.strip())
 
 
 def gh(*argv, stdin_bytes=None):

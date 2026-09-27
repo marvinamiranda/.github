@@ -21,6 +21,12 @@ const path = require('path');
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
   : path.join(__dirname, '..', 'bootstrap.sh');
+// The provenance rule bootstrap.sh sources, beside it as in the repository.
+const PROVENANCE = path.join(path.dirname(SCRIPT), 'identity', 'provenance.sh');
+function withProvenance(governanceDir) {
+  fs.mkdirSync(path.join(governanceDir, 'identity'), { recursive: true });
+  fs.copyFileSync(PROVENANCE, path.join(governanceDir, 'identity', 'provenance.sh'));
+}
 const BASH = process.env.BOOTSTRAP_BASH ? path.resolve(process.env.BOOTSTRAP_BASH) : 'bash';
 const ORG = 'marvinamiranda';
 const CANONICAL = `https://github.com/${ORG}/.github.git`;
@@ -153,6 +159,7 @@ function checkout(on) {
   fs.mkdirSync(path.join(work, 'governance'), { recursive: true });
   fs.copyFileSync(SCRIPT, path.join(work, 'governance', 'bootstrap.sh'));
   fs.chmodSync(path.join(work, 'governance', 'bootstrap.sh'), 0o755);
+  withProvenance(path.join(work, 'governance'));
   git(root, 'init', '-q', work);
   git(work, 'add', '.');
   git(work, 'commit', '-q', '-m', 'bootstrap');
@@ -254,6 +261,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   const loose = fs.mkdtempSync(path.join(root, 'loose-'));
   fs.mkdirSync(path.join(loose, 'governance'));
   fs.copyFileSync(SCRIPT, path.join(loose, 'governance', 'bootstrap.sh'));
+  withProvenance(path.join(loose, 'governance'));
   r = bootstrap(['--no-rulesets', '--apply'], { where: { script: path.join(loose, 'governance', 'bootstrap.sh'), canon: path.join(root, 'none.git') } });
   ok('--apply refuses to run from outside a git checkout', r.status !== 0 && /Refusing --apply/.test(r.stderr) && r.calls.length === 0, tail(r));
 }

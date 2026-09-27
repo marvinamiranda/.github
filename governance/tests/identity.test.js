@@ -912,7 +912,23 @@ function zshOrSkip(what) {
 // The proof that no key reached the disk is a grep of this suite's whole
 // temporary tree, HOME and TMPDIR included, for the marker.
 (function checksApp() {
-  const CREATE_APP = path.join(IDENTITY_SRC, 'create-app.py');
+  // create-app.py refuses to run unless its checkout is on
+  // marvinamiranda/.github test (identity/provenance.sh), so it runs from a
+  // throwaway checkout whose canonical test is a local bare repository.
+  const cSrc = path.join(root, 'checks-src');
+  const cCanon = path.join(root, 'checks-canon.git');
+  const cIdentity = path.join(cSrc, 'governance', 'identity');
+  fs.mkdirSync(cIdentity, { recursive: true });
+  for (const f of fs.readdirSync(IDENTITY_SRC).filter((n) => n === 'create-app.py' || n === 'provenance.sh' || n.endsWith('.manifest.json'))) {
+    fs.copyFileSync(path.join(IDENTITY_SRC, f), path.join(cIdentity, f));
+  }
+  git(root, 'init', '-q', cSrc);
+  git(cSrc, 'add', '.');
+  git(cSrc, 'commit', '-q', '-m', 'create-app');
+  git(root, 'init', '-q', '--bare', cCanon);
+  git(cCanon, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
+  git(cSrc, 'push', '-q', cCanon, 'HEAD:refs/heads/test');
+  const CREATE_APP = path.join(cIdentity, 'create-app.py');
   const REPOS = ['prod-a', 'prod-b'];
   const ENV = 'governance-checks';
   const MARKER = `MM-CHECKS-FAKE-PEM-${crypto.randomBytes(12).toString('hex')}`;
@@ -1061,6 +1077,10 @@ finally:
         FAKE_EVENTS: cEvents,
         FAKE_MARKER: MARKER,
         FAKE_CLIENT_ID: CLIENT_ID,
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: `url.${cCanon}.insteadOf`,
+        GIT_CONFIG_VALUE_0: CANONICAL,
         ...extraEnv,
       },
     });
@@ -1147,6 +1167,28 @@ finally:
       && !/PRIVATE KEY|pem|client_secret|fake-client-secret/.test(meta), meta);
   ok('it tells the owner to install the App on the selected repositories only',
     /apps\/fake-checks\/installations\/new/.test(r.stdout) && /prod-a/.test(r.stdout) && /prod-b/.test(r.stdout) && !/All repositories/.test(r.stdout), r.stdout);
+
+  // ---- provenance: only from a commit on marvinamiranda/.github test ----
+  ok('it runs from a commit on test, and says which', /Running from marvinamiranda\/\.github commit [0-9a-f]{40}, which is on test/.test(r.stdout), r.stdout.split('\n')[0]);
+  const provenanceRefused = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.gh.length === 0 && !fs.existsSync(checksDir());
+  const merged = git(cSrc, 'rev-parse', 'HEAD');
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  let p = createApp(args);
+  git(cSrc, 'reset', '-q', '--hard', merged);
+  ok('refuses to run from a commit that is not on test: before any gh call or page, nothing created',
+    provenanceRefused(p) && /not on marvinamiranda\/\.github test/.test(p.stderr), `${cTail(p)} gh=${p.gh.length} opened=${p.opened}`);
+  fs.appendFileSync(CREATE_APP, '# a local edit\n');
+  p = createApp(args);
+  git(cSrc, 'checkout', '-q', '--', '.');
+  ok('refuses to run from a checkout with uncommitted changes: before any gh call or page, nothing created',
+    provenanceRefused(p) && /uncommitted changes/.test(p.stderr), `${cTail(p)} gh=${p.gh.length} opened=${p.opened}`);
+  p = createApp(['mm-agent']);
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  const pAgent = createApp(['mm-agent']);
+  git(cSrc, 'reset', '-q', '--hard', merged);
+  ok('the rule holds for every identity: mm-agent runs at a merged commit and is refused from an unmerged one',
+    p.status === 0 && pAgent.status !== 0 && !pAgent.opened && /not on marvinamiranda\/\.github test/.test(pAgent.stderr), `${cTail(p)} / ${cTail(pAgent)}`);
+  fs.rmSync(cHome, { recursive: true, force: true }); // mm-agent's key holds the marker by design
 
   // ---- refusals: exit non-zero, before the page opens, nothing created ----
   const nothingDone = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.sets.length === 0 && !fs.existsSync(checksDir());
