@@ -288,10 +288,20 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
     HOME: path.join(root, 'home'), FAKE_GITHUB: planted.canon, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
   ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call',
     control.stdout.startsWith(execFileSync('git', ['-C', planted.work, 'rev-parse', 'HEAD']).toString().trim()), control.stdout + control.stderr);
-  r = bootstrap(['--no-rulesets', '--apply'], { where: planted,
-    extraEnv: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
-  ok('--apply ignores an insteadOf pointing test at the unmerged commit it runs from: refused, before any gh call',
-    r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+  const homeConfig = path.join(root, 'home', '.gitconfig');
+  for (const [what, extraEnv, setup, undo] of [
+    ['GIT_CONFIG_COUNT in the environment', { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL }],
+    ['GIT_CONFIG_PARAMETERS in the environment', { GIT_CONFIG_PARAMETERS: `'url.${evil}.insteadof'='${CANONICAL}'` }],
+    ['the global ~/.gitconfig', {}, () => fs.writeFileSync(homeConfig, `[url "${evil}"]\n\tinsteadOf = ${CANONICAL}\n`), () => fs.rmSync(homeConfig, { force: true })],
+    ['the checkout\'s own .git/config', {}, () => execFileSync('git', ['-C', planted.work, 'config', `url.${evil}.insteadOf`, CANONICAL]),
+      () => execFileSync('git', ['-C', planted.work, 'config', '--unset', `url.${evil}.insteadOf`])],
+  ]) {
+    if (setup) setup();
+    r = bootstrap(['--no-rulesets', '--apply'], { where: planted, extraEnv });
+    if (undo) undo();
+    ok(`--apply ignores an insteadOf in ${what} pointing test at the unmerged commit it runs from: refused, before any gh call`,
+      r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
 
   // An edit hidden from git status is still an edit.
   const skip = checkout('head');
