@@ -1601,11 +1601,12 @@ finally:
   const add = adds(k)[0];
   ok('the key reaches security exactly once, as one add-generic-password on stdin (security -i), never in argv',
     adds(k).length === 1 && add.via === 'stdin' && add.argv.includes('-i') && !secArgvHasKey(k), JSON.stringify(k.sec.map((c) => ({ via: c.via, argv: c.argv }))));
-  const pw = add && add.command[add.command.indexOf('-w') + 1];
+  const addCmd = add ? (add.command || add.argv) : []; // command: sent on stdin; argv: passed as arguments
+  const pw = addCmd[addCmd.indexOf('-w') + 1];
   ok('...holding the PEM base64-encoded on one line, in the login keychain, service as given, account the client id',
-    pw && pw.passwordSha === PEM_SHA(PEM_B64) && add.command.includes('login.keychain')
-      && add.command[add.command.indexOf('-s') + 1] === SVC && add.command[add.command.indexOf('-a') + 1] === CLIENT_ID
-      && !add.command.includes('-A'), add && JSON.stringify(add.command));
+    pw && pw.passwordSha === PEM_SHA(PEM_B64) && addCmd.includes('login.keychain')
+      && addCmd[addCmd.indexOf('-s') + 1] === SVC && addCmd[addCmd.indexOf('-a') + 1] === CLIENT_ID
+      && !addCmd.includes('-A'), add && add.via);
   ok('...and the Keychain then holds exactly that one item', k.kc.length === 1 && k.kc[0].service === SVC && k.kc[0].account === CLIENT_ID
     && k.kc[0].passwordSha === PEM_SHA(PEM_B64), JSON.stringify(k.kc));
   ok('no file under the temporary tree holds the PEM or its base64', filesWithMarker().length === 0, filesWithMarker().join(', '));
