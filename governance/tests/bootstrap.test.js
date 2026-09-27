@@ -310,6 +310,11 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   r = bootstrap(['--no-rulesets', '--apply'], { where: skip });
   ok('--apply refuses an edit hidden with skip-worktree', r.status !== 0 && /differs from its commit/.test(r.stderr) && r.calls.length === 0, tail(r));
 
+  const untracked = checkout('head');
+  fs.writeFileSync(path.join(untracked.work, 'governance', 'planted.sh'), 'echo planted\n');
+  r = bootstrap(['--no-rulesets', '--apply'], { where: untracked });
+  ok('--apply refuses an untracked file under governance/', r.status !== 0 && /uncommitted/.test(r.stderr) && r.calls.length === 0, tail(r));
+
   const loose = fs.mkdtempSync(path.join(root, 'loose-'));
   fs.mkdirSync(path.join(loose, 'governance'));
   fs.copyFileSync(SCRIPT, path.join(loose, 'governance', 'bootstrap.sh'));

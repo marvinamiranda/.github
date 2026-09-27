@@ -1224,6 +1224,11 @@ finally:
   git(cSrc, 'reset', '-q', '--hard', merged);
   ok('refuses to run from a commit that is not on test: before any gh call or page, nothing created',
     provenanceRefused(p) && /not on marvinamiranda\/\.github test/.test(p.stderr), `${cTail(p)} gh=${p.gh.length} opened=${p.opened}`);
+  fs.writeFileSync(path.join(cIdentity, 'planted.txt'), 'untracked\n');
+  p = createApp(args);
+  fs.rmSync(path.join(cIdentity, 'planted.txt'));
+  ok('refuses to run with an untracked file under governance/: before any gh call or page, nothing created',
+    provenanceRefused(p) && /uncommitted changes/.test(p.stderr), `${cTail(p)} gh=${p.gh.length} opened=${p.opened}`);
   fs.appendFileSync(CREATE_APP, '# a local edit\n');
   p = createApp(args);
   git(cSrc, 'checkout', '-q', '--', '.');
@@ -1245,7 +1250,9 @@ finally:
   function direct(pyFlags, extraEnv = {}) {
     fs.rmSync(plantedMarker, { force: true });
     fs.writeFileSync(cGhLog, '');
-    return spawnSync('python3', [...pyFlags, CREATE_APP, ...args], { encoding: 'utf8', timeout: 30000, input: '',
+    // A target no fixture knows: should a mutant get past every earlier check,
+    // the preflight refuses before the real browser or port 8765 is touched.
+    return spawnSync('python3', [...pyFlags, CREATE_APP, 'mm-checks', '--to-environment', '--repo', 'no-such-repo'], { encoding: 'utf8', timeout: 30000, input: '',
       env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
         FAKE_GH_LOG: cGhLog, FAKE_GH_FIXTURES: cFixtures, FAKE_GITHUB: cCanon, GIT_CONFIG_NOSYSTEM: '1', ...extraEnv } });
   }
