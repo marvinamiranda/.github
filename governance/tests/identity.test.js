@@ -35,7 +35,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
-const { forgePackParent, forgeLooseObject } = require('./object-forge');
+const { forgePackParent, forgeLooseObject, BACKDATED } = require('./object-forge');
 
 const IDENTITY_SRC = process.env.IDENTITY_DIR
   ? path.resolve(process.env.IDENTITY_DIR)
@@ -806,7 +806,8 @@ function zshOrSkip(what) {
   git(src, 'commit', '-q', '--allow-empty', '-m', 'merged');
   canonTest('head');
   const tip = git(src, 'rev-parse', 'HEAD');
-  git(src, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  execFileSync('git', ['-C', src, '-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'local, not on test'],
+    { env: { ...gitEnv, ...BACKDATED } }); // older than test's tip (object-forge.js)
   const unmerged = git(src, 'rev-parse', 'HEAD');
   restore = forgePackParent(src, COMMIT, unmerged);
   const packFooled = spawnSync('git', ['-C', src, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', unmerged, tip],
@@ -1664,7 +1665,8 @@ finally:
   git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'merged');
   git(cSrc, 'push', '-q', '-f', cCanon, 'HEAD:refs/heads/test');
   const packTip = git(cSrc, 'rev-parse', 'HEAD');
-  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  execFileSync('git', ['-C', cSrc, '-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'local, not on test'],
+    { env: { ...gitEnv, ...BACKDATED } }); // older than test's tip (object-forge.js)
   const packUnmerged = git(cSrc, 'rev-parse', 'HEAD');
   let restoreObjects = forgePackParent(cSrc, merged, packUnmerged);
   const packFooled = spawnSync(REAL_GIT, ['-C', cSrc, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', packUnmerged, packTip],

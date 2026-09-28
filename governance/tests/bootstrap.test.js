@@ -18,7 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
-const { forgePackParent, forgeLooseObject } = require('./object-forge');
+const { forgePackParent, forgeLooseObject, BACKDATED } = require('./object-forge');
 
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
@@ -400,7 +400,10 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
     gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'merged');
     gitIn(co, 'push', '-q', co.canon, 'HEAD:refs/heads/test');
     const tip = gitIn(co, 'rev-parse', 'HEAD');
-    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+    // Dated before test's tip: git 2.55 stops an ancestry walk at commits
+    // older than the one it looks for, and the writer chooses this date.
+    execFileSync('git', ['-C', co.work, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'local, not on test'],
+      { env: { ...process.env, ...BACKDATED } });
     const unmerged = gitIn(co, 'rev-parse', 'HEAD');
     forgePackParent(co.work, parent, unmerged);
     const fooled = spawnSync('git', ['-C', co.work, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', unmerged, tip],

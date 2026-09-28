@@ -12,7 +12,10 @@
 //       (victim's tree, <parent> as its only parent, a date after everything
 //       here) under victim's id. A walk that reaches victim then continues to
 //       <parent>. Aimed at the parent of test's tip: merge-base re-hashes the
-//       two commits it is named, not the ones it walks to.
+//       two commits it is named, not the ones it walks to. <parent> must be
+//       dated before test's tip (BACKDATED, in the environment of the commit
+//       that makes it): git 2.55 stops an ancestry walk at commits older than
+//       the one it looks for. Whoever writes <parent> chooses its date.
 //   forgeLooseObject(repo, id, type, content)
 //       the loose object file for <id> replaced by one holding <content>.
 //
@@ -97,4 +100,7 @@ function forgeLooseObject(repo, id, type, content) {
   return restore;
 }
 
-module.exports = { forgePackParent, forgeLooseObject };
+// Author and committer dates for a commit made to look older than test's tip.
+const BACKDATED = { GIT_AUTHOR_DATE: '1000000000 +0000', GIT_COMMITTER_DATE: '1000000000 +0000' };
+
+module.exports = { forgePackParent, forgeLooseObject, BACKDATED };
