@@ -76,6 +76,40 @@ PORT = 8765
 HERE = pathlib.Path(__file__).resolve().parent
 AGENT_ROOT = pathlib.Path.home() / ".config" / "mm-agent"
 
+
+def path_problem():
+    """Why PATH could find a command this checkout holds, or None. Runs nothing."""
+    top = next((d for d in [HERE, *HERE.parents] if (d / ".git").exists()), None)
+    path = os.environ.get("PATH")
+    if not path:
+        return "PATH is not set"
+    for entry in path.split(os.pathsep):
+        if entry == "":
+            return "PATH has an empty entry, which means the working directory"
+        if not os.path.isabs(entry):
+            return f"PATH entry {entry!r} is relative"
+        if top is None:
+            continue
+        # By file identity, for the entry, its real path and every ancestor of
+        # either: a case variant or a firmlink of the checkout counts too.
+        for start in (pathlib.Path(entry), pathlib.Path(os.path.realpath(entry))):
+            for d in (start, *start.parents):
+                if str(d) != "/" and d.exists() and os.path.samefile(d, top):
+                    return f"PATH entry {entry!r} is inside the checkout at {top}"
+    return None
+
+
+# PATH before any command runs: the key and the owner's token pass through gh
+# and security, and a PATH with an empty entry (":$PATH"), a relative entry, or
+# one inside this checkout under any spelling would find whatever the checkout
+# holds under their names. Refused rather than cleaned: a dirty PATH may
+# already have chosen the python running this. Then everything runs from /.
+_problem = path_problem()
+if _problem:
+    sys.exit(f"create-app.py: refusing: {_problem}, so a command could be found in this checkout. Run it with a clean PATH:\n"
+             f"  env -i HOME=\"$HOME\" PATH=/opt/homebrew/bin:/usr/bin:/bin /opt/homebrew/bin/python3 -I -S {HERE / 'create-app.py'} ...")
+os.chdir("/")
+
 # Where each identity's private key may go. An identity that is not listed is
 # refused. "file": ~/.config/mm-agent/<name>/private-key.pem, readable by every
 # agent session on the machine, which is acceptable for the identities agents
@@ -169,14 +203,8 @@ if custody == "environment":
 # from the repository provenance.sh fetched, never from this checkout's
 # objects, which anything that can write under .git can forge. Not from the
 # file either, which could change after the check.
-# PATH keeps only absolute entries outside this checkout, bash is found there
-# and run from /: an empty PATH entry (":$PATH") or one inside the checkout
-# would otherwise find whatever the checkout holds under the name "bash".
-CHECKOUT = HERE.parent.parent
-SAFE_PATH = os.pathsep.join(
-    e for e in os.environ.get("PATH", os.defpath).split(os.pathsep)
-    if os.path.isabs(e) and CHECKOUT != pathlib.Path(e).resolve() and CHECKOUT not in pathlib.Path(e).resolve().parents
-) or "/usr/bin:/bin"
+# bash is found through the PATH vetted at the top, and run from /.
+SAFE_PATH = os.environ["PATH"]  # vetted at the top
 PROVENANCE_ENV = {"PATH": SAFE_PATH}
 if os.environ.get("TMPDIR"):
     PROVENANCE_ENV["TMPDIR"] = os.environ["TMPDIR"]

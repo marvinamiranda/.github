@@ -100,6 +100,29 @@
 # bash 3.2 or later.
 set -euo pipefail
 
+# PATH first, before any command runs (builtins only up to the `cd /`): --apply
+# acts with the owner's token, and a PATH with an empty entry (":$PATH", from
+# an unset variable), a relative entry, or one inside this checkout under any
+# spelling would find whatever the checkout holds under a command's name
+# (gh, jq, mktemp, ...). Refused rather than cleaned: a dirty PATH may already
+# have chosen the bash running this. Run it as README "Bootstrap" shows:
+#   env -i HOME="$HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin /bin/bash governance/bootstrap.sh ...
+# Then everything runs from /, so no command works in the checkout.
+SELF="${BASH_SOURCE[0]}"
+[[ "$SELF" == */* ]] || SELF="./$SELF"
+SCRIPT_DIR="$(cd "${SELF%/*}" && pwd -P)"
+SELF="$SCRIPT_DIR/${SELF##*/}"
+# shellcheck source=identity/provenance.sh disable=SC1091
+. "$SCRIPT_DIR/identity/provenance.sh"
+path_problem="$(mm_provenance_path_problem "$(mm_provenance_top "$SCRIPT_DIR" || true)")"
+if [[ -n "$path_problem" ]]; then
+  echo "Refusing: $path_problem, so a command could be found in this checkout. Run it with a clean PATH:" >&2
+  echo "  env -i HOME=\"\$HOME\" PATH=/opt/homebrew/bin:/usr/bin:/bin /bin/bash $SELF ..." >&2
+  exit 1
+fi
+ORIG_PWD="$PWD"
+cd /
+
 ORG="marvinamiranda"
 APPLY=0
 REPOS=()
@@ -131,7 +154,7 @@ ACTIONS_APP_ID=15368
 
 usage() {
   # The comment block at the top of this file, whatever its length.
-  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"
   cat <<EOF
 
 Options:
@@ -169,7 +192,7 @@ while [[ $# -gt 0 ]]; do
     --probe) PROBE=1 ;;
     --project-title) [[ $# -ge 2 ]] || { echo "--project-title needs a value" >&2; exit 2; }; PROJECT_TITLE="$2"; shift ;;
     --reviewer-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--reviewer-app-id needs a numeric id" >&2; exit 2; }; REVIEWER_APP_ID="$2"; shift ;;
-    --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$2" && pwd)"; shift ;;
+    --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$ORIG_PWD" && cd "$2" && pwd)"; shift ;;
     --strict-up-to-date) STRICT_UP_TO_DATE=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -281,15 +304,13 @@ elif [[ -n "$CONFIG_DIR" ]]; then
 else
   info "Product config: each repo's .github/governance/ on $CONFIG_REF"
 fi
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Provenance: --apply runs only from a commit that is on this repository's
 # test as GitHub has it now, read from its canonical URL (never from whatever
 # `origin` points at), with no uncommitted changes. A commit that only exists
 # in this clone, or on a pull request branch, could hold a bypass nobody
 # reviewed. Checked before any gh call. The rule is identity/provenance.sh,
 # which create-app.py runs too.
-# shellcheck source=identity/provenance.sh disable=SC1091
-. "$SCRIPT_DIR/identity/provenance.sh"
+# (identity/provenance.sh was sourced at the top.)
 mm_provenance "$SCRIPT_DIR" "$WORK"
 [[ -z "$PROVENANCE_HEAD" ]] || info "Running from $ORG/$SELF_REPO commit $PROVENANCE_HEAD"
 [[ -n "$PROVENANCE_PROBLEM" ]] || info "That commit is on $ORG/$SELF_REPO test (read now: ${PROVENANCE_TEST:0:12})."

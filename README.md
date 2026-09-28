@@ -166,7 +166,24 @@ node governance/areas-check.js <product checkout> [git-ref]
 
 ## Identities (DELIVERY §9, Appendix A)
 
-Organisation GitHub Apps, created once by the owner:
+Organisation GitHub Apps, created once by the owner.
+
+**Run it from a fresh clone at a merged SHA, with a clean environment.** The
+examples below show the arguments; the command line is always
+
+```bash
+env -i HOME="$HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin /opt/homebrew/bin/python3 -I -S governance/identity/create-app.py <name> ...
+```
+
+(add `GH_TOKEN=<the day's token>` after `env -i` for `--to-environment`).
+`create-app.py` refuses, before it runs any command, a `PATH` with an empty
+entry (`":$PATH"`, from an unset variable), a relative entry (such as a
+literal `~/...`), or an entry that is this checkout under any spelling (a
+letter-case variant, the `/System/Volumes/Data` firmlink), because `gh` and
+`security` would then be looked up in the checkout while they hold the owner's
+token or the key. It refuses rather than cleans: a dirty `PATH` may already
+have chosen the `python3` running it, which is why the interpreter is named by
+its absolute path. Every command then runs from `/`.
 
 ```bash
 python3 -I -S governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
@@ -524,8 +541,21 @@ which deletes any runner it did not create.
 
 ## Bootstrap
 
-Run it **from a merged commit**: check this repository out by the SHA of a
-commit on its `test`. `--apply` refuses anything else. It refuses a commit
+Run it **from a fresh clone at a merged SHA, with a clean environment**:
+
+```bash
+env -i HOME="$HOME" GH_TOKEN=<the day's token> PATH=/opt/homebrew/bin:/usr/bin:/bin /bin/bash governance/bootstrap.sh ...
+```
+
+The examples below show only the arguments. `bootstrap.sh` refuses, before
+it runs any command, a `PATH` with an empty or relative entry, or an entry
+that is this checkout under any spelling, since `gh`, `jq` or `mktemp` would
+then be looked up in the checkout while it holds the owner's token. It refuses
+rather than cleans, because a dirty `PATH` may already have chosen the `bash`
+running it. Every command then runs from `/`.
+
+Check this repository out by the SHA of a commit on its `test`. `--apply`
+refuses anything else. It refuses a commit
 that is not on `test` as GitHub has it now, read from
 `https://github.com/marvinamiranda/.github.git` and never from `origin`. It
 also refuses a checkout with uncommitted changes, and files outside a git

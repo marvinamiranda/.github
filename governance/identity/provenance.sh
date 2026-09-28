@@ -77,18 +77,49 @@ MM_PROVENANCE_REPO="marvinamiranda/.github"
 MM_PROVENANCE_URL="https://github.com/$MM_PROVENANCE_REPO.git"
 MM_PROVENANCE_WRAP=() # never taken from the environment
 
+# Is <path> the checkout at <top>, or inside it, under any spelling? Compared
+# by file identity (-ef), for <path>, its physical form and every ancestor of
+# either, so a case variant or a firmlink (/System/Volumes/Data/...) of the
+# checkout counts too. Builtins only.
+mm_provenance_inside() {
+  local d real
+  real="$(cd "$1" 2>/dev/null && pwd -P)" || real="$1"
+  for d in "$1" "$real"; do
+    while [[ -n "$d" && "$d" != / ]]; do
+      [[ ! "$d" -ef "$2" ]] || return 0
+      d="${d%/*}"
+    done
+  done
+  return 1
+}
+
+# Why the caller's PATH could find a command the checkout at <top> holds (an
+# empty entry, a relative one, or one at or inside the checkout), or nothing.
+# <top> may be empty when there is no checkout. Builtins only: the entry
+# points call it before running any command at all.
+mm_provenance_path_problem() {
+  local entry
+  local -a entries=()
+  if [[ -z "${PATH:-}" ]]; then printf 'PATH is empty'; return 0; fi
+  [[ "$PATH" != :* && "$PATH" != *: && "$PATH" != *::* ]] || { printf 'PATH has an empty entry, which means the working directory'; return 0; }
+  IFS=: read -r -a entries <<<"$PATH"
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    if [[ "$entry" != /* ]]; then printf "PATH entry '%s' is relative" "$entry"; return 0; fi
+    if [[ -n "${1:-}" ]] && mm_provenance_inside "$entry" "$1"; then printf "PATH entry '%s' is inside the checkout at %s" "$entry" "$1"; return 0; fi
+  done
+  return 0
+}
+
 # The caller's PATH with its empty and relative entries dropped, and, given the
-# checkout's top <top>, every entry at or under it. Builtins only.
+# checkout's top <top>, every entry at or under it (by identity, as above).
+# Builtins only.
 mm_provenance_safe_path() {
-  local entry real out=""
+  local entry out=""
   local -a entries=()
   IFS=: read -r -a entries <<<"$PATH"
   for entry in ${entries[@]+"${entries[@]}"}; do
     [[ "$entry" == /* ]] || continue
-    if [[ -n "${1:-}" ]]; then
-      real="$(cd "$entry" 2>/dev/null && pwd -P)" || real="$entry"
-      if [[ "$real" == "$1" || "$real" == "$1"/* || "$entry" == "$1" || "$entry" == "$1"/* ]]; then continue; fi
-    fi
+    if [[ -n "${1:-}" ]] && mm_provenance_inside "$entry" "$1"; then continue; fi
     out="${out:+$out:}$entry"
   done
   printf '%s' "${out:-/usr/bin:/bin}"

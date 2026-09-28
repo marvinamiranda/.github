@@ -37,6 +37,10 @@ const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
 const { forgePackParent, forgeLooseObject, BACKDATED } = require('./object-forge');
 
+// The PATH every child gets after its own directories: the absolute entries
+// of this process's, since bootstrap.sh and create-app.py refuse an empty or
+// relative entry (a developer's PATH can hold one, such as a literal ~/...).
+const SYS_PATH = (process.env.PATH || '').split(':').filter((e) => e.startsWith('/')).join(':');
 const IDENTITY_SRC = process.env.IDENTITY_DIR
   ? path.resolve(process.env.IDENTITY_DIR)
   : path.join(__dirname, '..', 'identity');
@@ -169,7 +173,7 @@ const { privateKey } = crypto.generateKeyPairSync('rsa', {
 });
 
 // ---------------------------------------------- the checkout and its test ----
-const gitEnv = { PATH: process.env.PATH, HOME: gitHome, GIT_CONFIG_NOSYSTEM: '1', LANG: 'C' };
+const gitEnv = { PATH: SYS_PATH, HOME: gitHome, GIT_CONFIG_NOSYSTEM: '1', LANG: 'C' };
 const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.com',
   '-c', 'commit.gpgsign=false', ...a], { stdio: 'pipe', env: gitEnv }).toString().trim();
 fs.mkdirSync(IDENTITY, { recursive: true });
@@ -277,7 +281,7 @@ function writeReviewerFixture() {
 function env(extra = {}) {
   return {
     HOME: home,
-    PATH: [stubBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':'),
+    PATH: [stubBin, realBin, path.dirname(process.execPath), SYS_PATH].join(':'),
     TMPDIR: root,
     LANG: 'C',
     GIT_CONFIG_NOSYSTEM: '1',
@@ -363,7 +367,7 @@ function zshOrSkip(what) {
   const linkedBin = path.join(root, 'linked-bin');
   fs.mkdirSync(linkedBin);
   fs.symlinkSync(agentShim, path.join(linkedBin, 'gh'));
-  const discovery = agentEnv({ PATH: [stubBin, linkedBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':') });
+  const discovery = agentEnv({ PATH: [stubBin, linkedBin, realBin, path.dirname(process.execPath), SYS_PATH].join(':') });
   const printed = discovery.stdout;
   const discoveredPath = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
   ok('agent-env skips an external PATH symlink whose target is inside mm-agent',
@@ -870,7 +874,7 @@ function zshOrSkip(what) {
   const SHORT = '. ~/.config/mm-agent/mm-agent/env'; // exactly as the README shows it
   const LONG = (script) => `eval "$(${script} mm-agent || echo false)"`;
   const ENV_FILE = path.join(DIR, 'env');
-  const snapshot = { PATH: [brewBin, stubBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':'), GH_PACKAGES_TOKEN: OWNER };
+  const snapshot = { PATH: [brewBin, stubBin, realBin, path.dirname(process.execPath), SYS_PATH].join(':'), GH_PACKAGES_TOKEN: OWNER };
   const shells = [['bash', BASH], ['zsh', 'zsh']];
   const inShell = (bin, script) => spawnSync(bin, ['-c', script], { env: env(snapshot), encoding: 'utf8', cwd: root });
   const reachedOwner = (r) => lines(brewLog).length > 0 || (r.stdout + r.stderr).includes(OWNER);
@@ -1305,7 +1309,7 @@ finally:
       encoding: 'utf8',
       timeout: 60000,
       env: {
-        PATH: [cBin, process.env.PATH].join(':'),
+        PATH: [cBin, SYS_PATH].join(':'),
         HOME: cHome,
         TMPDIR: cTmp,
         LANG: 'C',
@@ -1451,7 +1455,7 @@ finally:
     // A target no fixture knows: should a mutant get past every earlier check,
     // the preflight refuses before the real browser or port 8765 is touched.
     return spawnSync(python, [...pyFlags, CREATE_APP, 'mm-checks', '--to-environment', '--repo', 'no-such-repo'], { encoding: 'utf8', timeout: 30000, input: '',
-      env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
+      env: { PATH: [cBin, SYS_PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
         FAKE_GH_LOG: cGhLog, FAKE_GH_FIXTURES: cFixtures, GIT_CONFIG_NOSYSTEM: '1', ...extraEnv } });
   }
   let iso = createApp(args, { pyFlags: [] });
@@ -1476,7 +1480,7 @@ finally:
   git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
   git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
   const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8',
-    env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, GIT_CONFIG_NOSYSTEM: '1',
+    env: { PATH: [cBin, SYS_PATH].join(':'), HOME: cHome, GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${cEvil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
   ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call (so the cases below can fail)',
     control.stdout.startsWith(git(cSrc, 'rev-parse', 'HEAD')), control.stdout + control.stderr);
@@ -1691,21 +1695,33 @@ finally:
     drill.status === 0 && forgedPosted && JSON.stringify(forgedPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
     `${cTail(drill)} posted=${forgedPosted && JSON.stringify(forgedPosted.manifest.default_permissions)}`);
 
-  // A planted bash at the checkout's root (outside governance/, so no content
-  // check sees it), found through an empty PATH entry with the root as the
-  // working directory, or through the root on PATH: never run, and so never
-  // handed the owner's token (miranda-infrastructure#616 review).
-  const plantedBash = path.join(cSrc, 'bash');
-  const bashRan = path.join(root, 'checks-bash-ran.log');
-  fs.writeFileSync(plantedBash, `#!/bin/sh\necho "token=\${GH_TOKEN-unset}" >> ${JSON.stringify(bashRan)}\nexit 1\n`, { mode: 0o755 });
-  for (const [what, entries] of [['an empty PATH entry', ['']], ['the checkout\'s root on PATH', [cSrc]]]) {
-    fs.rmSync(bashRan, { force: true });
-    drill = createApp(args, { cwd: cSrc, extraEnv: { PATH: [...entries, cBin, process.env.PATH].join(':') } });
-    ok(`a bash planted at the checkout's root, found through ${what}, never runs provenance.sh: it completes, and the plant never ran`,
-      drill.status === 0 && !fs.existsSync(bashRan), `${cTail(drill)} ran=${readOr(bashRan).trim()}`);
+  // The entry point refuses a PATH that could find a command in the checkout,
+  // before it runs any (review of #27 at 8a9fd87): gh gets the owner's token,
+  // and gh or security the key on stdin. Commands planted at the checkout's
+  // root (outside governance/, so no content check sees them), run from there.
+  const entryRan = path.join(root, 'checks-entry-ran.log');
+  const entryPlants = ['gh', 'security', 'bash', 'git', 'env', 'osascript', 'open'];
+  for (const n of entryPlants) {
+    fs.writeFileSync(path.join(cSrc, n), `#!/bin/sh\necho "${n} token=\${GH_TOKEN-unset}" >> ${JSON.stringify(entryRan)}\ncat >/dev/null\nexit 1\n`, { mode: 0o755 });
   }
-  fs.rmSync(plantedBash, { force: true });
-  fs.rmSync(bashRan, { force: true });
+  for (const [what, entry] of [['an empty entry', ''], ['a relative entry', 'governance'], ['the checkout itself', cSrc],
+    ['the checkout under another letter case', cSrc.toUpperCase()], ['the checkout through the /System/Volumes/Data firmlink', `/System/Volumes/Data${fs.realpathSync(cSrc)}`]]) {
+    if (entry.startsWith('/') && entry !== cSrc && !fs.existsSync(entry)) {
+      console.log(`ok - # SKIP create-app.py and ${what}: no such alias on this filesystem`);
+      continue;
+    }
+    fs.rmSync(entryRan, { force: true });
+    drill = createApp(args, { cwd: cSrc, extraEnv: { PATH: [entry, cBin, SYS_PATH].join(':') } });
+    ok(`create-app.py refuses a PATH with ${what} before running anything: nothing planted at the checkout's root runs, no gh call, no page`,
+      drill.status !== 0 && /refusing: PATH/.test(drill.stderr) && !fs.existsSync(entryRan) && drill.gh.length === 0 && !drill.opened,
+      `${cTail(drill)} ran=${readOr(entryRan).trim()} gh=${drill.gh.length}`);
+  }
+  fs.rmSync(entryRan, { force: true });
+  drill = createApp(args, { cwd: cSrc });
+  ok('with a clean PATH, run from the checkout\'s root, create-app.py completes and nothing planted there runs',
+    drill.status === 0 && !fs.existsSync(entryRan), `${cTail(drill)} ran=${readOr(entryRan).trim()}`);
+  for (const n of entryPlants) fs.rmSync(path.join(cSrc, n), { force: true });
+  fs.rmSync(entryRan, { force: true });
 
   // ---- test is read with nothing from the environment but PATH ----
   const envLog = path.join(cBin, 'canonical-read-env.log');
@@ -1726,7 +1742,7 @@ finally:
   git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
   git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
   fs.writeFileSync(sysConfig, `[url "${cEvil}"]\n\tinsteadOf = ${CANONICAL}\n`);
-  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome } });
+  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [cBin, SYS_PATH].join(':'), HOME: cHome } });
   drill = createApp(args);
   fs.rmSync(sysConfig, { force: true });
   ok('control: a planted system gitconfig does redirect the canonical URL for an ordinary git call',
