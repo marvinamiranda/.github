@@ -18,7 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
-const { forgePackParent } = require('./object-forge');
+const { forgePackParent, forgeLooseObject } = require('./object-forge');
 
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
@@ -409,6 +409,23 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
     r = bootstrap(['--no-rulesets', '--apply'], { where: co });
     ok('--apply ignores a replaced pack making test descend from the unmerged commit it runs from: refused, before any gh call',
       r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+    // A forged tree object: HEAD's governance/ tree filed as one listing an
+    // edited bootstrap.sh, with the index agreeing, so git status is clean and
+    // plain git reads the edit as committed.
+    const forged = checkout('head');
+    const sub = gitIn(forged, 'rev-parse', 'HEAD:governance');
+    fs.appendFileSync(forged.script, '# edited, not committed\n');
+    gitIn(forged, 'add', 'governance/bootstrap.sh');
+    const evilSub = gitIn(forged, 'write-tree', '--prefix=governance/');
+    const raw = execFileSync('git', ['-C', forged.work, 'cat-file', 'tree', evilSub]);
+    forgeLooseObject(forged.work, sub, 'tree', raw);
+    const treeFooled = gitIn(forged, 'status', '--porcelain') === ''
+      && gitIn(forged, 'rev-parse', 'HEAD:governance/bootstrap.sh') === gitIn(forged, 'hash-object', 'governance/bootstrap.sh');
+    ok('control: the forged tree makes plain git read the edited bootstrap.sh as committed, with git status clean', treeFooled, '');
+    r = bootstrap(['--no-rulesets', '--apply'], { where: forged });
+    ok('--apply ignores a forged tree object dressing an edited bootstrap.sh as committed: refused, before any gh call',
+      r.status !== 0 && /bootstrap\.sh differs from its commit/.test(r.stderr) && r.calls.length === 0, tail(r));
   }
 
   // test is read with nothing from the environment but PATH.

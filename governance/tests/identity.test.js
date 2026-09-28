@@ -9,9 +9,11 @@
 //
 // The scripts run from a throwaway git checkout, because agent-env.sh refuses
 // one whose scripts differ from its HEAD and warns when HEAD is not on
-// marvinamiranda/.github test. That repository is a local bare one here: the
-// fake HOME's ~/.gitconfig points https://github.com/marvinamiranda/.github.git
-// at it (url.<bare>.insteadOf), so its `test` is whatever a case says.
+// marvinamiranda/.github test. That repository is a local bare one here,
+// reached through a stub `git` first on PATH that serves
+// https://github.com/marvinamiranda/.github.git from it (agent-env.sh fetches
+// test with a clean configuration, so no insteadOf could), so its `test` is
+// whatever a case says.
 //
 // The fake HOME also holds zsh startup files shaped like the owner's: a
 // .zprofile and a .zshrc that put a directory holding another "real" gh first
@@ -38,7 +40,7 @@ const { forgePackParent, forgeLooseObject } = require('./object-forge');
 const IDENTITY_SRC = process.env.IDENTITY_DIR
   ? path.resolve(process.env.IDENTITY_DIR)
   : path.join(__dirname, '..', 'identity');
-const SCRIPTS = ['agent-env.sh', 'gh-shim.sh', 'app-token.sh'];
+const SCRIPTS = ['agent-env.sh', 'gh-shim.sh', 'app-token.sh', 'provenance.sh'];
 const NAME = 'mm-agent';
 const SLUG = 'fake-agent';
 const ORG = 'marvinamiranda';
@@ -148,6 +150,15 @@ fi
 echo "brew gh ran: $*"
 `, { mode: 0o755 });
 
+// git: the real one, except that the canonical URL is served by the local
+// bare repository standing in for GitHub.
+const AGENT_REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+fs.writeFileSync(path.join(stubBin, 'git'), `#!/usr/bin/env bash
+args=()
+for a in "$@"; do if [ "$a" = ${JSON.stringify(CANONICAL)} ]; then args+=(${JSON.stringify(canon)}); else args+=("$a"); fi; done
+exec ${JSON.stringify(AGENT_REAL_GIT)} "\${args[@]}"
+`, { mode: 0o755 });
+
 if (process.env.IDENTITY_BASH) fs.symlinkSync(path.resolve(process.env.IDENTITY_BASH), path.join(stubBin, 'bash'));
 const BASH = process.env.IDENTITY_BASH ? path.resolve(process.env.IDENTITY_BASH) : 'bash';
 
@@ -219,14 +230,13 @@ function ownerShellFiles() {
   w('.zlogin', 'export OWNER_ZLOGIN=l\n');
 }
 
-// A fresh HOME holding the App's id, slug and key, the owner's shell files and
-// the git configuration that maps the canonical URL; and a fresh GitHub.
+// A fresh HOME holding the App's id, slug and key and the owner's shell files;
+// and a fresh GitHub.
 function fresh({ installation = { status: 200, body: { id: 42 } }, tokens = ['ghs_T1'] } = {}) {
   fs.rmSync(home, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(DIR, 'app.json'), JSON.stringify({ id: 111, slug: SLUG, name: 'Fake Agent' }), { mode: 0o600 });
   fs.writeFileSync(path.join(DIR, 'private-key.pem'), privateKey, { mode: 0o600 });
-  fs.writeFileSync(path.join(home, '.gitconfig'), `[url "${canon}"]\n\tinsteadOf = ${CANONICAL}\n`);
   ownerShellFiles();
   world({ installation, tokens });
 }
@@ -808,6 +818,22 @@ function zshOrSkip(what) {
   ok('control: the replaced pack makes plain git believe the unmerged commit is on test', packFooled, '');
   ok('a replaced pack cannot make an unmerged commit "on test": the eval warns, and writes no env file',
     r.status === 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && !fs.existsSync(ENV_FILE), `status ${r.status} env=${fs.existsSync(ENV_FILE)} ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+
+  // "On test" is remembered as the blob ids that were checked, so a marker
+  // that names none (an older agent-env.sh's, or a planted one) is asked again.
+  fresh();
+  canonTest('head');
+  agentEnv();
+  const marker = path.join(SHIM(), 'on-test');
+  const named = readOr(marker).trim().split('\n');
+  fs.writeFileSync(marker, '');
+  fs.rmSync(ENV_FILE, { force: true });
+  canonTest('elsewhere');
+  r = agentEnv();
+  canonTest('head');
+  ok('the remembered answer names the three blobs that were checked', named.length === 3 && named.every((l) => /^[0-9a-f]{40}$/.test(l)), JSON.stringify(named));
+  ok('a remembered answer that names no blobs is not trusted: asked again, warned, no env file',
+    r.status === 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && !fs.existsSync(ENV_FILE), `status ${r.status} env=${fs.existsSync(ENV_FILE)}`);
 })();
 
 // ---------------------- two sessions from two commits keep their own shims ----
@@ -1218,6 +1244,9 @@ webbrowser.open = browser
 import subprocess
 _run = subprocess.run
 def run_then_touch(cmd, *a, **k):
+    if any(str(c).endswith('provenance.sh') for c in cmd):
+        given = k.get('env')
+        log(event='provenance-env', keys=sorted((os.environ if given is None else given).keys()))
     result = _run(cmd, *a, **k)
     after = os.environ.get('FAKE_AFTER_PROVENANCE')
     if after and any(str(c).endswith('provenance.sh') for c in cmd):
@@ -1380,6 +1409,9 @@ finally:
     /apps\/fake-checks\/installations\/new/.test(r.stdout) && /prod-a/.test(r.stdout) && /prod-b/.test(r.stdout) && !/All repositories/.test(r.stdout), r.stdout);
 
   // ---- provenance: only from a commit on marvinamiranda/.github test ----
+  const provEnv = r.events.find((e) => e.event === 'provenance-env');
+  ok('provenance.sh is run with PATH and TMPDIR only: never the owner\'s GH_TOKEN, nor anything else of the environment',
+    provEnv && provEnv.keys.every((k) => k === 'PATH' || k === 'TMPDIR') && provEnv.keys.includes('PATH'), JSON.stringify(provEnv && provEnv.keys));
   ok('it runs from a commit on test, and says which', /Running from marvinamiranda\/\.github commit [0-9a-f]{40}, which is on test/.test(r.stdout), r.stdout.split('\n')[0]);
   const provenanceRefused = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.gh.length === 0 && !fs.existsSync(checksDir());
   const merged = git(cSrc, 'rev-parse', 'HEAD');
