@@ -92,7 +92,6 @@ set -euo pipefail
 ROOT="$HOME/.config/mm-agent"
 LOCK="$ROOT/locked"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF_URL="https://github.com/marvinamiranda/.github.git"
 SENTINEL="mm-agent-sentinel-not-a-token"
 PACKAGES_TOKEN="$ROOT/packages-token"
 q() { printf '%q' "$1"; }
@@ -236,15 +235,8 @@ write_zdotdir() {
   done
 }
 
-# with_timeout <seconds> <command...>: perl's alarm survives its exec, so a hung
-# network call ends instead of hanging every tool command.
-with_timeout() {
-  local s="$1"
-  shift
-  if command -v perl >/dev/null 2>&1; then perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$s" "$@"; else "$@"; fi
-}
-
 PRINTED=0
+STAGE="" # the private directory the scripts are read into; removed on exit
 locked() {
   PRINTED=1
   local lock_body
@@ -274,6 +266,7 @@ EOF
 # Any failure not caught below still prints the environment with no identity.
 on_exit() {
   local rc=$?
+  [[ -z "$STAGE" ]] || rm -rf "$STAGE"
   if [[ $rc -ne 0 && $PRINTED -eq 0 ]]; then locked "stopped (exit $rc) before it finished"; fi
 }
 trap on_exit EXIT
@@ -304,23 +297,56 @@ DIR="$ROOT/$NAME"
 APP_JSON="$DIR/app.json"
 GH_DIR="$DIR/gh"
 [[ -r "$APP_JSON" ]] || locked "missing $APP_JSON; the owner creates it with python3 -I -S governance/identity/create-app.py $NAME"
-[[ -x "$HERE/gh-shim.sh" && -x "$HERE/app-token.sh" ]] || locked "gh-shim.sh or app-token.sh is missing beside $0"
+[[ -x "$HERE/gh-shim.sh" && -x "$HERE/app-token.sh" && -r "$HERE/provenance.sh" ]] || locked "gh-shim.sh, app-token.sh or provenance.sh is missing beside $0"
 [[ -n "$real_gh" ]] || locked "no gh on PATH"
 command -v git >/dev/null || locked "git is required"
 
-# The commit the copies come from. The three scripts here must be exactly its
-# blobs, compared by content, so a change hidden from `git status`
+# The commit the copies come from, and the copies. No git process runs in the
+# checkout: anything that can write under its .git could make git run code
+# there (core.fsmonitor, a clean filter) or read other content under a real
+# object id (provenance.sh says how). HEAD's id is read from its files; the
+# three scripts are read once, into a private directory, and those bytes are
+# what is hashed, compared with the commit, installed, and checked against
+# marvinamiranda/.github test below. So a change hidden from `git status`
 # (update-index --assume-unchanged) is refused too.
-top="$(git -C "$HERE" rev-parse --show-prefix 'HEAD^{commit}' 2>/dev/null)" \
+# shellcheck source=provenance.sh disable=SC1091
+. "$HERE/provenance.sh"
+top="$(mm_provenance_top "$HERE")" \
   || locked "$HERE is not in a git checkout with a commit, so what it would install cannot be tied to one. Eval from a clone of marvinamiranda/.github."
-{ read -r prefix; read -r commit; } <<<"$top" || true
-[[ "${commit:-}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || locked "cannot read the commit of the checkout at $HERE"
-want="$(git -C "$HERE" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
+# provenance.sh's commands (git, and its helpers) run from / with the
+# caller's PATH less any empty, relative or in-checkout entry.
+# shellcheck disable=SC2034 # read by provenance.sh's mm_run and mm_scratch_git
+MM_PROVENANCE_PATH="$(mm_provenance_safe_path "$top")"
+commit="$(mm_provenance_head "$top")" \
+  || locked "cannot read the commit of the checkout at $top from its HEAD file (a detached HEAD, or a branch in a loose or packed ref, is needed)"
+prefix="$(cd "$HERE" && pwd -P)" || locked "cannot resolve $HERE"
+prefix="${prefix#"$top"}"
+prefix="${prefix#/}"
+[[ -z "$prefix" ]] || prefix="$prefix/"
+STAGE="$(mktemp -d "$DIR/.stage.XXXXXX")" || locked "cannot make a private directory under $DIR"
+SCRIPT_FILES=(agent-env.sh gh-shim.sh app-token.sh)
+for f in "${SCRIPT_FILES[@]}"; do
+  mm_run cat -- "$HERE/$f" >"$STAGE/$f" 2>/dev/null || locked "cannot read the scripts in $HERE"
+done
+# Offline, the commit is the checkout's own: its objects, read through
+# alternates by a repository of this script's, which reads none of the
+# checkout's config, refs or hooks. Whether that commit is merged is decided
+# below, from test as fetched.
+{ IFS= read -r _gitdir && IFS= read -r common; } <<<"$(mm_provenance_gitdirs "$top")" || locked "cannot find the objects of the checkout at $top"
+local_repo="$STAGE/local.git"
+if ! mm_scratch_git "$local_repo" init --quiet --bare --template= >/dev/null 2>&1 \
+    || ! printf '%s\n' "$common/objects" >"$local_repo/objects/info/alternates"; then
+  locked "cannot make a private repository under $STAGE"
+fi
+have=""
+for f in "${SCRIPT_FILES[@]}"; do
+  blob="$(mm_scratch_git "$local_repo" hash-object --no-filters --stdin <"$STAGE/$f")" || locked "cannot hash the scripts in $HERE"
+  have="${have:+$have$'\n'}$blob"
+done
+want="$(mm_scratch_git "$local_repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
   || locked "agent-env.sh, gh-shim.sh and app-token.sh are not all in commit ${commit:0:12}. Eval from a clean checkout of a merged commit."
-have="$(git -C "$HERE" hash-object -- agent-env.sh gh-shim.sh app-token.sh)" || locked "cannot read the scripts in $HERE"
 [[ "$have" == "$want" ]] \
   || locked "a script in $HERE differs from commit ${commit:0:12} (uncommitted changes, or ones hidden from git status). Commit or discard them, or eval from a clean checkout of a merged commit."
-{ read -r _env_blob && read -r shim_blob && read -r token_blob; } <<<"$want" || locked "cannot read the blobs of commit ${commit:0:12}"
 
 SHIM="$DIR/shim/$commit"
 BIN="$SHIM/bin"
@@ -332,12 +358,14 @@ if ! { mkdir -p "$GH_DIR" "$BIN" "$LIBEXEC" && chmod 700 "$ROOT" "$DIR" "$DIR/sh
 fi
 [[ ! -e "$GH_DIR/hosts.yml" ]] || locked "$GH_DIR/hosts.yml exists: this directory must hold no login. Remove it."
 
-# The copies. A commit's are the same whichever checkout wrote them, so they
-# are written once, each whole before it is renamed into place.
-if [[ ! -x "$LIBEXEC/gh-shim.sh" || ! -x "$TOKEN_CMD" ]]; then
-  git -C "$HERE" cat-file blob "$shim_blob" | install_file "$LIBEXEC/gh-shim.sh" 700 || locked "cannot write $LIBEXEC/gh-shim.sh"
-  git -C "$HERE" cat-file blob "$token_blob" | install_file "$TOKEN_CMD" 700 || locked "cannot write $TOKEN_CMD"
-fi
+# The copies: the bytes read and checked above, never the checkout's objects.
+# Rewritten whenever they differ from what is there, each whole before it is
+# renamed into place.
+for f in gh-shim.sh app-token.sh; do
+  if [[ ! -x "$LIBEXEC/$f" ]] || ! cmp -s "$STAGE/$f" "$LIBEXEC/$f"; then
+    install_file "$LIBEXEC/$f" 700 <"$STAGE/$f" || locked "cannot write $LIBEXEC/$f"
+  fi
+done
 
 slug="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["slug"])' "$APP_JSON")" \
   || locked "no slug in $APP_JSON"
@@ -423,34 +451,41 @@ if [[ $current -eq 0 || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
 fi
 
 # Is that commit on marvinamiranda/.github test, as GitHub has it now (its
-# canonical URL, as bootstrap.sh reads it)? "Yes" is remembered for good: a
-# commit on test stays there, since the test-integration ruleset forbids force
-# pushes. Any other answer is asked again at the next eval, which is cheap
-# enough now that an eval only installs or refreshes the identity (the
-# per-command form sources the env file); each call has a time limit.
+# canonical URL, fetched as bootstrap.sh fetches it, into a repository of this
+# script's), and are the copies its files there? "Yes" is remembered, as the
+# three blob ids that were checked: a commit on test stays there, since the
+# test-integration ruleset forbids force pushes, and the copies are only
+# trusted while they are those blobs. Any other answer is asked again at the
+# next eval, which is cheap enough now that an eval only installs or refreshes
+# the identity (the per-command form sources the env file); the fetch has a
+# time limit.
 provenance() {
-  local test_sha
-  if ! test_sha="$(with_timeout 10 env GIT_TERMINAL_PROMPT=0 git -C "$HERE" ls-remote "$SELF_URL" refs/heads/test 2>/dev/null | cut -f1)" \
-      || [[ ! "$test_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  local repo="$STAGE/canonical.git" blobs
+  PROVENANCE_PROBLEM=""
+  PROVENANCE_TEST=""
+  MM_PROVENANCE_TIMEOUT=30 mm_provenance_fetch "$repo"
+  if [[ -n "$PROVENANCE_PROBLEM" ]]; then
     echo "marvinamiranda/.github test could not be read, so commit ${commit:0:12} is not known to be merged"
-  elif ! git -C "$HERE" cat-file -e "$test_sha^{commit}" 2>/dev/null \
-      && ! with_timeout 30 env GIT_TERMINAL_PROMPT=0 git -C "$HERE" fetch --quiet --no-tags --no-write-fetch-head "$SELF_URL" "$test_sha" 2>/dev/null; then
-    echo "marvinamiranda/.github test (${test_sha:0:12}) could not be fetched, so commit ${commit:0:12} is not known to be merged"
-  elif git -C "$HERE" merge-base --is-ancestor "$commit" "$test_sha"; then
-    : >"$SHIM/on-test" || true
+  elif ! mm_scratch_git "$repo" cat-file -e "$commit^{commit}" 2>/dev/null \
+      || ! mm_scratch_git "$repo" merge-base --is-ancestor "$commit" "$PROVENANCE_TEST" 2>/dev/null; then
+    echo "commit ${commit:0:12} is not on marvinamiranda/.github test (${PROVENANCE_TEST:0:12}): it has not been merged"
+  elif ! blobs="$(mm_scratch_git "$repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
+      || [[ "$blobs" != "$have" ]]; then
+    echo "the scripts in $HERE are not the ones commit ${commit:0:12} holds on marvinamiranda/.github test"
   else
-    echo "commit ${commit:0:12} is not on marvinamiranda/.github test (${test_sha:0:12}): it has not been merged"
+    printf '%s\n' "$have" | install_file "$SHIM/on-test" 600 || true
   fi
 }
+remembered() { [[ -f "$SHIM/on-test" && "$(cat "$SHIM/on-test" 2>/dev/null)" == "$have" ]]; }
 on_test=0
-if [[ -e "$SHIM/on-test" ]]; then
+if remembered; then
   on_test=1
 else
   why="$(provenance)" || why="the commit could not be checked against marvinamiranda/.github test"
   if [[ -n "$why" ]]; then
     echo "agent-env.sh: WARNING: $why. The gh shim and token helper this session runs come from it; eval from a checkout of a merged commit." >&2
   fi
-  if [[ -e "$SHIM/on-test" ]]; then on_test=1; fi
+  if remembered; then on_test=1; fi
 fi
 if [[ -n "${packages_hint:-}" ]]; then
   echo "agent-env.sh: GH_PACKAGES_TOKEN is not set: ${packages_hint}. Package restores from GitHub Packages will fail (README, \"Packages\")." >&2

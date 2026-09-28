@@ -51,7 +51,8 @@ Run it from a merged commit: check this repository out by the SHA of a commit
 on its test. It refuses anything else (governance/identity/provenance.sh, the
 rule bootstrap.sh --apply uses): a commit that is not on test as GitHub has it
 now, uncommitted changes under governance/ (by content), or files outside a
-git checkout. It reads the manifest from that commit, not from the file.
+git checkout. It reads the manifest from that commit as fetched from GitHub,
+not from the file or this checkout's objects.
 
 Afterwards, install the App from the URL it prints.
 """
@@ -63,7 +64,9 @@ import os
 import pathlib
 import re
 import secrets
+import shutil
 import subprocess
+import tempfile
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -72,6 +75,40 @@ ORG = "marvinamiranda"
 PORT = 8765
 HERE = pathlib.Path(__file__).resolve().parent
 AGENT_ROOT = pathlib.Path.home() / ".config" / "mm-agent"
+
+
+def path_problem():
+    """Why PATH could find a command this checkout holds, or None. Runs nothing."""
+    top = next((d for d in [HERE, *HERE.parents] if (d / ".git").exists()), None)
+    path = os.environ.get("PATH")
+    if not path:
+        return "PATH is not set"
+    for entry in path.split(os.pathsep):
+        if entry == "":
+            return "PATH has an empty entry, which means the working directory"
+        if not os.path.isabs(entry):
+            return f"PATH entry {entry!r} is relative"
+        if top is None:
+            continue
+        # By file identity, for the entry, its real path and every ancestor of
+        # either: a case variant or a firmlink of the checkout counts too.
+        for start in (pathlib.Path(entry), pathlib.Path(os.path.realpath(entry))):
+            for d in (start, *start.parents):
+                if str(d) != "/" and d.exists() and os.path.samefile(d, top):
+                    return f"PATH entry {entry!r} is inside the checkout at {top}"
+    return None
+
+
+# PATH before any command runs: the key and the owner's token pass through gh
+# and security, and a PATH with an empty entry (":$PATH"), a relative entry, or
+# one inside this checkout under any spelling would find whatever the checkout
+# holds under their names. Refused rather than cleaned: a dirty PATH may
+# already have chosen the python running this. Then everything runs from /.
+_problem = path_problem()
+if _problem:
+    sys.exit(f"create-app.py: refusing: {_problem}, so a command could be found in this checkout. Run it with a clean PATH:\n"
+             f"  env -i HOME=\"$HOME\" PATH=/opt/homebrew/bin:/usr/bin:/bin /opt/homebrew/bin/python3 -I -S {HERE / 'create-app.py'} ...")
+os.chdir("/")
 
 # Where each identity's private key may go. An identity that is not listed is
 # refused. "file": ~/.config/mm-agent/<name>/private-key.pem, readable by every
@@ -160,14 +197,32 @@ if custody == "environment":
 # bootstrap.sh --apply, from the same script: this checkout's HEAD must be on
 # marvinamiranda/.github test as GitHub has it now, with nothing uncommitted
 # under governance/. Checked before any gh call and before the page opens.
-provenance = subprocess.run(["bash", str(HERE / "provenance.sh")], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+# provenance.sh gets PATH and TMPDIR only: never the owner's token, so nothing
+# it starts could carry it off (it runs no git in the checkout either).
+# --emit: the manifest as test's history holds it at the checked commit, read
+# from the repository provenance.sh fetched, never from this checkout's
+# objects, which anything that can write under .git can forge. Not from the
+# file either, which could change after the check.
+# bash is found through the PATH vetted at the top, and run from /.
+SAFE_PATH = os.environ["PATH"]  # vetted at the top
+PROVENANCE_ENV = {"PATH": SAFE_PATH}
+if os.environ.get("TMPDIR"):
+    PROVENANCE_ENV["TMPDIR"] = os.environ["TMPDIR"]
+BASH = shutil.which("bash", path=SAFE_PATH)
+if not BASH:
+    refuse("no bash on PATH (outside this checkout) to run provenance.sh with.", 1)
+with tempfile.TemporaryDirectory(prefix="mm-create-app.") as held:
+    committed_file = pathlib.Path(held) / "manifest.json"
+    provenance = subprocess.run([BASH, str(HERE / "provenance.sh"), "--emit", f"identity/{manifest_path.name}", str(committed_file)],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, env=PROVENANCE_ENV, cwd="/")
+    committed = committed_file.read_text(encoding="utf-8") if provenance.returncode == 0 and committed_file.is_file() else None
 if provenance.returncode != 0:
     reason = provenance.stderr.strip() or f"provenance.sh exited {provenance.returncode}"
     refuse(f"{reason}. Check out a merged commit of {ORG}/.github by its SHA (git checkout <sha>) and run it from there.", 1)
 print(provenance.stdout.strip())
 checked = re.search(r"commit ([0-9a-f]{40})", provenance.stdout)
-if not checked:
-    refuse("provenance.sh did not name the commit it checked.", 1)
+if not checked or committed is None:
+    refuse("provenance.sh did not name the commit it checked, or hand over its manifest.", 1)
 CHECKED_COMMIT = checked.group(1)
 
 
@@ -280,19 +335,8 @@ if custody == "environment":
     for repo in repos:
         preflight(repo)
 
-# From the commit provenance.sh checked, not from the file, which could change
-# after the check. `cat-file blob` prints the committed bytes with no textconv
-# or filter; `<commit>:./<file>` is relative to HERE.
-# Replace refs, grafts and the commit-graph ignored, as in provenance.sh: a
-# refs/replace entry for the manifest's blob would otherwise hand cat-file other
-# bytes, and a forged commit-graph could give the commit another tree.
-committed = subprocess.run(["git", "-c", "core.commitGraph=false", "-c", "advice.graftFileDeprecated=false", "cat-file", "blob",
-                            f"{CHECKED_COMMIT}:./{manifest_path.name}"],
-                           cwd=HERE, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"})
-if committed.returncode != 0:
-    refuse(f"{manifest_path.name} is not in commit {CHECKED_COMMIT[:12]}: {committed.stderr.strip()}", 1)
-manifest = json.loads(committed.stdout)
+# The committed manifest provenance.sh handed over (above).
+manifest = json.loads(committed)
 manifest["redirect_url"] = f"http://127.0.0.1:{PORT}/callback"
 state = secrets.token_urlsafe(16)
 out_dir = AGENT_ROOT / name

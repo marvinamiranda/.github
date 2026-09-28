@@ -18,6 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
+const { forgePackParent, forgeLooseObject, BACKDATED } = require('./object-forge');
 
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
@@ -28,7 +29,13 @@ function withProvenance(governanceDir) {
   fs.mkdirSync(path.join(governanceDir, 'identity'), { recursive: true });
   fs.copyFileSync(PROVENANCE, path.join(governanceDir, 'identity', 'provenance.sh'));
 }
-const BASH = process.env.BOOTSTRAP_BASH ? path.resolve(process.env.BOOTSTRAP_BASH) : 'bash';
+// The PATH every child gets after its own directories: the absolute entries
+// of this process's, since bootstrap.sh and create-app.py refuse an empty or
+// relative entry (a developer's PATH can hold one, such as a literal ~/...).
+const SYS_PATH = (process.env.PATH || '').split(':').filter((e) => e.startsWith('/')).join(':');
+// An absolute path: a child's PATH may hold an empty entry here, and bash is not what is under test.
+const BASH = process.env.BOOTSTRAP_BASH ? path.resolve(process.env.BOOTSTRAP_BASH)
+  : spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
 const ORG = 'marvinamiranda';
 const CANONICAL = `https://github.com/${ORG}/.github.git`;
 const REVIEWER_ID = 5075711;
@@ -133,7 +140,7 @@ if [ -f ${JSON.stringify(path.join(stubBin, 'system-gitconfig'))} ]; then export
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
 if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(stubBin, 'fake-github'))})"; fi
-for a in "$@"; do if [ "$a" = ls-remote ]; then { env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; fi; done
+{ env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(stubBin, 'canonical-read-env.log'))}
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -213,15 +220,16 @@ function checkout(on) {
 }
 
 // `repo: false` runs without the default `--repo prod --config-dir <cfg>`.
-function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null, repo = true, extraEnv = {}, writable = false } = {}) {
+function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null, repo = true, extraEnv = {}, writable = false, cwd = undefined } = {}) {
   const co = where || checkout(on);
   fs.writeFileSync(fixtureFile, JSON.stringify(fx));
   fs.writeFileSync(ghLog, '');
   fs.writeFileSync(path.join(stubBin, 'fake-github'), co.canon);
   const r = spawnSync(BASH, [co.script, ...(repo ? ['--repo', 'prod', '--config-dir', cfg] : []), ...args], {
+    cwd,
     encoding: 'utf8',
     env: {
-      PATH: [stubBin, process.env.PATH].join(':'),
+      PATH: [stubBin, SYS_PATH].join(':'),
       HOME: path.join(root, 'home'),
       TMPDIR: root,
       LANG: 'C',
@@ -292,7 +300,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   execFileSync('git', ['init', '-q', '--bare', evil]);
   execFileSync('git', ['-C', planted.work, 'push', '-q', evil, 'HEAD:refs/heads/test']);
   fs.writeFileSync(path.join(stubBin, 'fake-github'), planted.canon);
-  const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, process.env.PATH].join(':'),
+  const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, SYS_PATH].join(':'),
     HOME: path.join(root, 'home'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
   ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call',
     control.stdout.startsWith(execFileSync('git', ['-C', planted.work, 'rev-parse', 'HEAD']).toString().trim()), control.stdout + control.stderr);
@@ -364,24 +372,167 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
       r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
   }
 
+  // marvinamiranda/.github#26: a process that can write under the checkout's
+  // .git. Nothing there may run (bootstrap.sh sources provenance.sh in the
+  // shell that holds the owner's token), and none of its objects may decide.
+  {
+    const TOKEN = 'github_pat_FAKEOWNERTOKEN';
+    for (const [what, plantIt, control] of [
+      ['a core.fsmonitor hook', (co, hook) => gitIn(co, 'config', 'core.fsmonitor', hook),
+        (co) => spawnSync('git', ['-C', co.work, 'status', '--porcelain'], { env: { ...process.env, GH_TOKEN: TOKEN } })],
+      ['a clean filter on every path', (co, hook) => {
+        gitIn(co, 'config', 'filter.mm.clean', `${hook}; cat`);
+        fs.mkdirSync(path.join(co.work, '.git', 'info'), { recursive: true });
+        fs.writeFileSync(path.join(co.work, '.git', 'info', 'attributes'), '* filter=mm\n');
+      }, (co) => spawnSync('git', ['-C', co.work, 'hash-object', '--', 'governance/bootstrap.sh'], { env: { ...process.env, GH_TOKEN: TOKEN } })],
+    ]) {
+      const co = checkout('head');
+      const ran = path.join(path.dirname(co.work), 'ran.log');
+      const hook = path.join(path.dirname(co.work), 'hook.sh');
+      fs.writeFileSync(hook, `#!/bin/sh\necho "token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\n`, { mode: 0o755 });
+      plantIt(co, hook);
+      control(co);
+      const fired = readLines(ran).some((l) => l === `token=${TOKEN}`);
+      fs.rmSync(ran, { force: true });
+      ok(`control: ${what} in the checkout's own config runs for plain git, with the caller's token`, fired, '');
+      r = bootstrap(['--no-rulesets', '--apply'], { where: co, extraEnv: { GH_TOKEN: TOKEN } });
+      ok(`--apply never runs ${what} from the checkout's own config: it runs, and the hook never did`,
+        r.status === 0 && /0 change\(s\) applied/.test(r.stdout) && !fs.existsSync(ran), `${tail(r)} ran=${readLines(ran).join(',')}`);
+    }
+
+    // A replaced pack whose index files a forged parent of test's tip, listing
+    // the unmerged HEAD as its parent: plain git then walks from test to HEAD.
+    const co = checkout('head');
+    const parent = gitIn(co, 'rev-parse', 'HEAD');
+    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'merged');
+    gitIn(co, 'push', '-q', co.canon, 'HEAD:refs/heads/test');
+    const tip = gitIn(co, 'rev-parse', 'HEAD');
+    // Dated before test's tip: git 2.55 stops an ancestry walk at commits
+    // older than the one it looks for, and the writer chooses this date.
+    execFileSync('git', ['-C', co.work, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'local, not on test'],
+      { env: { ...process.env, ...BACKDATED } });
+    const unmerged = gitIn(co, 'rev-parse', 'HEAD');
+    forgePackParent(co.work, parent, unmerged);
+    const fooled = spawnSync('git', ['-C', co.work, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', unmerged, tip],
+      { env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } }).status === 0;
+    ok('control: the replaced pack makes plain git believe the unmerged commit is on test', fooled, '');
+    r = bootstrap(['--no-rulesets', '--apply'], { where: co });
+    ok('--apply ignores a replaced pack making test descend from the unmerged commit it runs from: refused, before any gh call',
+      r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+
+    // A forged tree object: HEAD's governance/ tree filed as one listing an
+    // edited bootstrap.sh, with the index agreeing, so git status is clean and
+    // plain git reads the edit as committed.
+    const forged = checkout('head');
+    const sub = gitIn(forged, 'rev-parse', 'HEAD:governance');
+    fs.appendFileSync(forged.script, '# edited, not committed\n');
+    gitIn(forged, 'add', 'governance/bootstrap.sh');
+    const evilSub = gitIn(forged, 'write-tree', '--prefix=governance/');
+    const raw = execFileSync('git', ['-C', forged.work, 'cat-file', 'tree', evilSub]);
+    forgeLooseObject(forged.work, sub, 'tree', raw);
+    const treeFooled = gitIn(forged, 'status', '--porcelain') === ''
+      && gitIn(forged, 'rev-parse', 'HEAD:governance/bootstrap.sh') === gitIn(forged, 'hash-object', 'governance/bootstrap.sh');
+    ok('control: the forged tree makes plain git read the edited bootstrap.sh as committed, with git status clean', treeFooled, '');
+    r = bootstrap(['--no-rulesets', '--apply'], { where: forged });
+    ok('--apply ignores a forged tree object dressing an edited bootstrap.sh as committed: refused, before any gh call',
+      r.status !== 0 && /bootstrap\.sh differs from its commit/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+
+  // Nothing the checkout holds may run through a PATH lookup either
+  // (miranda-infrastructure#616 review): bootstrap.sh sources provenance.sh in
+  // the shell that exports the owner's token, and a PATH with an empty entry
+  // (":$PATH", from an unset variable) or an entry inside the checkout finds
+  // whatever the checkout holds under a command's name. The sourced rule runs
+  // with every name it or its older copy uses planted as an executable that
+  // records the token, in the checked directory, and then at the checkout's root.
+  {
+    const PLANTED = ['find', 'awk', 'sed', 'grep', 'head', 'tr', 'readlink', 'dirname', 'env', 'git', 'cat', 'mktemp', 'perl', 'rm', 'cut', 'sort'];
+    const REAL_BASH = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+    const TOKEN = 'github_pat_FAKEOWNERTOKEN';
+    for (const [what, where, expect, alias] of [
+      ['in the checked directory, with an empty PATH entry and that directory on PATH', ['governance', 'governance/identity'], /is not in its commit/],
+      ['at the checkout\'s root, with an empty PATH entry, the root on PATH, and the root as the working directory', ['.'], null],
+      ['at the checkout\'s root, with the root on PATH under another letter case', ['.'], null, (w) => w.toUpperCase()],
+      ['at the checkout\'s root, with the root on PATH through the /System/Volumes/Data firmlink', ['.'], null, (w) => `/System/Volumes/Data${fs.realpathSync(w)}`],
+    ]) {
+      const co = checkout('head');
+      if (alias && !fs.existsSync(alias(co.work))) {
+        console.log(`ok - # SKIP planted ${what}: no such alias on this filesystem`);
+        continue;
+      }
+      const ran = path.join(path.dirname(co.work), 'planted-ran.log');
+      for (const d of where) {
+        for (const n of PLANTED) {
+          fs.writeFileSync(path.join(co.work, d, n), `#!/bin/sh\necho "${n} token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\nexit 1\n`, { mode: 0o755 });
+        }
+      }
+      fs.writeFileSync(path.join(stubBin, 'fake-github'), co.canon);
+      const onPath = alias ? [alias(co.work)] : ['', ...where.map((d) => path.join(co.work, d))];
+      const x = spawnSync(REAL_BASH, ['-c', '. "$1"; mm_provenance "$2" "$3"; printf "PROBLEM=%s\\n" "$PROVENANCE_PROBLEM"',
+        '_', PROVENANCE, path.join(co.work, 'governance'), fs.mkdtempSync(path.join(root, 'sourced-'))], {
+        cwd: co.work, encoding: 'utf8',
+        env: { PATH: [...onPath, stubBin, SYS_PATH].join(':'), HOME: path.join(root, 'home'), GH_TOKEN: TOKEN, GIT_CONFIG_NOSYSTEM: '1', LANG: 'C' },
+      });
+      const problem = (/^PROBLEM=(.*)$/m.exec(x.stdout) || [])[1];
+      ok(`nothing planted ${what} runs while the sourced rule decides, and the token reaches none of it`,
+        readLines(ran).length === 0 && problem !== undefined && (expect ? expect.test(problem) : problem === ''),
+        `ran=${readLines(ran).join(',')} problem=${problem} ${x.stderr.trim().split('\n').slice(-1)}`);
+    }
+  }
+
+  // The entry point itself (review of #27 at 8a9fd87): bootstrap.sh holds the
+  // owner's token for its whole run, so it refuses a PATH that could find a
+  // command in the checkout before it runs any command at all: an empty or a
+  // relative entry, or the checkout under any spelling. Planted at the
+  // checkout's root, which no content check covers, and run from there.
+  {
+    const TOKEN = 'github_pat_FAKEOWNERTOKEN';
+    const PLANTED = ['gh', 'jq', 'mktemp', 'awk', 'dirname', 'cat', 'rm', 'git', 'env', 'sed', 'grep', 'find', 'perl', 'tr', 'head'];
+    const co = checkout('head');
+    const ran = path.join(path.dirname(co.work), 'entry-ran.log');
+    for (const n of PLANTED) {
+      fs.writeFileSync(path.join(co.work, n), `#!/bin/sh\necho "${n} token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\nexit 1\n`, { mode: 0o755 });
+    }
+    const upper = co.work.toUpperCase();
+    const firm = `/System/Volumes/Data${fs.realpathSync(co.work)}`;
+    const shapes = [['an empty entry', ''], ['a relative entry', 'governance'], ['the checkout itself', co.work],
+      ['the checkout under another letter case', upper], ['the checkout through the /System/Volumes/Data firmlink', firm]];
+    for (const [what, entry] of shapes) {
+      if (entry.startsWith('/') && entry !== co.work && !fs.existsSync(entry)) {
+        console.log(`ok - # SKIP ${what}: no such alias on this filesystem`);
+        continue;
+      }
+      fs.rmSync(ran, { force: true });
+      r = bootstrap(['--no-rulesets', '--apply'], { where: co, cwd: co.work, extraEnv: { GH_TOKEN: TOKEN, PATH: [entry, stubBin, SYS_PATH].join(':') } });
+      ok(`bootstrap.sh refuses a PATH with ${what} before running anything: nothing planted at the checkout's root runs, no gh call`,
+        r.status !== 0 && /Refusing: PATH/.test(r.stderr) && readLines(ran).length === 0 && r.calls.length === 0,
+        `${tail(r)} ran=${readLines(ran).join(',')}`);
+    }
+    fs.rmSync(ran, { force: true });
+    r = bootstrap(['--no-rulesets', '--apply'], { where: co, cwd: co.work, extraEnv: { GH_TOKEN: TOKEN } });
+    ok('with a clean PATH, run from the checkout\'s root, bootstrap.sh --apply completes and nothing planted there runs',
+      r.status === 0 && /0 change\(s\) applied/.test(r.stdout) && readLines(ran).length === 0, `${tail(r)} ran=${readLines(ran).join(',')}`);
+  }
+
   // test is read with nothing from the environment but PATH.
-  const envLog = path.join(stubBin, 'ls-remote-env.log');
+  const envLog = path.join(stubBin, 'canonical-read-env.log');
   fs.writeFileSync(envLog, '');
   const leaky = { HTTPS_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', ALL_PROXY: 'http://127.0.0.1:9', SSL_CERT_FILE: '/nonexistent/ca.pem',
-    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x' };
+    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x',
+    GH_TOKEN: 'github_pat_LEAKPROBE', GITHUB_TOKEN: 'github_pat_LEAKPROBE2' };
   r = bootstrap(['--no-rulesets'], { extraEnv: leaky });
   const seen = readLines(envLog);
   const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
-  ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
+  ok('the read of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
     r.status === 0 && seen.length >= 1 && leaked.length === 0, `${tail(r)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
-  ok('the ls-remote of test runs with GIT_TERMINAL_PROMPT=0', seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)),
+  ok('the read of test runs with GIT_TERMINAL_PROMPT=0', seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)),
     seen.map((l) => l.slice(-40)).join(' | '));
 
   // A planted system gitconfig redirecting test to the unmerged commit: ignored.
   const sysConfig = path.join(stubBin, 'system-gitconfig');
   fs.writeFileSync(sysConfig, `[url "${evil}"]\n\tinsteadOf = ${CANONICAL}\n`);
   fs.writeFileSync(path.join(stubBin, 'fake-github'), planted.canon);
-  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, process.env.PATH].join(':'), HOME: path.join(root, 'home') } });
+  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [stubBin, SYS_PATH].join(':'), HOME: path.join(root, 'home') } });
   r = bootstrap(['--no-rulesets', '--apply'], { where: planted });
   fs.rmSync(sysConfig, { force: true });
   ok('control: a planted system gitconfig does redirect the canonical URL for an ordinary git call',
@@ -599,7 +750,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   r = bootstrap(['--no-rulesets'], { extraEnv: { FAKE_GH_SCOPES: "'repo'" } });
   ok('a dry run never advises adding admin:org to the gh login', r.status === 0 && noRefresh(r), tail(r));
 
-  const help = spawnSync(BASH, [SCRIPT, '--help'], { encoding: 'utf8' });
+  const help = spawnSync(BASH, [SCRIPT, '--help'], { encoding: 'utf8', env: { ...process.env, PATH: SYS_PATH } });
   const text = help.stdout;
   ok('--help lists the fine-grained token\'s permissions for each step',
     help.status === 0 && /fine-grained/i.test(text) && /Issue Types: read and write/.test(text) && /Administration: read and write/.test(text)

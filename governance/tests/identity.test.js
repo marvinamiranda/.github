@@ -9,9 +9,11 @@
 //
 // The scripts run from a throwaway git checkout, because agent-env.sh refuses
 // one whose scripts differ from its HEAD and warns when HEAD is not on
-// marvinamiranda/.github test. That repository is a local bare one here: the
-// fake HOME's ~/.gitconfig points https://github.com/marvinamiranda/.github.git
-// at it (url.<bare>.insteadOf), so its `test` is whatever a case says.
+// marvinamiranda/.github test. That repository is a local bare one here,
+// reached through a stub `git` first on PATH that serves
+// https://github.com/marvinamiranda/.github.git from it (agent-env.sh fetches
+// test with a clean configuration, so no insteadOf could), so its `test` is
+// whatever a case says.
 //
 // The fake HOME also holds zsh startup files shaped like the owner's: a
 // .zprofile and a .zshrc that put a directory holding another "real" gh first
@@ -33,11 +35,16 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
+const { forgePackParent, forgeLooseObject, BACKDATED } = require('./object-forge');
 
+// The PATH every child gets after its own directories: the absolute entries
+// of this process's, since bootstrap.sh and create-app.py refuse an empty or
+// relative entry (a developer's PATH can hold one, such as a literal ~/...).
+const SYS_PATH = (process.env.PATH || '').split(':').filter((e) => e.startsWith('/')).join(':');
 const IDENTITY_SRC = process.env.IDENTITY_DIR
   ? path.resolve(process.env.IDENTITY_DIR)
   : path.join(__dirname, '..', 'identity');
-const SCRIPTS = ['agent-env.sh', 'gh-shim.sh', 'app-token.sh'];
+const SCRIPTS = ['agent-env.sh', 'gh-shim.sh', 'app-token.sh', 'provenance.sh'];
 const NAME = 'mm-agent';
 const SLUG = 'fake-agent';
 const ORG = 'marvinamiranda';
@@ -147,6 +154,15 @@ fi
 echo "brew gh ran: $*"
 `, { mode: 0o755 });
 
+// git: the real one, except that the canonical URL is served by the local
+// bare repository standing in for GitHub.
+const AGENT_REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+fs.writeFileSync(path.join(stubBin, 'git'), `#!/usr/bin/env bash
+args=()
+for a in "$@"; do if [ "$a" = ${JSON.stringify(CANONICAL)} ]; then args+=(${JSON.stringify(canon)}); else args+=("$a"); fi; done
+exec ${JSON.stringify(AGENT_REAL_GIT)} "\${args[@]}"
+`, { mode: 0o755 });
+
 if (process.env.IDENTITY_BASH) fs.symlinkSync(path.resolve(process.env.IDENTITY_BASH), path.join(stubBin, 'bash'));
 const BASH = process.env.IDENTITY_BASH ? path.resolve(process.env.IDENTITY_BASH) : 'bash';
 
@@ -157,7 +173,7 @@ const { privateKey } = crypto.generateKeyPairSync('rsa', {
 });
 
 // ---------------------------------------------- the checkout and its test ----
-const gitEnv = { PATH: process.env.PATH, HOME: gitHome, GIT_CONFIG_NOSYSTEM: '1', LANG: 'C' };
+const gitEnv = { PATH: SYS_PATH, HOME: gitHome, GIT_CONFIG_NOSYSTEM: '1', LANG: 'C' };
 const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.com',
   '-c', 'commit.gpgsign=false', ...a], { stdio: 'pipe', env: gitEnv }).toString().trim();
 fs.mkdirSync(IDENTITY, { recursive: true });
@@ -218,14 +234,13 @@ function ownerShellFiles() {
   w('.zlogin', 'export OWNER_ZLOGIN=l\n');
 }
 
-// A fresh HOME holding the App's id, slug and key, the owner's shell files and
-// the git configuration that maps the canonical URL; and a fresh GitHub.
+// A fresh HOME holding the App's id, slug and key and the owner's shell files;
+// and a fresh GitHub.
 function fresh({ installation = { status: 200, body: { id: 42 } }, tokens = ['ghs_T1'] } = {}) {
   fs.rmSync(home, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(DIR, 'app.json'), JSON.stringify({ id: 111, slug: SLUG, name: 'Fake Agent' }), { mode: 0o600 });
   fs.writeFileSync(path.join(DIR, 'private-key.pem'), privateKey, { mode: 0o600 });
-  fs.writeFileSync(path.join(home, '.gitconfig'), `[url "${canon}"]\n\tinsteadOf = ${CANONICAL}\n`);
   ownerShellFiles();
   world({ installation, tokens });
 }
@@ -266,7 +281,7 @@ function writeReviewerFixture() {
 function env(extra = {}) {
   return {
     HOME: home,
-    PATH: [stubBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':'),
+    PATH: [stubBin, realBin, path.dirname(process.execPath), SYS_PATH].join(':'),
     TMPDIR: root,
     LANG: 'C',
     GIT_CONFIG_NOSYSTEM: '1',
@@ -352,7 +367,7 @@ function zshOrSkip(what) {
   const linkedBin = path.join(root, 'linked-bin');
   fs.mkdirSync(linkedBin);
   fs.symlinkSync(agentShim, path.join(linkedBin, 'gh'));
-  const discovery = agentEnv({ PATH: [stubBin, linkedBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':') });
+  const discovery = agentEnv({ PATH: [stubBin, linkedBin, realBin, path.dirname(process.execPath), SYS_PATH].join(':') });
   const printed = discovery.stdout;
   const discoveredPath = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
   ok('agent-env skips an external PATH symlink whose target is inside mm-agent',
@@ -744,6 +759,88 @@ function zshOrSkip(what) {
   canonTest('head');
 })();
 
+// ------ marvinamiranda/.github#26: nothing under the checkout's .git decides ----
+// A process that can write under .git: its config must never run in an eval
+// (an agent shell's snapshot can carry the owner's token), the copies
+// installed must be the working files that were checked, and "on test" must
+// come from test as fetched, never from the checkout's objects.
+(function gitWriter() {
+  const ENV_FILE = path.join(DIR, 'env');
+  const ran = path.join(root, 'agent-hook-ran.log');
+  const hook = path.join(root, 'agent-hook.sh');
+  fs.writeFileSync(hook, `#!/bin/sh\necho "token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\n`, { mode: 0o755 });
+  const attributes = path.join(src, '.git', 'info', 'attributes');
+  fresh();
+  canonTest('head');
+  git(src, 'config', 'core.fsmonitor', hook);
+  git(src, 'config', 'filter.mm.clean', `${hook}; cat`);
+  fs.mkdirSync(path.dirname(attributes), { recursive: true });
+  fs.writeFileSync(attributes, '* filter=mm\n');
+  fs.rmSync(ran, { force: true });
+  spawnSync('git', ['-C', src, 'hash-object', '--', 'governance/identity/gh-shim.sh'], { env: { ...gitEnv, GH_TOKEN: OWNER } });
+  const fired = readOr(ran).includes(`token=${OWNER}`);
+  fs.rmSync(ran, { force: true });
+  let r = agentEnv({ GH_TOKEN: OWNER });
+  const after = readOr(ran);
+  git(src, 'config', '--unset', 'core.fsmonitor');
+  git(src, 'config', '--remove-section', 'filter.mm');
+  fs.rmSync(attributes, { force: true });
+  fs.rmSync(ran, { force: true });
+  ok('control: a clean filter in the checkout\'s own config runs for plain git, with the caller\'s token', fired, '');
+  ok('an eval never runs a clean filter or an fsmonitor hook from the checkout\'s own config, and still sets the identity',
+    r.status === 0 && after === '' && fs.existsSync(ENV_FILE), `status ${r.status} ran=${after.trim().split('\n').join(',')} ${r.stderr.trim().split('\n').slice(-1)}`);
+
+  // A forged object filed under gh-shim.sh's blob id.
+  fresh();
+  canonTest('head');
+  const shimBlob = git(src, 'rev-parse', 'HEAD:governance/identity/gh-shim.sh');
+  const passThrough = '#!/usr/bin/env bash\nREAL="$2"; shift 2; exec "$REAL" "$@"\n';
+  let restore = forgeLooseObject(src, shimBlob, 'blob', passThrough);
+  const blobFooled = spawnSync('git', ['-C', src, 'cat-file', 'blob', shimBlob], { env: gitEnv, encoding: 'utf8' }).stdout === passThrough;
+  r = agentEnv();
+  restore();
+  const installed = readOr(path.join(SHIM(), 'libexec', 'gh-shim.sh'), null);
+  ok('control: the forged object gives plain git other bytes for gh-shim.sh\'s blob', blobFooled, '');
+  ok('a forged object for gh-shim.sh\'s blob is not what is installed: the copy is the working file that was checked',
+    r.status === 0 && installed === fs.readFileSync(path.join(IDENTITY, 'gh-shim.sh'), 'utf8'), `status ${r.status} installed=${JSON.stringify((installed || '').slice(0, 60))}`);
+
+  // A replaced pack: the parent of test's tip filed as a forged commit whose
+  // parent is the unmerged HEAD.
+  fresh();
+  git(src, 'commit', '-q', '--allow-empty', '-m', 'merged');
+  canonTest('head');
+  const tip = git(src, 'rev-parse', 'HEAD');
+  execFileSync('git', ['-C', src, '-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'local, not on test'],
+    { env: { ...gitEnv, ...BACKDATED } }); // older than test's tip (object-forge.js)
+  const unmerged = git(src, 'rev-parse', 'HEAD');
+  restore = forgePackParent(src, COMMIT, unmerged);
+  const packFooled = spawnSync('git', ['-C', src, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', unmerged, tip],
+    { env: { ...gitEnv, GIT_NO_REPLACE_OBJECTS: '1' } }).status === 0;
+  r = agentEnv();
+  restore();
+  git(src, 'reset', '-q', '--hard', COMMIT);
+  canonTest('head');
+  ok('control: the replaced pack makes plain git believe the unmerged commit is on test', packFooled, '');
+  ok('a replaced pack cannot make an unmerged commit "on test": the eval warns, and writes no env file',
+    r.status === 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && !fs.existsSync(ENV_FILE), `status ${r.status} env=${fs.existsSync(ENV_FILE)} ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+
+  // "On test" is remembered as the blob ids that were checked, so a marker
+  // that names none (an older agent-env.sh's, or a planted one) is asked again.
+  fresh();
+  canonTest('head');
+  agentEnv();
+  const marker = path.join(SHIM(), 'on-test');
+  const named = readOr(marker).trim().split('\n');
+  fs.writeFileSync(marker, '');
+  fs.rmSync(ENV_FILE, { force: true });
+  canonTest('elsewhere');
+  r = agentEnv();
+  canonTest('head');
+  ok('the remembered answer names the three blobs that were checked', named.length === 3 && named.every((l) => /^[0-9a-f]{40}$/.test(l)), JSON.stringify(named));
+  ok('a remembered answer that names no blobs is not trusted: asked again, warned, no env file',
+    r.status === 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && !fs.existsSync(ENV_FILE), `status ${r.status} env=${fs.existsSync(ENV_FILE)}`);
+})();
+
 // ---------------------- two sessions from two commits keep their own shims ----
 (function isolation() {
   fresh();
@@ -777,7 +874,7 @@ function zshOrSkip(what) {
   const SHORT = '. ~/.config/mm-agent/mm-agent/env'; // exactly as the README shows it
   const LONG = (script) => `eval "$(${script} mm-agent || echo false)"`;
   const ENV_FILE = path.join(DIR, 'env');
-  const snapshot = { PATH: [brewBin, stubBin, realBin, path.dirname(process.execPath), process.env.PATH].join(':'), GH_PACKAGES_TOKEN: OWNER };
+  const snapshot = { PATH: [brewBin, stubBin, realBin, path.dirname(process.execPath), SYS_PATH].join(':'), GH_PACKAGES_TOKEN: OWNER };
   const shells = [['bash', BASH], ['zsh', 'zsh']];
   const inShell = (bin, script) => spawnSync(bin, ['-c', script], { env: env(snapshot), encoding: 'utf8', cwd: root });
   const reachedOwner = (r) => lines(brewLog).length > 0 || (r.stdout + r.stderr).includes(OWNER);
@@ -973,7 +1070,7 @@ if [ -f ${JSON.stringify(path.join(cBin, 'system-gitconfig'))} ]; then export GI
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
 if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(cBin, 'fake-github'))})"; fi
-for a in "$@"; do if [ "$a" = ls-remote ]; then { env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(cBin, 'ls-remote-env.log'))}; fi; done
+{ env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(cBin, 'canonical-read-env.log'))}
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -1152,6 +1249,9 @@ webbrowser.open = browser
 import subprocess
 _run = subprocess.run
 def run_then_touch(cmd, *a, **k):
+    if any(str(c).endswith('provenance.sh') for c in cmd):
+        given = k.get('env')
+        log(event='provenance-env', keys=sorted((os.environ if given is None else given).keys()))
     result = _run(cmd, *a, **k)
     after = os.environ.get('FAKE_AFTER_PROVENANCE')
     if after and any(str(c).endswith('provenance.sh') for c in cmd):
@@ -1193,7 +1293,7 @@ finally:
       name: m.name, owner: { login: ORG, type: 'Organization' }, permissions: m.default_permissions, events: m.default_events,
       client_secret: 'fake-client-secret', webhook_secret: null });
   }
-  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM } = {}) { // failKeychainAdd: false | true | 'silent'
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM, cwd = undefined } = {}) { // failKeychainAdd: false | true | 'silent'
     fs.rmSync(cHome, { recursive: true, force: true });
     fs.rmSync(cTmp, { recursive: true, force: true });
     fs.mkdirSync(cHome, { recursive: true });
@@ -1204,11 +1304,12 @@ finally:
     fs.writeFileSync(cFixtures, JSON.stringify(fx));
     for (const f of [cGhLog, cEvents]) fs.writeFileSync(f, '');
     const r = spawnSync('python3', [...pyFlags, harness, CREATE_APP, ...args], {
+      cwd,
       input: pem,
       encoding: 'utf8',
       timeout: 60000,
       env: {
-        PATH: [cBin, process.env.PATH].join(':'),
+        PATH: [cBin, SYS_PATH].join(':'),
         HOME: cHome,
         TMPDIR: cTmp,
         LANG: 'C',
@@ -1314,6 +1415,9 @@ finally:
     /apps\/fake-checks\/installations\/new/.test(r.stdout) && /prod-a/.test(r.stdout) && /prod-b/.test(r.stdout) && !/All repositories/.test(r.stdout), r.stdout);
 
   // ---- provenance: only from a commit on marvinamiranda/.github test ----
+  const provEnv = r.events.find((e) => e.event === 'provenance-env');
+  ok('provenance.sh is run with PATH and TMPDIR only: never the owner\'s GH_TOKEN, nor anything else of the environment',
+    provEnv && provEnv.keys.every((k) => k === 'PATH' || k === 'TMPDIR') && provEnv.keys.includes('PATH'), JSON.stringify(provEnv && provEnv.keys));
   ok('it runs from a commit on test, and says which', /Running from marvinamiranda\/\.github commit [0-9a-f]{40}, which is on test/.test(r.stdout), r.stdout.split('\n')[0]);
   const provenanceRefused = (x) => x.status !== 0 && !x.opened && x.converted === 0 && x.gh.length === 0 && !fs.existsSync(checksDir());
   const merged = git(cSrc, 'rev-parse', 'HEAD');
@@ -1351,7 +1455,7 @@ finally:
     // A target no fixture knows: should a mutant get past every earlier check,
     // the preflight refuses before the real browser or port 8765 is touched.
     return spawnSync(python, [...pyFlags, CREATE_APP, 'mm-checks', '--to-environment', '--repo', 'no-such-repo'], { encoding: 'utf8', timeout: 30000, input: '',
-      env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
+      env: { PATH: [cBin, SYS_PATH].join(':'), HOME: cHome, TMPDIR: cTmp, LANG: 'C', GH_TOKEN: 'github_pat_FAKEOWNERTOKEN',
         FAKE_GH_LOG: cGhLog, FAKE_GH_FIXTURES: cFixtures, GIT_CONFIG_NOSYSTEM: '1', ...extraEnv } });
   }
   let iso = createApp(args, { pyFlags: [] });
@@ -1376,7 +1480,7 @@ finally:
   git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
   git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
   const control = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8',
-    env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome, GIT_CONFIG_NOSYSTEM: '1',
+    env: { PATH: [cBin, SYS_PATH].join(':'), HOME: cHome, GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${cEvil}.insteadOf`, GIT_CONFIG_VALUE_0: CANONICAL } });
   ok('control: a planted insteadOf does redirect the canonical URL for an ordinary git call (so the cases below can fail)',
     control.stdout.startsWith(git(cSrc, 'rev-parse', 'HEAD')), control.stdout + control.stderr);
@@ -1530,17 +1634,107 @@ finally:
     graphPosted && JSON.stringify(graphPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
     `${cTail(drill)} posted=${graphPosted && JSON.stringify(graphPosted.manifest.default_permissions)}`);
 
+  // ---- marvinamiranda/.github#26: nothing under the checkout's .git runs or decides ----
+  // Config there must never execute (create-app.py holds the owner's token in
+  // its environment), and none of its objects may answer for test or for the
+  // manifest: a forged object is filed under a real id, and git trusts the id.
+  for (const [what, plantIt, unplant, control] of [
+    ['a core.fsmonitor hook', (hook) => git(cSrc, 'config', 'core.fsmonitor', hook), () => git(cSrc, 'config', '--unset', 'core.fsmonitor'),
+      () => spawnSync(REAL_GIT, ['-C', cSrc, 'status', '--porcelain'], { env: { ...gitEnv, GH_TOKEN: 'github_pat_FAKEOWNERTOKEN' } })],
+    ['a clean filter on every path', (hook) => {
+      git(cSrc, 'config', 'filter.mm.clean', `${hook}; cat`);
+      fs.writeFileSync(path.join(cSrc, '.git', 'info', 'attributes'), '* filter=mm\n');
+    }, () => {
+      git(cSrc, 'config', '--remove-section', 'filter.mm');
+      fs.rmSync(path.join(cSrc, '.git', 'info', 'attributes'), { force: true });
+    }, () => spawnSync(REAL_GIT, ['-C', cSrc, 'hash-object', '--', 'governance/identity/create-app.py'], { env: { ...gitEnv, GH_TOKEN: 'github_pat_FAKEOWNERTOKEN' } })],
+  ]) {
+    const ran = path.join(root, 'checks-hook-ran.log');
+    const hook = path.join(root, 'checks-hook.sh');
+    fs.writeFileSync(hook, `#!/bin/sh\necho "token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\n`, { mode: 0o755 });
+    fs.mkdirSync(path.join(cSrc, '.git', 'info'), { recursive: true });
+    plantIt(hook);
+    control();
+    const fired = readOr(ran).includes('token=github_pat_FAKEOWNERTOKEN');
+    fs.rmSync(ran, { force: true });
+    drill = createApp(args);
+    const after = readOr(ran);
+    unplant();
+    fs.rmSync(ran, { force: true });
+    ok(`control: ${what} in the checkout's own config runs for plain git, with the caller's token`, fired, '');
+    ok(`${what} in the checkout's own config never runs: create-app.py completes, and the hook never ran`,
+      drill.status === 0 && drill.converted === 1 && after === '', `${cTail(drill)} ran=${after.trim().split('\n').join(',')}`);
+  }
+  // A replaced pack: the parent of test's tip filed as a forged commit whose
+  // parent is the unmerged HEAD.
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'merged');
+  git(cSrc, 'push', '-q', '-f', cCanon, 'HEAD:refs/heads/test');
+  const packTip = git(cSrc, 'rev-parse', 'HEAD');
+  execFileSync('git', ['-C', cSrc, '-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'local, not on test'],
+    { env: { ...gitEnv, ...BACKDATED } }); // older than test's tip (object-forge.js)
+  const packUnmerged = git(cSrc, 'rev-parse', 'HEAD');
+  let restoreObjects = forgePackParent(cSrc, merged, packUnmerged);
+  const packFooled = spawnSync(REAL_GIT, ['-C', cSrc, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', packUnmerged, packTip],
+    { env: { ...gitEnv, GIT_NO_REPLACE_OBJECTS: '1' } }).status === 0;
+  drill = createApp(args);
+  restoreObjects();
+  git(cSrc, 'reset', '-q', '--hard', merged);
+  git(cSrc, 'push', '-q', '-f', cCanon, `${merged}:refs/heads/test`);
+  ok('control: the replaced pack makes plain git believe the unmerged commit is on test', packFooled, '');
+  ok('a replaced pack making test descend from an unmerged commit is ignored: refused', drill.status !== 0 && /not on marvinamiranda\/\.github test/.test(drill.stderr)
+    && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
+  // A forged loose object filed under the manifest's blob id: the working file
+  // still hashes to the real id, so only the bytes read back differ.
+  restoreObjects = forgeLooseObject(cSrc, blob, 'blob', widened);
+  const blobFooled = spawnSync(REAL_GIT, ['-C', cSrc, 'cat-file', 'blob', blob], { env: gitEnv, encoding: 'utf8' }).stdout === widened;
+  drill = createApp(args, { extraEnv: { FAKE_APP_AS_POSTED: '1' } });
+  restoreObjects();
+  const forgedPosted = drill.events.find((e) => e.event === 'form');
+  ok('control: the forged object gives plain git other bytes for the manifest\'s blob', blobFooled, '');
+  ok('a forged object for the manifest\'s blob is ignored: the page posts the committed manifest',
+    drill.status === 0 && forgedPosted && JSON.stringify(forgedPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
+    `${cTail(drill)} posted=${forgedPosted && JSON.stringify(forgedPosted.manifest.default_permissions)}`);
+
+  // The entry point refuses a PATH that could find a command in the checkout,
+  // before it runs any (review of #27 at 8a9fd87): gh gets the owner's token,
+  // and gh or security the key on stdin. Commands planted at the checkout's
+  // root (outside governance/, so no content check sees them), run from there.
+  const entryRan = path.join(root, 'checks-entry-ran.log');
+  const entryPlants = ['gh', 'security', 'bash', 'git', 'env', 'osascript', 'open'];
+  for (const n of entryPlants) {
+    fs.writeFileSync(path.join(cSrc, n), `#!/bin/sh\necho "${n} token=\${GH_TOKEN-unset}" >> ${JSON.stringify(entryRan)}\ncat >/dev/null\nexit 1\n`, { mode: 0o755 });
+  }
+  for (const [what, entry] of [['an empty entry', ''], ['a relative entry', 'governance'], ['the checkout itself', cSrc],
+    ['the checkout under another letter case', cSrc.toUpperCase()], ['the checkout through the /System/Volumes/Data firmlink', `/System/Volumes/Data${fs.realpathSync(cSrc)}`]]) {
+    if (entry.startsWith('/') && entry !== cSrc && !fs.existsSync(entry)) {
+      console.log(`ok - # SKIP create-app.py and ${what}: no such alias on this filesystem`);
+      continue;
+    }
+    fs.rmSync(entryRan, { force: true });
+    drill = createApp(args, { cwd: cSrc, extraEnv: { PATH: [entry, cBin, SYS_PATH].join(':') } });
+    ok(`create-app.py refuses a PATH with ${what} before running anything: nothing planted at the checkout's root runs, no gh call, no page`,
+      drill.status !== 0 && /refusing: PATH/.test(drill.stderr) && !fs.existsSync(entryRan) && drill.gh.length === 0 && !drill.opened,
+      `${cTail(drill)} ran=${readOr(entryRan).trim()} gh=${drill.gh.length}`);
+  }
+  fs.rmSync(entryRan, { force: true });
+  drill = createApp(args, { cwd: cSrc });
+  ok('with a clean PATH, run from the checkout\'s root, create-app.py completes and nothing planted there runs',
+    drill.status === 0 && !fs.existsSync(entryRan), `${cTail(drill)} ran=${readOr(entryRan).trim()}`);
+  for (const n of entryPlants) fs.rmSync(path.join(cSrc, n), { force: true });
+  fs.rmSync(entryRan, { force: true });
+
   // ---- test is read with nothing from the environment but PATH ----
-  const envLog = path.join(cBin, 'ls-remote-env.log');
+  const envLog = path.join(cBin, 'canonical-read-env.log');
   fs.writeFileSync(envLog, '');
   const leaky = { HTTPS_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', ALL_PROXY: 'http://127.0.0.1:9', SSL_CERT_FILE: '/nonexistent/ca.pem',
-    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x' };
+    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x',
+    GH_TOKEN: 'github_pat_LEAKPROBE', GITHUB_TOKEN: 'github_pat_LEAKPROBE2' };
   drill = createApp(args, { extraEnv: leaky });
   const seen = readOr(envLog).trim().split('\n').filter(Boolean);
   const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
-  ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
+  ok('the read of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
     drill.status === 0 && seen.length >= 1 && leaked.length === 0, `${cTail(drill)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
-  ok('the ls-remote of test runs with GIT_TERMINAL_PROMPT=0, so a private repository fails instead of prompting',
+  ok('the read of test runs with GIT_TERMINAL_PROMPT=0, so a private repository fails instead of prompting',
     seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)), seen.map((l) => l.slice(-40)).join(' | '));
 
   // ---- a planted system gitconfig cannot redirect test either ----
@@ -1548,7 +1742,7 @@ finally:
   git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
   git(cSrc, 'push', '-q', '-f', cEvil, 'HEAD:refs/heads/test');
   fs.writeFileSync(sysConfig, `[url "${cEvil}"]\n\tinsteadOf = ${CANONICAL}\n`);
-  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [cBin, process.env.PATH].join(':'), HOME: cHome } });
+  const sysControl = spawnSync('git', ['ls-remote', CANONICAL, 'refs/heads/test'], { encoding: 'utf8', env: { PATH: [cBin, SYS_PATH].join(':'), HOME: cHome } });
   drill = createApp(args);
   fs.rmSync(sysConfig, { force: true });
   ok('control: a planted system gitconfig does redirect the canonical URL for an ordinary git call',

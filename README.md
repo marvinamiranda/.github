@@ -166,7 +166,24 @@ node governance/areas-check.js <product checkout> [git-ref]
 
 ## Identities (DELIVERY §9, Appendix A)
 
-Organisation GitHub Apps, created once by the owner:
+Organisation GitHub Apps, created once by the owner.
+
+**Run it from a fresh clone at a merged SHA, with a clean environment.** The
+examples below show the arguments; the command line is always
+
+```bash
+env -i HOME="$HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin /opt/homebrew/bin/python3 -I -S governance/identity/create-app.py <name> ...
+```
+
+(add `GH_TOKEN=<the day's token>` after `env -i` for `--to-environment`).
+`create-app.py` refuses, before it runs any command, a `PATH` with an empty
+entry (`":$PATH"`, from an unset variable), a relative entry (such as a
+literal `~/...`), or an entry that is this checkout under any spelling (a
+letter-case variant, the `/System/Volumes/Data` firmlink), because `gh` and
+`security` would then be looked up in the checkout while they hold the owner's
+token or the key. It refuses rather than cleans: a dirty `PATH` may already
+have chosen the `python3` running it, which is why the interpreter is named by
+its absolute path. Every command then runs from `/`.
 
 ```bash
 python3 -I -S governance/identity/create-app.py mm-agent      # builds, opens and merges PRs into test
@@ -197,17 +214,26 @@ before any `gh` call or page. Only reviewed code handles an App's private key.
   and no global or system config is read. A `url.<x>.insteadOf` in any of
   them (or in the checkout's own `.git/config`), or a proxy with its own CA,
   could otherwise answer for the canonical URL with an unreviewed commit.
-- **Replace refs and grafts are ignored** by every git call in the check and
-  by the manifest read (`GIT_NO_REPLACE_OBJECTS=1`, `GIT_GRAFT_FILE=/dev/null`).
-  A `refs/replace/*` entry or a `.git/info/grafts` line in the checkout could
-  otherwise make an unmerged commit look like an ancestor of `test`, or hand
-  the manifest's blob other bytes.
-- **Uncommitted means by content**: every file under `governance/` must hash to
-  its blob in `HEAD`, so an edit hidden from `git status` with skip-worktree or
-  assume-unchanged is refused too, and untracked files count even when
-  `status.showUntrackedFiles=no` is configured. The manifest is then read from that commit
-  (`git cat-file blob <commit>:./<name>.manifest.json`), not from the file,
-  which could change after the check.
+- **Nothing under the checkout's `.git` decides, and nothing there runs.**
+  Only two things come from the checkout: `HEAD`'s commit id, read from the
+  files git keeps it in (no git process runs in the checkout), and the bytes
+  of the files under `governance/`. Anything that can write under `.git` could
+  otherwise make git run code there with the owner's token in its environment
+  (a `core.fsmonitor` hook, a clean filter), or give a real object id other
+  content (a replaced pack or loose object, a replace ref, a graft, a
+  commit-graph): git re-hashes an object only when it writes one. Every
+  decision is made in an empty bare repository the check creates in a private
+  scratch directory and fetches `test` into: whether `HEAD` is an ancestor of
+  `test`, and what `HEAD`'s files are.
+- **Uncommitted means by content**: every file of `HEAD`'s tree under
+  `governance/`, as that fetched repository holds it, must be on disk with
+  exactly its bytes (hashed with `--no-filters`), and nothing else may be
+  there. So an edit hidden from `git status` with skip-worktree or
+  assume-unchanged is refused too, and so is any untracked file, whatever the
+  checkout's config says. The manifest is then read from the fetched
+  repository at that commit, not from the file, which could change after the
+  check, and not from the checkout's objects. `provenance.sh` itself is run
+  with `PATH` and `TMPDIR` only, never the owner's token.
 - A merged commit that is not `test`'s tip runs, with a warning.
 - **The App GitHub creates is checked** before its key is used: owned by
   `marvinamiranda`, named as the manifest names it, with exactly the manifest's
@@ -264,8 +290,10 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
 
 - puts the identity's `gh` first on `PATH`: a launcher in
   `~/.config/mm-agent/<name>/shim/<commit>/bin/`, the only file there, for
-  copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`, taken from the
-  blobs of a commit. Which commit a shell runs depends on the form:
+  copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`: the working
+  files' bytes that were read once and checked against a commit, never what
+  the checkout's object store says. Which commit a shell runs depends on the
+  form:
   - the eval installs what the checkout's HEAD is at that moment and switches
     that shell to it. The shell keeps it when the checkout changes or goes
     away, until it evaluates again;
@@ -274,8 +302,12 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
     without touching it;
 - refuses a checkout whose three identity scripts differ from its HEAD commit
   (compared by content, so a change hidden from `git status` counts), and
-  warns when that commit is not on this repository's `test`. A commit found on
-  `test` is remembered; anything else is asked again at the next eval;
+  warns when that commit is not on this repository's `test`, or its scripts
+  there are not the ones read. It runs no git in the checkout (so nothing in
+  its config runs), and decides "on `test`" in a repository of its own that it
+  fetches `test` into, as `provenance.sh` does. The answer is remembered as the
+  three blob ids that were checked; anything else is asked again at the next
+  eval;
 - keeps that `gh` first in zsh, login or interactive, without editing the
   owner's files: `ZDOTDIR` points at startup files that source the owner's
   (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`, with `ZDOTDIR` set to
@@ -509,8 +541,21 @@ which deletes any runner it did not create.
 
 ## Bootstrap
 
-Run it **from a merged commit**: check this repository out by the SHA of a
-commit on its `test`. `--apply` refuses anything else. It refuses a commit
+Run it **from a fresh clone at a merged SHA, with a clean environment**:
+
+```bash
+env -i HOME="$HOME" GH_TOKEN=<the day's token> PATH=/opt/homebrew/bin:/usr/bin:/bin /bin/bash governance/bootstrap.sh ...
+```
+
+The examples below show only the arguments. `bootstrap.sh` refuses, before
+it runs any command, a `PATH` with an empty or relative entry, or an entry
+that is this checkout under any spelling, since `gh`, `jq` or `mktemp` would
+then be looked up in the checkout while it holds the owner's token. It refuses
+rather than cleans, because a dirty `PATH` may already have chosen the `bash`
+running it. Every command then runs from `/`.
+
+Check this repository out by the SHA of a commit on its `test`. `--apply`
+refuses anything else. It refuses a commit
 that is not on `test` as GitHub has it now, read from
 `https://github.com/marvinamiranda/.github.git` and never from `origin`. It
 also refuses a checkout with uncommitted changes, and files outside a git
