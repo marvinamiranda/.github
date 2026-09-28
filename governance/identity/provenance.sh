@@ -32,11 +32,16 @@
 # exact commit may use the ordinary configuration: it is asked for by SHA, so a
 # redirect can only fail to supply it.
 #
-# Every git call here ignores replace refs (refs/replace/*) and grafts
-# (.git/info/grafts): either can give any commit, tree or blob a different
-# history or content, so an unmerged commit could pass merge-base, or a file
-# its content check. Git reads both from the checkout, so a process that can
-# write there could plant them.
+# Every git call here ignores replace refs (refs/replace/*), grafts
+# (.git/info/grafts) and the commit-graph (.git/objects/info/commit-graph, and
+# a split chain under objects/info/commit-graphs/): any of them can give a
+# commit a different history, and the first two any tree or blob different
+# content, so an unmerged commit could pass merge-base, or a file its content
+# check. Git reads all three from under .git, where the content check never
+# looks, so a process that can write there could plant them. A forged
+# commit-graph is trusted for every commit merge-base walks to (it parses only
+# the two it is given from their objects): the parent of test's tip made to
+# list an unmerged commit as its parent makes that commit "on test".
 #
 # "Uncommitted changes" is judged by content, not by `git status` alone:
 # every file under the directory must hash to its blob in HEAD, so an edit
@@ -45,10 +50,10 @@
 MM_PROVENANCE_REPO="marvinamiranda/.github"
 MM_PROVENANCE_URL="https://github.com/$MM_PROVENANCE_REPO.git"
 
-# git, with replace refs and grafts ignored. The graft advice is silenced: git
-# prints it whenever it reads a graft file, /dev/null included.
+# git, with replace refs, grafts and the commit-graph ignored. The graft advice
+# is silenced: git prints it whenever it reads a graft file, /dev/null included.
 mm_git() {
-  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null git -c advice.graftFileDeprecated=false "$@"
+  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null git -c core.commitGraph=false -c advice.graftFileDeprecated=false "$@"
 }
 
 # The first file under $1 whose content is not its blob in HEAD, or nothing.
@@ -86,7 +91,7 @@ mm_provenance() {
     PROVENANCE_PROBLEM="this checkout has uncommitted changes: $hidden differs from its commit, though git status does not show it"
   elif ! PROVENANCE_TEST="$(cd / && env -i PATH="$PATH" \
         GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null \
-        GIT_TERMINAL_PROMPT=0 git ls-remote "$MM_PROVENANCE_URL" refs/heads/test 2>"$scratch/ls-remote.err" | cut -f1)" \
+        GIT_TERMINAL_PROMPT=0 git -c core.commitGraph=false ls-remote "$MM_PROVENANCE_URL" refs/heads/test 2>"$scratch/ls-remote.err" | cut -f1)" \
       || [[ ! "$PROVENANCE_TEST" =~ ^[0-9a-f]{40}$ ]]; then
     PROVENANCE_PROBLEM="$MM_PROVENANCE_REPO test could not be read from $MM_PROVENANCE_URL: $(tr '\n' ' ' <"$scratch/ls-remote.err")"
   elif ! mm_git -C "$dir" cat-file -e "$PROVENANCE_TEST^{commit}" 2>/dev/null \

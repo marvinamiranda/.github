@@ -17,6 +17,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { forgeCommitGraph } = require('./commit-graph-forge');
 
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
@@ -340,6 +341,26 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
     plantIt(co, merged, gitIn(co, 'rev-parse', 'HEAD'));
     r = bootstrap(['--no-rulesets', '--apply'], { where: co });
     ok(`--apply ignores ${what} grafting test onto the unmerged commit it runs from: refused, before any gh call`,
+      r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+
+  // A forged commit-graph: the parent A of test's tip T made to list the
+  // unmerged HEAD U as its only parent. Not T itself: merge-base parses the two
+  // commits it is given from their objects, and every commit it walks to (A)
+  // from the graph.
+  {
+    const co = checkout('head');
+    const parent = gitIn(co, 'rev-parse', 'HEAD');
+    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'merged');
+    gitIn(co, 'push', '-q', co.canon, 'HEAD:refs/heads/test');
+    const tip = gitIn(co, 'rev-parse', 'HEAD');
+    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+    const unmerged = gitIn(co, 'rev-parse', 'HEAD');
+    forgeCommitGraph(co.work, parent, { parent: unmerged });
+    const fooled = spawnSync('git', ['-C', co.work, 'merge-base', '--is-ancestor', unmerged, tip]).status === 0;
+    ok('control: the forged commit-graph makes plain git believe the unmerged commit is on test', fooled, '');
+    r = bootstrap(['--no-rulesets', '--apply'], { where: co });
+    ok('--apply ignores a forged commit-graph making test descend from the unmerged commit it runs from: refused, before any gh call',
       r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
   }
 

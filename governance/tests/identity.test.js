@@ -32,6 +32,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { forgeCommitGraph } = require('./commit-graph-forge');
 
 const IDENTITY_SRC = process.env.IDENTITY_DIR
   ? path.resolve(process.env.IDENTITY_DIR)
@@ -1481,6 +1482,24 @@ finally:
   fs.rmSync(graftFile, { force: true });
   ok('a .git/info/grafts entry grafting test onto an unmerged commit is ignored: refused', drill.status !== 0 && /not on marvinamiranda\/\.github test/.test(drill.stderr)
     && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
+  // A forged commit-graph (under .git, outside the content check): the parent
+  // of test's tip made to list the unmerged commit as its only parent. Not the
+  // tip itself: merge-base parses the two commits it is given from their
+  // objects, and every commit it walks to from the graph.
+  git(cSrc, 'reset', '-q', '--hard', merged);
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'merged');
+  git(cSrc, 'push', '-q', '-f', cCanon, 'HEAD:refs/heads/test');
+  const tip = git(cSrc, 'rev-parse', 'HEAD');
+  git(cSrc, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+  const graphUnmerged = git(cSrc, 'rev-parse', 'HEAD');
+  let graph = forgeCommitGraph(cSrc, merged, { parent: graphUnmerged });
+  const graphFooled = spawnSync(REAL_GIT, ['-C', cSrc, 'merge-base', '--is-ancestor', graphUnmerged, tip], { env: gitEnv }).status === 0;
+  drill = createApp(args);
+  fs.rmSync(graph, { force: true });
+  git(cSrc, 'push', '-q', '-f', cCanon, `${merged}:refs/heads/test`);
+  ok('control: the forged commit-graph makes plain git believe the unmerged commit is on test', graphFooled, '');
+  ok('a forged commit-graph making test descend from an unmerged commit is ignored: refused', drill.status !== 0 && /not on marvinamiranda\/\.github test/.test(drill.stderr)
+    && !drill.opened && drill.gh.length === 0, `${cTail(drill)} opened=${drill.opened}`);
   git(cSrc, 'reset', '-q', '--hard', merged);
   // The reviewer's drill: at a merged commit, a replace ref swaps the manifest's
   // blob for one asking administration: write. The committed bytes are what count.
@@ -1493,6 +1512,23 @@ finally:
   ok('a replace ref swapping the manifest\'s blob is ignored: the page posts the committed manifest',
     drillPosted && JSON.stringify(drillPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
     `${cTail(drill)} posted=${drillPosted && JSON.stringify(drillPosted.manifest.default_permissions)}`);
+  // The same through a forged commit-graph: the checked commit's root tree
+  // swapped for one holding the widened manifest.
+  const evilIndex = path.join(root, 'checks-evil-index');
+  const idx = { ...gitEnv, GIT_INDEX_FILE: evilIndex };
+  execFileSync('git', ['-C', cSrc, 'read-tree', merged], { env: idx });
+  execFileSync('git', ['-C', cSrc, 'update-index', '--cacheinfo', `100644,${evilBlob},governance/identity/mm-checks.manifest.json`], { env: idx });
+  const evilTree = execFileSync('git', ['-C', cSrc, 'write-tree'], { env: idx }).toString().trim();
+  fs.rmSync(evilIndex, { force: true });
+  graph = forgeCommitGraph(cSrc, merged, { tree: evilTree });
+  const treeFooled = git(cSrc, 'log', '-1', '--format=%T', merged) === evilTree;
+  drill = createApp(args, { extraEnv: { FAKE_APP_AS_POSTED: '1' } });
+  fs.rmSync(graph, { force: true });
+  const graphPosted = drill.events.find((e) => e.event === 'form');
+  ok('control: the forged commit-graph gives the checked commit another tree for plain git', treeFooled, '');
+  ok('a forged commit-graph swapping the checked commit\'s tree is ignored: the page posts the committed manifest',
+    graphPosted && JSON.stringify(graphPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
+    `${cTail(drill)} posted=${graphPosted && JSON.stringify(graphPosted.manifest.default_permissions)}`);
 
   // ---- test is read with nothing from the environment but PATH ----
   const envLog = path.join(cBin, 'ls-remote-env.log');

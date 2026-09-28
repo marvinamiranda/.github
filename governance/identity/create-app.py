@@ -283,9 +283,10 @@ if custody == "environment":
 # From the commit provenance.sh checked, not from the file, which could change
 # after the check. `cat-file blob` prints the committed bytes with no textconv
 # or filter; `<commit>:./<file>` is relative to HERE.
-# Replace refs and grafts ignored, as in provenance.sh: a refs/replace entry
-# for the manifest's blob would otherwise hand cat-file other bytes.
-committed = subprocess.run(["git", "-c", "advice.graftFileDeprecated=false", "cat-file", "blob",
+# Replace refs, grafts and the commit-graph ignored, as in provenance.sh: a
+# refs/replace entry for the manifest's blob would otherwise hand cat-file other
+# bytes, and a forged commit-graph could give the commit another tree.
+committed = subprocess.run(["git", "-c", "core.commitGraph=false", "-c", "advice.graftFileDeprecated=false", "cat-file", "blob",
                             f"{CHECKED_COMMIT}:./{manifest_path.name}"],
                            cwd=HERE, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"})
