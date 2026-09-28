@@ -51,7 +51,8 @@ Run it from a merged commit: check this repository out by the SHA of a commit
 on its test. It refuses anything else (governance/identity/provenance.sh, the
 rule bootstrap.sh --apply uses): a commit that is not on test as GitHub has it
 now, uncommitted changes under governance/ (by content), or files outside a
-git checkout. It reads the manifest from that commit, not from the file.
+git checkout. It reads the manifest from that commit as fetched from GitHub,
+not from the file or this checkout's objects.
 
 Afterwards, install the App from the URL it prints.
 """
@@ -64,6 +65,7 @@ import pathlib
 import re
 import secrets
 import subprocess
+import tempfile
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -160,14 +162,27 @@ if custody == "environment":
 # bootstrap.sh --apply, from the same script: this checkout's HEAD must be on
 # marvinamiranda/.github test as GitHub has it now, with nothing uncommitted
 # under governance/. Checked before any gh call and before the page opens.
-provenance = subprocess.run(["bash", str(HERE / "provenance.sh")], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+# provenance.sh gets PATH and TMPDIR only: never the owner's token, so nothing
+# it starts could carry it off (it runs no git in the checkout either).
+# --emit: the manifest as test's history holds it at the checked commit, read
+# from the repository provenance.sh fetched, never from this checkout's
+# objects, which anything that can write under .git can forge. Not from the
+# file either, which could change after the check.
+PROVENANCE_ENV = {"PATH": os.environ.get("PATH", os.defpath)}
+if os.environ.get("TMPDIR"):
+    PROVENANCE_ENV["TMPDIR"] = os.environ["TMPDIR"]
+with tempfile.TemporaryDirectory(prefix="mm-create-app.") as held:
+    committed_file = pathlib.Path(held) / "manifest.json"
+    provenance = subprocess.run(["bash", str(HERE / "provenance.sh"), "--emit", f"identity/{manifest_path.name}", str(committed_file)],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, env=PROVENANCE_ENV)
+    committed = committed_file.read_text(encoding="utf-8") if provenance.returncode == 0 and committed_file.is_file() else None
 if provenance.returncode != 0:
     reason = provenance.stderr.strip() or f"provenance.sh exited {provenance.returncode}"
     refuse(f"{reason}. Check out a merged commit of {ORG}/.github by its SHA (git checkout <sha>) and run it from there.", 1)
 print(provenance.stdout.strip())
 checked = re.search(r"commit ([0-9a-f]{40})", provenance.stdout)
-if not checked:
-    refuse("provenance.sh did not name the commit it checked.", 1)
+if not checked or committed is None:
+    refuse("provenance.sh did not name the commit it checked, or hand over its manifest.", 1)
 CHECKED_COMMIT = checked.group(1)
 
 
@@ -280,19 +295,8 @@ if custody == "environment":
     for repo in repos:
         preflight(repo)
 
-# From the commit provenance.sh checked, not from the file, which could change
-# after the check. `cat-file blob` prints the committed bytes with no textconv
-# or filter; `<commit>:./<file>` is relative to HERE.
-# Replace refs, grafts and the commit-graph ignored, as in provenance.sh: a
-# refs/replace entry for the manifest's blob would otherwise hand cat-file other
-# bytes, and a forged commit-graph could give the commit another tree.
-committed = subprocess.run(["git", "-c", "core.commitGraph=false", "-c", "advice.graftFileDeprecated=false", "cat-file", "blob",
-                            f"{CHECKED_COMMIT}:./{manifest_path.name}"],
-                           cwd=HERE, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"})
-if committed.returncode != 0:
-    refuse(f"{manifest_path.name} is not in commit {CHECKED_COMMIT[:12]}: {committed.stderr.strip()}", 1)
-manifest = json.loads(committed.stdout)
+# The committed manifest provenance.sh handed over (above).
+manifest = json.loads(committed)
 manifest["redirect_url"] = f"http://127.0.0.1:{PORT}/callback"
 state = secrets.token_urlsafe(16)
 out_dir = AGENT_ROOT / name

@@ -18,6 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { forgeCommitGraph } = require('./commit-graph-forge');
+const { forgePackParent } = require('./object-forge');
 
 const SCRIPT = process.env.BOOTSTRAP_SCRIPT
   ? path.resolve(process.env.BOOTSTRAP_SCRIPT)
@@ -133,7 +134,7 @@ if [ -f ${JSON.stringify(path.join(stubBin, 'system-gitconfig'))} ]; then export
 if [ $hit -eq 0 ]; then exec "$real" "$@"; fi
 url="$("$real" \${pre[@]+"\${pre[@]}"} ls-remote --get-url "$canonical")"
 if [ "$url" = "$canonical" ]; then url="$(cat ${JSON.stringify(path.join(stubBin, 'fake-github'))})"; fi
-for a in "$@"; do if [ "$a" = ls-remote ]; then { env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(stubBin, 'ls-remote-env.log'))}; fi; done
+{ env | sed 's/=.*//' | sort | tr '\\n' ' '; echo "GIT_TERMINAL_PROMPT_VALUE=\${GIT_TERMINAL_PROMPT-unset}"; } >> ${JSON.stringify(path.join(stubBin, 'canonical-read-env.log'))}
 args=()
 for a in "$@"; do if [ "$a" = "$canonical" ]; then args+=("$url"); else args+=("$a"); fi; done
 exec "$real" "\${args[@]}"
@@ -364,17 +365,64 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
       r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
   }
 
+  // marvinamiranda/.github#26: a process that can write under the checkout's
+  // .git. Nothing there may run (bootstrap.sh sources provenance.sh in the
+  // shell that holds the owner's token), and none of its objects may decide.
+  {
+    const TOKEN = 'github_pat_FAKEOWNERTOKEN';
+    for (const [what, plantIt, control] of [
+      ['a core.fsmonitor hook', (co, hook) => gitIn(co, 'config', 'core.fsmonitor', hook),
+        (co) => spawnSync('git', ['-C', co.work, 'status', '--porcelain'], { env: { ...process.env, GH_TOKEN: TOKEN } })],
+      ['a clean filter on every path', (co, hook) => {
+        gitIn(co, 'config', 'filter.mm.clean', `${hook}; cat`);
+        fs.mkdirSync(path.join(co.work, '.git', 'info'), { recursive: true });
+        fs.writeFileSync(path.join(co.work, '.git', 'info', 'attributes'), '* filter=mm\n');
+      }, (co) => spawnSync('git', ['-C', co.work, 'hash-object', '--', 'governance/bootstrap.sh'], { env: { ...process.env, GH_TOKEN: TOKEN } })],
+    ]) {
+      const co = checkout('head');
+      const ran = path.join(path.dirname(co.work), 'ran.log');
+      const hook = path.join(path.dirname(co.work), 'hook.sh');
+      fs.writeFileSync(hook, `#!/bin/sh\necho "token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\n`, { mode: 0o755 });
+      plantIt(co, hook);
+      control(co);
+      const fired = readLines(ran).some((l) => l === `token=${TOKEN}`);
+      fs.rmSync(ran, { force: true });
+      ok(`control: ${what} in the checkout's own config runs for plain git, with the caller's token`, fired, '');
+      r = bootstrap(['--no-rulesets', '--apply'], { where: co, extraEnv: { GH_TOKEN: TOKEN } });
+      ok(`--apply never runs ${what} from the checkout's own config: it runs, and the hook never did`,
+        r.status === 0 && /0 change\(s\) applied/.test(r.stdout) && !fs.existsSync(ran), `${tail(r)} ran=${readLines(ran).join(',')}`);
+    }
+
+    // A replaced pack whose index files a forged parent of test's tip, listing
+    // the unmerged HEAD as its parent: plain git then walks from test to HEAD.
+    const co = checkout('head');
+    const parent = gitIn(co, 'rev-parse', 'HEAD');
+    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'merged');
+    gitIn(co, 'push', '-q', co.canon, 'HEAD:refs/heads/test');
+    const tip = gitIn(co, 'rev-parse', 'HEAD');
+    gitIn(co, 'commit', '-q', '--allow-empty', '-m', 'local, not on test');
+    const unmerged = gitIn(co, 'rev-parse', 'HEAD');
+    forgePackParent(co.work, parent, unmerged);
+    const fooled = spawnSync('git', ['-C', co.work, '-c', 'core.commitGraph=false', 'merge-base', '--is-ancestor', unmerged, tip],
+      { env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } }).status === 0;
+    ok('control: the replaced pack makes plain git believe the unmerged commit is on test', fooled, '');
+    r = bootstrap(['--no-rulesets', '--apply'], { where: co });
+    ok('--apply ignores a replaced pack making test descend from the unmerged commit it runs from: refused, before any gh call',
+      r.status !== 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+
   // test is read with nothing from the environment but PATH.
-  const envLog = path.join(stubBin, 'ls-remote-env.log');
+  const envLog = path.join(stubBin, 'canonical-read-env.log');
   fs.writeFileSync(envLog, '');
   const leaky = { HTTPS_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', ALL_PROXY: 'http://127.0.0.1:9', SSL_CERT_FILE: '/nonexistent/ca.pem',
-    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x' };
+    SSL_CERT_DIR: '/nonexistent', CURL_CA_BUNDLE: '/nonexistent/ca.pem', GIT_SSL_NO_VERIFY: '1', MM_UNLISTED_PROBE: 'x',
+    GH_TOKEN: 'github_pat_LEAKPROBE', GITHUB_TOKEN: 'github_pat_LEAKPROBE2' };
   r = bootstrap(['--no-rulesets'], { extraEnv: leaky });
   const seen = readLines(envLog);
   const leaked = seen.flatMap((line) => Object.keys(leaky).filter((k) => line.split(' ').includes(k)));
-  ok('the ls-remote of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
+  ok('the read of test sees none of the proxy, CA or other variables of the environment (env -i, PATH only)',
     r.status === 0 && seen.length >= 1 && leaked.length === 0, `${tail(r)} lines=${seen.length} leaked=${[...new Set(leaked)]}`);
-  ok('the ls-remote of test runs with GIT_TERMINAL_PROMPT=0', seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)),
+  ok('the read of test runs with GIT_TERMINAL_PROMPT=0', seen.length >= 1 && seen.every((line) => / GIT_TERMINAL_PROMPT_VALUE=0$/.test(` ${line}`)),
     seen.map((l) => l.slice(-40)).join(' | '));
 
   // A planted system gitconfig redirecting test to the unmerged commit: ignored.
