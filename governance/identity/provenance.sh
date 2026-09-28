@@ -49,7 +49,17 @@
 #   - create-app.py reads the manifest from that repository (--emit), never
 #     from the checkout.
 #
-# Every git call runs under `env -i` with PATH alone: no GIT_DIR,
+# No command this file runs is found through the caller's PATH as given, and
+# none runs with its working directory in the checkout: bootstrap.sh sources
+# it in the shell that exports the owner's token, and a PATH with an empty
+# entry (":$PATH", from an unset variable), a relative entry, or an entry
+# inside the checkout would find whatever the checkout holds under a
+# command's name. MM_PROVENANCE_PATH is the caller's PATH with only its
+# absolute entries outside the checkout; every external command runs from /
+# under `env -i` with that PATH (mm_run, mm_scratch_git), and the rest is
+# bash builtins.
+#
+# Every git call runs under `env -i` with that PATH alone: no GIT_DIR,
 # GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS, no proxy (HTTPS_PROXY, ALL_PROXY),
 # no CA override (SSL_CERT_FILE, SSL_CERT_DIR, GIT_SSL_*), no token (GH_TOKEN,
 # GITHUB_TOKEN: the repository is public). No global or system config either
@@ -67,6 +77,29 @@ MM_PROVENANCE_REPO="marvinamiranda/.github"
 MM_PROVENANCE_URL="https://github.com/$MM_PROVENANCE_REPO.git"
 MM_PROVENANCE_WRAP=() # never taken from the environment
 
+# The caller's PATH with its empty and relative entries dropped, and, given the
+# checkout's top <top>, every entry at or under it. Builtins only.
+mm_provenance_safe_path() {
+  local entry real out=""
+  local -a entries=()
+  IFS=: read -r -a entries <<<"$PATH"
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    [[ "$entry" == /* ]] || continue
+    if [[ -n "${1:-}" ]]; then
+      real="$(cd "$entry" 2>/dev/null && pwd -P)" || real="$entry"
+      if [[ "$real" == "$1" || "$real" == "$1"/* || "$entry" == "$1" || "$entry" == "$1"/* ]]; then continue; fi
+    fi
+    out="${out:+$out:}$entry"
+  done
+  printf '%s' "${out:-/usr/bin:/bin}"
+}
+MM_PROVENANCE_PATH="$(mm_provenance_safe_path)" # refined once the checkout is known
+
+# <command...> from /, with an empty environment but MM_PROVENANCE_PATH.
+mm_run() {
+  (cd / && PATH="$MM_PROVENANCE_PATH" && exec env -i PATH="$MM_PROVENANCE_PATH" LC_ALL=C "$@")
+}
+
 # git in the repository <git dir> that provenance made: an empty environment
 # but PATH, no global or system config, run from /, no prompt, no replace refs,
 # grafts or commit-graph. MM_PROVENANCE_WRAP, when a caller sets it, is a
@@ -74,7 +107,7 @@ MM_PROVENANCE_WRAP=() # never taken from the environment
 mm_scratch_git() {
   local gitdir="$1"
   shift
-  (cd / && env -i PATH="$PATH" GIT_DIR="$gitdir" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  (cd / && PATH="$MM_PROVENANCE_PATH" && exec env -i PATH="$MM_PROVENANCE_PATH" GIT_DIR="$gitdir" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ATTR_NOSYSTEM=1 \
     ${MM_PROVENANCE_WRAP[@]+"${MM_PROVENANCE_WRAP[@]}"} git -c core.commitGraph=false -c advice.graftFileDeprecated=false "$@")
 }
@@ -92,7 +125,8 @@ mm_provenance_top() {
   d="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
   while [[ ! -e "$d/.git" ]]; do
     [[ "$d" != "/" && -n "$d" ]] || return 1
-    d="$(dirname "$d")"
+    d="${d%/*}"
+    [[ -n "$d" ]] || d=/
   done
   printf '%s' "$d"
 }
@@ -134,7 +168,10 @@ mm_provenance_head() {
   if [[ -f "$common/$ref" ]]; then
     sha="$(mm_provenance_line "$common/$ref")" || return 1
   elif [[ -f "$common/packed-refs" ]]; then
-    sha="$(awk -v r="$ref" '$2 == r && length($1) == 40 && $1 !~ /[^0-9a-f]/ { print $1; exit }' "$common/packed-refs")" || return 1
+    local id name
+    while IFS=' ' read -r id name; do
+      if [[ "$name" == "$ref" ]]; then sha="$id"; break; fi
+    done <"$common/packed-refs"
   fi
   [[ "$sha" =~ $re_sha ]] || return 1
   printf '%s' "$sha"
@@ -157,7 +194,7 @@ mm_provenance_changed() {
     printf '%s\n' "$rel" >>"$work/tracked"
     [[ "$type" == "blob" ]] || continue
     if [[ "$mode" == "120000" ]]; then
-      if [[ ! -L "$dir/$rel" ]] || [[ "$(readlink "$dir/$rel")" != "$(mm_scratch_git "$repo" cat-file blob "$sha")" ]]; then
+      if [[ ! -L "$dir/$rel" ]] || [[ "$(mm_run readlink "$dir/$rel")" != "$(mm_scratch_git "$repo" cat-file blob "$sha")" ]]; then
         printf '%s differs from its commit' "$path"
         return 0
       fi
@@ -169,18 +206,23 @@ mm_provenance_changed() {
       return 0
     fi
   done <"$work/tree"
-  # Anything else under <dir>: a name holding a line break cannot be listed
-  # line by line, so it is reported as such.
-  if ! (cd "$dir" && find . -path ./.git -prune -o ! -type d -print) >"$work/present" 2>/dev/null; then
+  # Anything else under <dir>, listed by absolute path from /: a name holding
+  # a line break cannot be listed line by line, so it is reported as such.
+  local present entry_path
+  if ! mm_run find "$dir" -path "$dir/.git" -prune -o ! -type d -print >"$work/present" 2>/dev/null; then
     printf 'the files under %s could not be listed' "$dir"
     return 0
   fi
-  if [[ -n "$(cd "$dir" && find . -path ./.git -prune -o -name "*"$'\n'"*" -print 2>/dev/null)" ]]; then
+  if [[ -n "$(mm_run find "$dir" -path "$dir/.git" -prune -o -name "*"$'\n'"*" -print 2>/dev/null)" ]]; then
     printf 'a file under %s has a line break in its name' "$dir"
     return 0
   fi
-  sed 's#^\./##' "$work/present" >"$work/present.rel"
-  rel="$(grep -Fxv -f "$work/tracked" "$work/present.rel" | head -n 1)" || true
+  : >"$work/present.rel"
+  while IFS= read -r entry_path; do
+    printf '%s\n' "${entry_path#"$dir/"}" >>"$work/present.rel"
+  done <"$work/present"
+  present="$(mm_run grep -Fxv -f "$work/tracked" "$work/present.rel")" || true
+  rel="${present%%$'\n'*}"
   if [[ -n "$rel" ]]; then
     printf '%s%s is not in its commit' "$prefix" "$rel"
   fi
@@ -194,17 +236,17 @@ mm_provenance_fetch() {
   local repo="$1" out re_sha='^[0-9a-f]{40}$'
   local -a MM_PROVENANCE_WRAP=()
   if ! out="$(mm_scratch_git "$repo" init --quiet --bare --template= 2>&1)"; then
-    PROVENANCE_PROBLEM="a scratch repository to check $MM_PROVENANCE_REPO test in could not be made: $(tr '\n' ' ' <<<"$out")"
+    PROVENANCE_PROBLEM="a scratch repository to check $MM_PROVENANCE_REPO test in could not be made: ${out//$'\n'/ }"
     return 0
   fi
-  if [[ "${MM_PROVENANCE_TIMEOUT:-}" =~ ^[1-9][0-9]{0,3}$ ]] && command -v perl >/dev/null 2>&1; then
+  if [[ "${MM_PROVENANCE_TIMEOUT:-}" =~ ^[1-9][0-9]{0,3}$ ]] && PATH="$MM_PROVENANCE_PATH" command -v perl >/dev/null 2>&1; then
     MM_PROVENANCE_WRAP=(perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$MM_PROVENANCE_TIMEOUT")
   fi
   if ! out="$(mm_scratch_git "$repo" fetch --quiet --no-tags "$MM_PROVENANCE_URL" "+refs/heads/test:refs/heads/test" 2>&1)" \
       || ! PROVENANCE_TEST="$(mm_scratch_git "$repo" rev-parse --verify --quiet 'refs/heads/test^{commit}' 2>/dev/null)" \
       || [[ ! "$PROVENANCE_TEST" =~ $re_sha ]]; then
     PROVENANCE_TEST=""
-    PROVENANCE_PROBLEM="$MM_PROVENANCE_REPO test could not be read from $MM_PROVENANCE_URL: $(tr '\n' ' ' <<<"$out")"
+    PROVENANCE_PROBLEM="$MM_PROVENANCE_REPO test could not be read from $MM_PROVENANCE_URL: ${out//$'\n'/ }"
   fi
   return 0
 }
@@ -221,6 +263,11 @@ mm_provenance() {
     return 0
   fi
   dir="$(cd "$dir" && pwd -P)"
+  MM_PROVENANCE_PATH="$(mm_provenance_safe_path "$top")"
+  if ! scratch="$(cd "$scratch" 2>/dev/null && pwd -P)"; then
+    PROVENANCE_PROBLEM="the scratch directory ${2} cannot be used"
+    return 0
+  fi
   prefix="${dir#"$top"}"
   prefix="${prefix#/}"
   [[ -z "$prefix" ]] || prefix="$prefix/"
@@ -259,7 +306,12 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     emit_path="$2"
     emit_to="$3"
   fi
-  governance="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  here="${BASH_SOURCE[0]%/*}"
+  [[ "$here" != "${BASH_SOURCE[0]}" ]] || here=.
+  governance="$(cd "$here/.." && pwd)"
+  # This process's own commands too: the caller's PATH, as for the rule.
+  if top="$(mm_provenance_top "$governance")"; then MM_PROVENANCE_PATH="$(mm_provenance_safe_path "$top")"; fi
+  PATH="$MM_PROVENANCE_PATH"
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/mm-provenance.XXXXXX")"
   trap 'rm -rf "$scratch"' EXIT
   mm_provenance "$governance" "$scratch"

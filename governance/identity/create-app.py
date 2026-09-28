@@ -64,6 +64,7 @@ import os
 import pathlib
 import re
 import secrets
+import shutil
 import subprocess
 import tempfile
 import urllib.parse
@@ -168,13 +169,24 @@ if custody == "environment":
 # from the repository provenance.sh fetched, never from this checkout's
 # objects, which anything that can write under .git can forge. Not from the
 # file either, which could change after the check.
-PROVENANCE_ENV = {"PATH": os.environ.get("PATH", os.defpath)}
+# PATH keeps only absolute entries outside this checkout, bash is found there
+# and run from /: an empty PATH entry (":$PATH") or one inside the checkout
+# would otherwise find whatever the checkout holds under the name "bash".
+CHECKOUT = HERE.parent.parent
+SAFE_PATH = os.pathsep.join(
+    e for e in os.environ.get("PATH", os.defpath).split(os.pathsep)
+    if os.path.isabs(e) and CHECKOUT != pathlib.Path(e).resolve() and CHECKOUT not in pathlib.Path(e).resolve().parents
+) or "/usr/bin:/bin"
+PROVENANCE_ENV = {"PATH": SAFE_PATH}
 if os.environ.get("TMPDIR"):
     PROVENANCE_ENV["TMPDIR"] = os.environ["TMPDIR"]
+BASH = shutil.which("bash", path=SAFE_PATH)
+if not BASH:
+    refuse("no bash on PATH (outside this checkout) to run provenance.sh with.", 1)
 with tempfile.TemporaryDirectory(prefix="mm-create-app.") as held:
     committed_file = pathlib.Path(held) / "manifest.json"
-    provenance = subprocess.run(["bash", str(HERE / "provenance.sh"), "--emit", f"identity/{manifest_path.name}", str(committed_file)],
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, env=PROVENANCE_ENV)
+    provenance = subprocess.run([BASH, str(HERE / "provenance.sh"), "--emit", f"identity/{manifest_path.name}", str(committed_file)],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, env=PROVENANCE_ENV, cwd="/")
     committed = committed_file.read_text(encoding="utf-8") if provenance.returncode == 0 and committed_file.is_file() else None
 if provenance.returncode != 0:
     reason = provenance.stderr.strip() or f"provenance.sh exited {provenance.returncode}"

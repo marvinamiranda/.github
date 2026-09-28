@@ -313,6 +313,10 @@ command -v git >/dev/null || locked "git is required"
 . "$HERE/provenance.sh"
 top="$(mm_provenance_top "$HERE")" \
   || locked "$HERE is not in a git checkout with a commit, so what it would install cannot be tied to one. Eval from a clone of marvinamiranda/.github."
+# provenance.sh's commands (git, and its helpers) run from / with the
+# caller's PATH less any empty, relative or in-checkout entry.
+# shellcheck disable=SC2034 # read by provenance.sh's mm_run and mm_scratch_git
+MM_PROVENANCE_PATH="$(mm_provenance_safe_path "$top")"
 commit="$(mm_provenance_head "$top")" \
   || locked "cannot read the commit of the checkout at $top from its HEAD file (a detached HEAD, or a branch in a loose or packed ref, is needed)"
 prefix="$(cd "$HERE" && pwd -P)" || locked "cannot resolve $HERE"
@@ -322,7 +326,7 @@ prefix="${prefix#/}"
 STAGE="$(mktemp -d "$DIR/.stage.XXXXXX")" || locked "cannot make a private directory under $DIR"
 SCRIPT_FILES=(agent-env.sh gh-shim.sh app-token.sh)
 for f in "${SCRIPT_FILES[@]}"; do
-  cat -- "$HERE/$f" >"$STAGE/$f" 2>/dev/null || locked "cannot read the scripts in $HERE"
+  mm_run cat -- "$HERE/$f" >"$STAGE/$f" 2>/dev/null || locked "cannot read the scripts in $HERE"
 done
 # Offline, the commit is the checkout's own: its objects, read through
 # alternates by a repository of this script's, which reads none of the

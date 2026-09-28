@@ -431,6 +431,42 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
       r.status !== 0 && /bootstrap\.sh differs from its commit/.test(r.stderr) && r.calls.length === 0, tail(r));
   }
 
+  // Nothing the checkout holds may run through a PATH lookup either
+  // (miranda-infrastructure#616 review): bootstrap.sh sources provenance.sh in
+  // the shell that exports the owner's token, and a PATH with an empty entry
+  // (":$PATH", from an unset variable) or an entry inside the checkout finds
+  // whatever the checkout holds under a command's name. The sourced rule runs
+  // with every name it or its older copy uses planted as an executable that
+  // records the token, in the checked directory, and then at the checkout's root.
+  {
+    const PLANTED = ['find', 'awk', 'sed', 'grep', 'head', 'tr', 'readlink', 'dirname', 'env', 'git', 'cat', 'mktemp', 'perl', 'rm', 'cut', 'sort'];
+    const REAL_BASH = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+    const TOKEN = 'github_pat_FAKEOWNERTOKEN';
+    for (const [what, where, expect] of [
+      ['in the checked directory, with an empty PATH entry and that directory on PATH', ['governance', 'governance/identity'], /is not in its commit/],
+      ['at the checkout\'s root, with an empty PATH entry, the root on PATH, and the root as the working directory', ['.'], null],
+    ]) {
+      const co = checkout('head');
+      const ran = path.join(path.dirname(co.work), 'planted-ran.log');
+      for (const d of where) {
+        for (const n of PLANTED) {
+          fs.writeFileSync(path.join(co.work, d, n), `#!/bin/sh\necho "${n} token=\${GH_TOKEN-unset}" >> ${JSON.stringify(ran)}\nexit 1\n`, { mode: 0o755 });
+        }
+      }
+      fs.writeFileSync(path.join(stubBin, 'fake-github'), co.canon);
+      const onPath = where.map((d) => path.join(co.work, d));
+      const x = spawnSync(REAL_BASH, ['-c', '. "$1"; mm_provenance "$2" "$3"; printf "PROBLEM=%s\\n" "$PROVENANCE_PROBLEM"',
+        '_', PROVENANCE, path.join(co.work, 'governance'), fs.mkdtempSync(path.join(root, 'sourced-'))], {
+        cwd: co.work, encoding: 'utf8',
+        env: { PATH: ['', ...onPath, stubBin, process.env.PATH].join(':'), HOME: path.join(root, 'home'), GH_TOKEN: TOKEN, GIT_CONFIG_NOSYSTEM: '1', LANG: 'C' },
+      });
+      const problem = (/^PROBLEM=(.*)$/m.exec(x.stdout) || [])[1];
+      ok(`nothing planted ${what} runs while the sourced rule decides, and the token reaches none of it`,
+        readLines(ran).length === 0 && problem !== undefined && (expect ? expect.test(problem) : problem === ''),
+        `ran=${readLines(ran).join(',')} problem=${problem} ${x.stderr.trim().split('\n').slice(-1)}`);
+    }
+  }
+
   // test is read with nothing from the environment but PATH.
   const envLog = path.join(stubBin, 'canonical-read-env.log');
   fs.writeFileSync(envLog, '');

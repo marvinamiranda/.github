@@ -1289,7 +1289,7 @@ finally:
       name: m.name, owner: { login: ORG, type: 'Organization' }, permissions: m.default_permissions, events: m.default_events,
       client_secret: 'fake-client-secret', webhook_secret: null });
   }
-  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM } = {}) { // failKeychainAdd: false | true | 'silent'
+  function createApp(args, { fx = allRepos(), extraEnv = {}, fail = '', failVariable = '', pyFlags = ['-I', '-S'], app = (a) => a, homeGitconfig = '', keychain = [], failKeychainAdd = false, pem = PEM, cwd = undefined } = {}) { // failKeychainAdd: false | true | 'silent'
     fs.rmSync(cHome, { recursive: true, force: true });
     fs.rmSync(cTmp, { recursive: true, force: true });
     fs.mkdirSync(cHome, { recursive: true });
@@ -1300,6 +1300,7 @@ finally:
     fs.writeFileSync(cFixtures, JSON.stringify(fx));
     for (const f of [cGhLog, cEvents]) fs.writeFileSync(f, '');
     const r = spawnSync('python3', [...pyFlags, harness, CREATE_APP, ...args], {
+      cwd,
       input: pem,
       encoding: 'utf8',
       timeout: 60000,
@@ -1689,6 +1690,22 @@ finally:
   ok('a forged object for the manifest\'s blob is ignored: the page posts the committed manifest',
     drill.status === 0 && forgedPosted && JSON.stringify(forgedPosted.manifest.default_permissions) === JSON.stringify(manifest.default_permissions),
     `${cTail(drill)} posted=${forgedPosted && JSON.stringify(forgedPosted.manifest.default_permissions)}`);
+
+  // A planted bash at the checkout's root (outside governance/, so no content
+  // check sees it), found through an empty PATH entry with the root as the
+  // working directory, or through the root on PATH: never run, and so never
+  // handed the owner's token (miranda-infrastructure#616 review).
+  const plantedBash = path.join(cSrc, 'bash');
+  const bashRan = path.join(root, 'checks-bash-ran.log');
+  fs.writeFileSync(plantedBash, `#!/bin/sh\necho "token=\${GH_TOKEN-unset}" >> ${JSON.stringify(bashRan)}\nexit 1\n`, { mode: 0o755 });
+  for (const [what, entries] of [['an empty PATH entry', ['']], ['the checkout\'s root on PATH', [cSrc]]]) {
+    fs.rmSync(bashRan, { force: true });
+    drill = createApp(args, { cwd: cSrc, extraEnv: { PATH: [...entries, cBin, process.env.PATH].join(':') } });
+    ok(`a bash planted at the checkout's root, found through ${what}, never runs provenance.sh: it completes, and the plant never ran`,
+      drill.status === 0 && !fs.existsSync(bashRan), `${cTail(drill)} ran=${readOr(bashRan).trim()}`);
+  }
+  fs.rmSync(plantedBash, { force: true });
+  fs.rmSync(bashRan, { force: true });
 
   // ---- test is read with nothing from the environment but PATH ----
   const envLog = path.join(cBin, 'canonical-read-env.log');
