@@ -324,11 +324,6 @@ SCRIPT_FILES=(agent-env.sh gh-shim.sh app-token.sh)
 for f in "${SCRIPT_FILES[@]}"; do
   cat -- "$HERE/$f" >"$STAGE/$f" 2>/dev/null || locked "cannot read the scripts in $HERE"
 done
-have=""
-for f in "${SCRIPT_FILES[@]}"; do
-  blob="$(mm_scratch_git "$STAGE" hash-object --no-filters --stdin <"$STAGE/$f")" || locked "cannot hash the scripts in $HERE"
-  have="${have:+$have$'\n'}$blob"
-done
 # Offline, the commit is the checkout's own: its objects, read through
 # alternates by a repository of this script's, which reads none of the
 # checkout's config, refs or hooks. Whether that commit is merged is decided
@@ -339,6 +334,11 @@ if ! mm_scratch_git "$local_repo" init --quiet --bare --template= >/dev/null 2>&
     || ! printf '%s\n' "$common/objects" >"$local_repo/objects/info/alternates"; then
   locked "cannot make a private repository under $STAGE"
 fi
+have=""
+for f in "${SCRIPT_FILES[@]}"; do
+  blob="$(mm_scratch_git "$local_repo" hash-object --no-filters --stdin <"$STAGE/$f")" || locked "cannot hash the scripts in $HERE"
+  have="${have:+$have$'\n'}$blob"
+done
 want="$(mm_scratch_git "$local_repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
   || locked "agent-env.sh, gh-shim.sh and app-token.sh are not all in commit ${commit:0:12}. Eval from a clean checkout of a merged commit."
 [[ "$have" == "$want" ]] \
