@@ -179,9 +179,16 @@ file, so a pull request cannot edit the job that receives the key):
     permissions: { contents: read, issues: read, pull-requests: read }
     uses: marvinamiranda/.github/.github/workflows/issue-link-publish.yml@<40-char sha>
     with:
-      runs-on: '["self-hosted", "gate-ephemeral"]'
+      runs-on: '["self-hosted", "gate-ephemeral"]'   # exactly this; see below
       governance-ref: <the same 40-char sha>
 ```
+
+**`runs-on` must be `["self-hosted", "gate-ephemeral"]`.** This job holds the
+Checks App key, and `gate-ephemeral` is the single-use VM pool made for it
+(decision E). The workflow cannot check the label it is given, so the caller
+is the control: any other pool (`pool-linux` runs pull request code on shared
+hosts) would put the key where pull request code has run. A caller passing
+anything else is a `tier:senior` finding.
 
 - Inputs: `runs-on` (JSON, required, no default) and `governance-ref`, which
   must equal the commit the caller's `uses:` pins and be a commit of this
@@ -192,17 +199,27 @@ file, so a pull request cannot edit the job that receives the key):
   and judge, holding only the read `GITHUB_TOKEN`; mint the Checks App token
   (this repository, `checks: write` only); one inline script POSTs the verdict
   on the pull request's **current** head. The fetched code never sees the key.
-- The pull request is the first of `workflow_run.pull_requests`. If the run
-  lists none, the job fails and posts nothing. If the judge cannot run, a
-  **failure** is posted for the head, so a success from before a body edit does
-  not stand; if not even the head can be read, the job fails and posts nothing.
+- `workflow_run.pull_requests` lists **every** open pull request whose head
+  sha or head branch matches the run, in any repository. The workflow judges
+  **each one whose base repository is this repository** and posts one check
+  per head commit, a success only if every pull request on that commit
+  passed. If none belongs to this repository, or the payload does not say
+  which repository this is, the job fails and posts nothing. If the judge
+  cannot run, a **failure** is posted for the head (the pull request's, or
+  else the run's own commit), so a success from before a body edit does not
+  stand; if no head commit can be found at all, the job fails and posts nothing.
+- A summary is cut at 60,000 characters with a `(truncated)` marker (both here
+  and in `pr-governance.yml`): the API refuses one over 65,535, and a crafted
+  body could otherwise make the post fail and leave an older success standing.
+- Runs for one commit queue (`concurrency` on the job, never cancelling); the
+  last to run judges the pull requests as they are then.
 - The workflow names the `governance-checks` environment itself
   (`deployment: false`); the caller sets nothing. Because that environment
   admits any job on `test`, the workflow checks out no pull request code, has
   no `run:` step and no `${{ }}` inside a script.
   `governance/tests/issue-link-publish.test.js` pins each of these, and
   `governance/tests/issue-link-publish.mutations.js` shows the suite failing on
-  28 deliberately broken copies. No other workflow in this repository may name
+  45 deliberately broken copies. No other workflow in this repository may name
   the environment or the key (also tested).
 - Only JavaScript actions are used, because the `gate-ephemeral` VM has the
   runner, git, python3, jq and curl and nothing else.

@@ -107,6 +107,14 @@ ok('the checkout takes only governance/issue-link.js', checkouts[0] && checkouts
 ok('the workflow never mentions a pull request head, merge ref or fork',
   !/pull_request\.head|refs\/pull|head_ref|head\.repo|head_branch/.test(text.replace(/^\s*#.*$/gm, '')));
 
+// ------------------------------------------------ run limits ------------
+ok('the job has a timeout of at most 10 minutes', typeof job['timeout-minutes'] === 'number' && job['timeout-minutes'] > 0 && job['timeout-minutes'] <= 10, String(job['timeout-minutes']));
+ok('two runs for one commit queue, never cancel, and the workflow says so itself',
+  job.concurrency && job.concurrency.group === 'issue-link-publish-${{ github.event.workflow_run.head_sha }}' && job.concurrency['cancel-in-progress'] === false,
+  JSON.stringify(job.concurrency));
+ok('no step runs on always(), failure() or cancelled(): the mint and post need a verdict from a verified pin',
+  steps.every((s) => !/always\(|failure\(|cancelled\(|success\(/.test(s.if || '')), JSON.stringify(steps.map((s) => s.if)));
+
 // ------------------------------------------------ ordering ---------------
 const at = { verify: indexOfStep('Verify the pin'), fetch: indexOfStep('Fetch the shared matcher'), judge: indexOfStep('Judge the pull request'),
   mint: indexOfStep('Mint the Checks App token'), post: indexOfStep('Publish governance/issue-link') };
@@ -172,9 +180,13 @@ for (const f of others) {
 // ------------------------------------------------ behaviour --------------
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
 const HEAD = 'c'.repeat(40);
+const HEAD2 = 'd'.repeat(40);
+const HERE = 1001; // this repository's id in the fake payload
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-link-publish-'));
 fs.symlinkSync(ROOT, path.join(work, '.org-governance'));
 fs.mkdirSync(path.join(work, 'tmp'));
+process.env.RUNNER_TEMP = path.join(work, 'tmp');
+const verdictFile = path.join(work, 'tmp', 'issue-link-verdict.json');
 
 function fakeCore() {
   const out = { failed: [], outputs: {}, summary: [] };
@@ -185,84 +197,165 @@ function fakeCore() {
     summary: { addHeading() { return this; }, addRaw(t) { out.summary.push(t); return this; }, async write() {} },
   };
 }
-function fakeApi({ body = 'Closes #742', closing = [742], pullsGet = null } = {}) {
+// `bodies`: pull request number -> { body, head sha, closing issues }.
+function fakeApi({ bodies = { 761: {} }, pullsGet = null, base = 'test', defaultBranch = 'test' } = {}) {
   const calls = [];
+  const of = (n) => ({ body: 'Closes #742', head: HEAD, closing: [742], ...(bodies[n] || {}) });
   return {
     calls,
     rest: {
       pulls: { get: async (a) => { calls.push(['pulls.get', a.pull_number]);
-        if (pullsGet) return pullsGet(calls);
-        return { data: { number: a.pull_number, body, head: { ref: 'x', sha: HEAD }, base: { ref: 'test' } } }; } },
-      repos: { get: async () => ({ data: { default_branch: 'test' } }) },
+        if (pullsGet) return pullsGet(calls, a);
+        const b = of(a.pull_number);
+        return { data: { number: a.pull_number, body: b.body, head: { ref: 'x', sha: b.head }, base: { ref: base } } }; } },
+      repos: { get: async () => ({ data: { default_branch: defaultBranch } }) },
       issues: { get: async () => ({ data: {} }) },
     },
-    graphql: async () => ({ repository: { pullRequest: { closingIssuesReferences: { totalCount: closing.length,
-      nodes: closing.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }),
+    graphql: async (q, v) => ({ repository: { pullRequest: { closingIssuesReferences: { totalCount: of(v.number).closing.length,
+      nodes: of(v.number).closing.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }),
     async request(route, params) { calls.push(['request', route, params]); return { data: {} }; },
   };
 }
 const realRequire = require;
 const requireFrom = (p) => (p.startsWith('.') ? realRequire(path.resolve(work, p)) : realRequire(p));
-const context = (pulls) => ({ repo: { owner: 'marvinamiranda', repo: 'omni237' }, payload: { workflow_run: { event: 'pull_request', pull_requests: pulls } } });
+const listedPr = (number, repoId = HERE) => ({ number, base: { ref: 'test', repo: { id: repoId, name: 'omni237' } } });
+const context = (pulls, extra = {}) => ({
+  repo: { owner: 'marvinamiranda', repo: 'omni237' },
+  payload: { repository: { id: HERE }, workflow_run: { event: 'pull_request', head_sha: HEAD, pull_requests: pulls, ...extra } },
+});
 
 async function runJudge(github, ctx) {
   const core = fakeCore();
-  process.env.RUNNER_TEMP = path.join(work, 'tmp');
-  const file = path.join(work, 'tmp', 'issue-link-verdict.json');
-  fs.rmSync(file, { force: true });
+  fs.rmSync(verdictFile, { force: true });
   await new AsyncFunction('github', 'context', 'core', 'require', script(judgeStep))(github, ctx, core, requireFrom);
-  return { core, verdict: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null };
+  return { core, verdicts: fs.existsSync(verdictFile) ? JSON.parse(fs.readFileSync(verdictFile, 'utf8')) : null };
 }
 async function runPost(github) {
   const core = fakeCore();
-  process.env.RUNNER_TEMP = path.join(work, 'tmp');
-  await new AsyncFunction('github', 'context', 'core', 'require', script(post))(github, context([{ number: 1 }]), core, requireFrom);
+  await new AsyncFunction('github', 'context', 'core', 'require', script(post))(github, context([listedPr(1)]), core, requireFrom);
+  return core;
+}
+
+// A fake for the pin step's own API calls (the same shape pr-governance's test uses).
+const TEST_TIP = '69b68cd158547974bb71b1fdc01ba7a89629c46c';
+const SELF = 'eded4bf1f05be3a33a354795bac37d77105bac16';
+function fakePinApi(status, branch = TEST_TIP) {
+  const fail = (code) => { const e = new Error('HTTP error'); e.status = code; throw e; };
+  return { rest: { repos: {
+    getBranch: async (a) => { if (typeof branch === 'number') fail(branch); return { data: { name: a.branch, commit: { sha: branch } } }; },
+    compareCommitsWithBasehead: async () => { if (typeof status === 'number') fail(status); return { data: { status } }; },
+  } } };
+}
+async function runPin(github, env) {
+  const core = fakeCore();
+  await new AsyncFunction('github', 'context', 'core', 'process', script(verify))(github, {}, core, { env });
   return core;
 }
 
 (async () => {
-  if (!judgeStep || !post) { console.log('not ok - behaviour: the steps are missing'); process.exit(1); }
+  if (!judgeStep || !post || !verify) { console.log('not ok - behaviour: the steps are missing'); process.exit(1); }
 
-  // A closing link: success, and the verdict is for the PR's CURRENT head.
+  // ---- the pin step's own script, call site included --------------------
+  const pinEnv = (o = {}) => ({ SELF_SHA: SELF, SELF_REPOSITORY: 'marvinamiranda/.github', GOVERNANCE_REF: SELF, ...o });
+  for (const [label, github, env, pass] of [
+    ['a pin that is test\'s head', fakePinApi('identical'), pinEnv(), true],
+    ['a pin behind test', fakePinApi('behind'), pinEnv(), true],
+    ['a governance-ref that is not the uses: pin', fakePinApi('identical'), pinEnv({ GOVERNANCE_REF: 'b'.repeat(40) }), false],
+    ['a pin that diverged from test (a fork or branch commit)', fakePinApi('diverged'), pinEnv(), false],
+    ['a pin ahead of test (an unmerged commit)', fakePinApi('ahead'), pinEnv(), false],
+    ['a workflow running from another repository', fakePinApi('identical'), pinEnv({ SELF_REPOSITORY: 'someone/.github' }), false],
+    ['test that cannot be read', fakePinApi('identical', 404), pinEnv(), false],
+  ]) {
+    const core = await runPin(github, env);
+    ok(`pin step: ${label} sets ok=${pass}${pass ? '' : ' and fails the job'}`,
+      core.out.outputs.ok === String(pass) && (pass ? core.out.failed.length === 0 : core.out.failed.length === 1), JSON.stringify(core.out));
+  }
+
+  // ---- one pull request ---------------------------------------------------
   let gh = fakeApi();
-  let r = await runJudge(gh, context([{ number: 761 }]));
+  let r = await runJudge(gh, context([listedPr(761)]));
   ok('judge: a pull request that closes an issue is a success on its current head',
-    r.verdict && r.verdict.ok === true && r.verdict.headSha === HEAD && r.core.out.failed.length === 0, JSON.stringify(r.verdict));
+    r.verdicts && r.verdicts.length === 1 && r.verdicts[0].ok === true && r.verdicts[0].headSha === HEAD && r.core.out.failed.length === 0, JSON.stringify(r.verdicts));
   ok('judge: it read the pull request the run lists', gh.calls.some((c) => c[0] === 'pulls.get' && c[1] === 761));
   ok('judge: it posts nothing', !gh.calls.some((c) => c[0] === 'request'));
   ok('judge: it marks the verdict for the mint and post steps', r.core.out.outputs.judged === 'true');
 
-  gh = fakeApi({ body: 'no link here', closing: [] });
-  r = await runJudge(gh, context([{ number: 761 }]));
-  ok('judge: a body with no closing keyword is a failure verdict', r.verdict && r.verdict.ok === false && r.verdict.headSha === HEAD, JSON.stringify(r.verdict));
+  gh = fakeApi({ bodies: { 761: { body: 'no link here', closing: [] } } });
+  r = await runJudge(gh, context([listedPr(761)]));
+  ok('judge: a body with no closing keyword is a failure verdict', r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD, JSON.stringify(r.verdicts));
 
-  for (const [label, pulls] of [['none', []], ['no list', undefined], ['a non-integer number', [{ number: '7' }]], ['number zero', [{ number: 0 }]]]) {
+  // ---- which pull requests are judged (F1) --------------------------------
+  // Two open pull requests share one commit; one closes an issue, one does not.
+  const two = { 761: {}, 762: { body: 'no link here', closing: [] } };
+  for (const [label, order] of [['the passing one listed first', [761, 762]], ['the failing one listed first', [762, 761]]]) {
+    gh = fakeApi({ bodies: two });
+    r = await runJudge(gh, context(order.map((n) => listedPr(n))));
+    ok(`judge: two pull requests on one commit, ${label}: every one is judged and the commit fails`,
+      gh.calls.filter((c) => c[0] === 'pulls.get').length === 2 && r.verdicts.length === 1 && r.verdicts[0].ok === false
+        && r.verdicts[0].headSha === HEAD && /#762/.test(r.verdicts[0].title), JSON.stringify(r.verdicts));
+  }
+  gh = fakeApi({ bodies: { 761: {}, 762: {} } });
+  r = await runJudge(gh, context([listedPr(761), listedPr(762)]));
+  ok('judge: two pull requests on one commit that both close an issue: one success',
+    r.verdicts.length === 1 && r.verdicts[0].ok === true && /All 2 pull requests/.test(r.verdicts[0].title), JSON.stringify(r.verdicts));
+  gh = fakeApi({ bodies: { 761: {}, 762: { head: HEAD2, body: 'no link', closing: [] } } });
+  r = await runJudge(gh, context([listedPr(761), listedPr(762)]));
+  ok('judge: pull requests on different commits get one verdict each, and one failure does not fail the other',
+    r.verdicts.length === 2 && r.verdicts.find((v) => v.headSha === HEAD).ok === true && r.verdicts.find((v) => v.headSha === HEAD2).ok === false, JSON.stringify(r.verdicts));
+  // A pull request of another repository is not this repository's to judge.
+  gh = fakeApi({ bodies: two });
+  r = await runJudge(gh, context([listedPr(762, 7777), listedPr(761)]));
+  ok('judge: a listed pull request that targets another repository is not judged',
+    gh.calls.filter((c) => c[0] === 'pulls.get').map((c) => c[1]).join() === '761' && r.verdicts.length === 1 && r.verdicts[0].ok === true, JSON.stringify(r.verdicts));
+  for (const [label, pulls] of [['none', []], ['no list', undefined], ['only another repository\'s', [listedPr(9, 7777)]],
+    ['a pull request with no base repository', [{ number: 9, base: { ref: 'test' } }]], ['a non-integer number', [{ ...listedPr(7), number: '7' }]], ['number zero', [{ ...listedPr(7), number: 0 }]]]) {
     gh = fakeApi();
     r = await runJudge(gh, context(pulls));
-    ok(`judge: a run listing ${label} fails the job and writes no verdict`,
-      r.core.out.failed.length === 1 && r.verdict === null && r.core.out.outputs.judged === undefined && gh.calls.length === 0, JSON.stringify(r.core.out));
+    ok(`judge: a run listing ${label} of this repository fails the job and writes no verdict`,
+      r.core.out.failed.length === 1 && r.verdicts === null && r.core.out.outputs.judged === undefined && gh.calls.length === 0, JSON.stringify(r.core.out));
   }
+  gh = fakeApi();
+  const noRepo = context([listedPr(761)]);
+  delete noRepo.payload.repository;
+  r = await runJudge(gh, noRepo);
+  ok('judge: a payload that does not say which repository this is judges nothing (fail closed)', r.core.out.failed.length === 1 && r.verdicts === null && gh.calls.length === 0);
+  // Two missing ids must not equal each other.
+  gh = fakeApi();
+  const neither = context([{ number: 761, base: { ref: 'test', repo: { name: 'omni237' } } }]);
+  delete neither.payload.repository;
+  r = await runJudge(gh, neither);
+  ok('judge: no id on either side is not a match', r.core.out.failed.length === 1 && r.verdicts === null && gh.calls.length === 0);
 
-  // The judge cannot run: a FAILURE is published for the head, never silence.
-  gh = fakeApi({ pullsGet: (calls) => { if (calls.filter((c) => c[0] === 'pulls.get').length === 1) { const e = new Error('boom'); e.status = 502; throw e; }
-    return { data: { head: { sha: HEAD } } }; } });
-  r = await runJudge(gh, context([{ number: 761 }]));
-  ok('judge: an API error becomes a failure verdict on the head, not silence',
-    r.verdict && r.verdict.ok === false && r.verdict.headSha === HEAD && /502/.test(r.verdict.summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdict));
+  // ---- the judge cannot run ----------------------------------------------
+  gh = fakeApi({ pullsGet: (calls, a) => { if (calls.filter((c) => c[0] === 'pulls.get').length === 1) { const e = new Error('boom'); e.status = 502; throw e; }
+    return { data: { head: { sha: HEAD2 } } }; } });
+  r = await runJudge(gh, context([listedPr(761)]));
+  ok('judge: an API error becomes a failure verdict on the pull request\'s head, not silence',
+    r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD2 && /502/.test(r.verdicts[0].summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdicts));
 
   gh = fakeApi({ pullsGet: () => { const e = new Error('down'); e.status = 503; throw e; } });
-  r = await runJudge(gh, context([{ number: 761 }]));
-  ok('judge: if not even the head can be read, the job fails and nothing is written',
-    r.verdict === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined, JSON.stringify(r.core.out));
+  r = await runJudge(gh, context([listedPr(761)]));
+  ok('judge: if the head cannot be read, the failure lands on the run\'s own head commit',
+    r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD, JSON.stringify(r.verdicts));
+  r = await runJudge(gh, context([listedPr(761)], { head_sha: 'not-a-sha' }));
+  ok('judge: if no head commit can be found at all, the job fails and nothing is written',
+    r.verdicts === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined, JSON.stringify(r.core.out));
 
-  // The post.
-  const file = path.join(work, 'tmp', 'issue-link-verdict.json');
+  // ---- a crafted body cannot make the POST too big (F3) ----------------
+  // A non-default base skips GitHub's lookup, and the summary lists every reference.
+  const many = Array.from({ length: 12000 }, (_, i) => `Closes #${i + 1000}`).join('\n');
+  gh = fakeApi({ bodies: { 761: { body: many } }, base: 'test', defaultBranch: 'main' });
+  r = await runJudge(gh, context([listedPr(761)]));
+  ok('judge: a summary over the API limit is cut, and says so',
+    r.verdicts && r.verdicts[0].summary.length <= 60000 && /\(truncated\)$/.test(r.verdicts[0].summary), r.verdicts && String(r.verdicts[0].summary.length));
+
+  // ---- the post ---------------------------------------------------------
   for (const [label, verdict, conclusion] of [
     ['success', { ok: true, title: 'Closes x', summary: 'fine', headSha: HEAD }, 'success'],
     ['failure', { ok: false, title: 'No closing issue link', summary: 'add one', headSha: HEAD }, 'failure'],
     ['a truthy non-boolean ok is not a success', { ok: 'yes', title: 't', summary: 's', headSha: HEAD }, 'failure'],
   ]) {
-    fs.writeFileSync(file, JSON.stringify(verdict));
+    fs.writeFileSync(verdictFile, JSON.stringify([verdict]));
     gh = fakeApi();
     const core = await runPost(gh);
     const req = gh.calls.filter((c) => c[0] === 'request');
@@ -271,8 +364,21 @@ async function runPost(github) {
         && req[0][2].conclusion === conclusion && req[0][2].status === 'completed' && req[0][2].head_sha === HEAD
         && req[0][2].owner === 'marvinamiranda' && req[0][2].repo === 'omni237' && core.out.failed.length === 0, JSON.stringify(req));
   }
-  for (const [label, headSha] of [['missing', undefined], ['not a full sha', 'abc123'], ['a branch name', 'test']]) {
-    fs.writeFileSync(file, JSON.stringify({ ok: true, title: 't', summary: 's', headSha }));
+  fs.writeFileSync(verdictFile, JSON.stringify([{ ok: true, title: 'a', summary: 'a', headSha: HEAD }, { ok: false, title: 'b', summary: 'b', headSha: HEAD2 }]));
+  gh = fakeApi();
+  await runPost(gh);
+  ok('post: one check run per head commit', gh.calls.filter((c) => c[0] === 'request').map((c) => `${c[2].head_sha.slice(0, 1)}:${c[2].conclusion}`).join() === 'c:success,d:failure');
+  fs.writeFileSync(verdictFile, JSON.stringify([{ ok: false, title: 'x'.repeat(1000), summary: 'y'.repeat(200000), headSha: HEAD }]));
+  gh = fakeApi();
+  await runPost(gh);
+  const sent = gh.calls.find((c) => c[0] === 'request');
+  ok('post: whatever the verdict file holds, the summary sent is under the API limit and the title under 255',
+    sent && sent[2].output.summary.length <= 60000 && /\(truncated\)$/.test(sent[2].output.summary) && sent[2].output.title.length <= 255,
+    sent && `${sent[2].output.summary.length}/${sent[2].output.title.length}`);
+  for (const [label, content] of [['missing', [{ ok: true, title: 't', summary: 's' }]], ['not a full sha', [{ ok: true, title: 't', summary: 's', headSha: 'abc123' }]],
+    ['a branch name', [{ ok: true, title: 't', summary: 's', headSha: 'test' }]], ['an empty list', []], ['not a list', { ok: true, headSha: HEAD }],
+    ['bad in the second entry (so nothing at all is posted)', [{ ok: true, title: 't', summary: 's', headSha: HEAD }, { ok: true, title: 't', summary: 's', headSha: 'x' }]]]) {
+    fs.writeFileSync(verdictFile, JSON.stringify(content));
     gh = fakeApi();
     const core = await runPost(gh);
     ok(`post: a verdict whose head is ${label} posts nothing and fails the job`,

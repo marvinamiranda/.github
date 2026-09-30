@@ -152,6 +152,10 @@ jobs:
           script: |
             const lib = require('./.org-governance/governance/issue-link.js');
             const v = await lib.judge({ github, context });
+            // The API refuses a summary over 65,535 characters. A crafted body can
+            // make the judge's summary longer, the check would not be created, and
+            // an older success would stand: so it is cut here.
+            const summary = v.summary.length <= 60000 ? v.summary : `${v.summary.slice(0, 59960)}\n\n(truncated)`;
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -159,9 +163,9 @@ jobs:
               head_sha: v.headSha,
               status: 'completed',
               conclusion: v.ok ? 'success' : 'failure',
-              output: { title: v.title, summary: v.summary },
+              output: { title: v.title, summary },
             });
-            await core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
+            await core.summary.addHeading('governance/issue-link').addRaw(summary).write();
 
   areas:
     name: areas

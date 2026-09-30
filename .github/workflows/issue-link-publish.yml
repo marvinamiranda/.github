@@ -69,6 +69,11 @@ jobs:
     if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
+    # Two runs for one commit would each post; queued, the last to run judges
+    # the pull request as it is then. Not left to callers.
+    concurrency:
+      group: issue-link-publish-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     environment:
       name: governance-checks
       # Secrets without a deployment record per run (GitHub changelog,
@@ -158,39 +163,82 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             const lib = require('./.org-governance/governance/issue-link.js');
-            const listed = (context.payload.workflow_run && context.payload.workflow_run.pull_requests) || [];
-            const number = listed.length > 0 ? listed[0].number : undefined;
-            if (!Number.isInteger(number) || number < 1) {
-              core.setFailed('The workflow run lists no pull request, so there is no head to post governance/issue-link on. Nothing is posted.');
+            // The API refuses a summary over 65,535 characters. A crafted body can
+            // make the judge's summary longer than that, the POST would be
+            // rejected, and an older success would stand: so it is cut here.
+            const CAP = 60000;
+            const cap = (text) => {
+              const s = String(text);
+              return s.length <= CAP ? s : `${s.slice(0, CAP - 40)}\n\n(truncated)`;
+            };
+            const { owner, repo } = context.repo;
+            const run = context.payload.workflow_run || {};
+            // `pull_requests` lists EVERY open pull request whose head sha or head
+            // branch matches the run, in any repository. Judging only one of them
+            // would let another that shares the commit pass unjudged, so every
+            // one that targets THIS repository is judged. Anything that cannot be
+            // shown to be this repository's (no id on either side) is not.
+            const here = context.payload.repository && context.payload.repository.id;
+            const listed = Array.isArray(run.pull_requests) ? run.pull_requests : [];
+            const mine = listed.filter((p) => p && Number.isInteger(p.number) && p.number >= 1
+              && here !== undefined && p.base && p.base.repo && p.base.repo.id === here);
+            if (mine.length === 0) {
+              core.setFailed('The workflow run lists no pull request of this repository, so there is no head to post governance/issue-link on. Nothing is posted.');
               return;
             }
-            const { owner, repo } = context.repo;
-            const file = path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json');
-            let verdict;
-            try {
-              // judge() reads the pull request now, not from the event.
-              verdict = await lib.judge({ github, context: { repo: context.repo, payload: { pull_request: { number } } } });
-            } catch (error) {
-              // Fail closed: a verdict that could not be reached is a failure on
-              // the head, not silence that leaves an older success standing.
-              const status = error && error.status ? `HTTP ${error.status}` : 'an error';
-              let headSha;
+            const runHead = /^[0-9a-f]{40}$/.test(run.head_sha || '') ? run.head_sha : undefined;
+            const judged = [];
+            for (const listedPull of mine) {
+              const number = listedPull.number;
+              let verdict;
               try {
-                ({ data: { head: { sha: headSha } } } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
-              } catch (again) {
-                core.setFailed(`The judge failed (${status}) and the pull request head could not be read. Nothing is posted.`);
-                return;
+                // judge() reads the pull request now, not from the event.
+                verdict = await lib.judge({ github, context: { repo: context.repo, payload: { pull_request: { number } } } });
+              } catch (error) {
+                // Fail closed: a verdict that could not be reached is a failure on
+                // the head, not silence that leaves an older success standing.
+                const status = error && error.status ? `HTTP ${error.status}` : 'an error';
+                let headSha = runHead;
+                try {
+                  ({ data: { head: { sha: headSha } } } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
+                } catch (again) {
+                  // The run's own head is the fallback: still a failure, on a commit.
+                }
+                if (!headSha) {
+                  core.setFailed(`The judge failed (${status}) and no head commit could be found. Nothing is posted.`);
+                  return;
+                }
+                verdict = {
+                  ok: false,
+                  title: 'The issue-link judge could not run',
+                  summary: `The judge failed with ${status}. Re-run the PR gate. This failure is posted so an older success does not stand.`,
+                  headSha,
+                };
               }
-              verdict = {
-                ok: false,
-                title: 'The issue-link judge could not run',
-                summary: `The judge failed with ${status}. Re-run the PR gate. This failure is posted so an older success does not stand.`,
-                headSha,
-              };
+              judged.push({ number, ...verdict });
             }
-            fs.writeFileSync(file, JSON.stringify(verdict));
+            // One verdict per head commit: a success only if EVERY pull request
+            // judged on that commit passed.
+            const heads = new Map();
+            for (const j of judged) heads.set(j.headSha, [...(heads.get(j.headSha) || []), j]);
+            const verdicts = [...heads].map(([headSha, group]) => {
+              const failing = group.filter((j) => j.ok !== true);
+              if (group.length === 1) {
+                const only = group[0];
+                return { headSha, ok: only.ok === true, title: String(only.title).slice(0, 255), summary: cap(only.summary) };
+              }
+              const ok = failing.length === 0;
+              return {
+                headSha,
+                ok,
+                title: (ok ? `All ${group.length} pull requests on this commit close an issue`
+                  : `#${failing[0].number}: ${failing[0].title}`).slice(0, 255),
+                summary: cap(group.map((j) => `#${j.number}: ${j.ok === true ? 'passes' : 'FAILS'}: ${j.title}\n${j.summary}`).join('\n\n')),
+              };
+            });
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json'), JSON.stringify(verdicts));
             core.setOutput('judged', 'true');
-            await core.summary.addHeading('governance/issue-link').addRaw(verdict.summary).write();
+            for (const v of verdicts) await core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
 
       # The Checks App token: the first thing to touch the key, after all fetched
       # code has run. This repository only, `checks: write` only.
@@ -214,17 +262,25 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const verdict = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json'), 'utf8'));
-            if (!/^[0-9a-f]{40}$/.test(verdict.headSha || '')) {
-              core.setFailed('The verdict names no head commit. Nothing is posted.');
+            const verdicts = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json'), 'utf8'));
+            if (!Array.isArray(verdicts) || verdicts.length === 0
+                || !verdicts.every((v) => v && /^[0-9a-f]{40}$/.test(v.headSha || ''))) {
+              core.setFailed('A verdict names no head commit. Nothing is posted.');
               return;
             }
-            await github.request('POST /repos/{owner}/{repo}/check-runs', {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name: 'governance/issue-link',
-              head_sha: verdict.headSha,
-              status: 'completed',
-              conclusion: verdict.ok === true ? 'success' : 'failure',
-              output: { title: String(verdict.title).slice(0, 255), summary: String(verdict.summary) },
-            });
+            // Never over the API's 65,535-character summary limit (see the judge).
+            const cap = (text) => {
+              const s = String(text);
+              return s.length <= 60000 ? s : `${s.slice(0, 59960)}\n\n(truncated)`;
+            };
+            for (const verdict of verdicts) {
+              await github.request('POST /repos/{owner}/{repo}/check-runs', {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'governance/issue-link',
+                head_sha: verdict.headSha,
+                status: 'completed',
+                conclusion: verdict.ok === true ? 'success' : 'failure',
+                output: { title: String(verdict.title).slice(0, 255), summary: cap(verdict.summary) },
+              });
+            }
