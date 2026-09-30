@@ -1,0 +1,286 @@
+# Publishes `governance/issue-link` as the Checks App ("MarvinaMiranda Checks")
+# on a pull request's current head. Called from an adopted repository's
+# `workflow_run` job (its PR gate). Epic marvinamiranda/.github#7, Task #10.
+#
+# WHY IT IS NOT pr-governance.yml. That workflow runs in `pull_request` context
+# as the GitHub Actions app: any workflow a pull request adds runs as the same
+# app, so the pull request can post a passing `governance/issue-link` itself,
+# and the check run is filed in the commit's oldest Actions check suite, which
+# the ruleset stops counting once that workflow runs again on the commit (the
+# stranding fault of .github#6). Here the post is made by a different App, from
+# default-branch code, with a key that only a job on `test` can read.
+#
+# WHAT HOLDS THE KEY. The job below names the environment `governance-checks`,
+# whose only deployment rule is the branch `test`. A `workflow_run` job runs the
+# DEFAULT branch's copy of the caller, at the default branch's commit, so a pull
+# request cannot edit the job that receives the key. But the environment admits
+# ANY job whose ref is `test` -- `workflow_run`, `pull_request_target`,
+# `issue_comment` -- and it cannot stop such a job running pull request code
+# (the custody review of .github#18). So this job must never check out, build,
+# run or evaluate anything a pull request supplies:
+#   * the only checkout is of marvinamiranda/.github at governance-ref, which
+#     the first step proved is a merged commit of `test`;
+#   * no `run:` step, and no `${{ }}` expression inside any script: everything
+#     a script reads arrives through env or the event payload as DATA;
+#   * the pull request's body is read by `issue-link.js` as text and matched;
+#     it is never executed, and it reaches the check run only as a bounded
+#     summary written through the API.
+# governance/tests/issue-link-publish.test.js pins every one of these.
+#
+# ORDER, and why. (1) Verify the pin: nothing below runs unless it holds.
+# (2) Fetch issue-link.js at governance-ref and judge, holding ONLY the read
+# token. (3) Mint the Checks App token -- the first step that touches the key,
+# after all code has run -- for this repository only, with `checks: write`
+# only, revoked when the job ends. (4) One inline script reads the verdict as
+# JSON and POSTs it with that token. The judge (fetched code) never sees the
+# key; the step that sees the key runs only inline text of this file.
+#
+# A judge that cannot run (an API error) posts a FAILURE for the head rather
+# than nothing: a stale success from before a body edit must not stand.
+#
+# Runs where the caller says (`runs-on` has no default and no hosted label is
+# named here): adopted repositories pass '["self-hosted","gate-ephemeral"]', a
+# clean single-use VM (decision E, .github#8). Only JavaScript actions are used,
+# because that VM has the runner, git, python3, jq and curl and nothing else.
+name: Publish governance/issue-link
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Runner for the job, as JSON (a label string or a list of labels). No
+          default: adopted repositories pass '["self-hosted","gate-ephemeral"]'.
+        type: string
+        required: true
+      governance-ref:
+        description: >-
+          Commit SHA of marvinamiranda/.github whose governance/issue-link.js is
+          used -- the same SHA the caller pins this workflow to, and on its test
+          branch.
+        type: string
+        required: true
+
+jobs:
+  publish:
+    name: publish governance/issue-link
+    # Only the completion of a pull request's workflow run. Any other event
+    # skips the job, so no token is minted for it.
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    # Two runs for one commit would each post; queued, the last to run judges
+    # the pull request as it is then. Not left to callers.
+    concurrency:
+      group: issue-link-publish-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    environment:
+      name: governance-checks
+      # Secrets without a deployment record per run (GitHub changelog,
+      # 2026-03-19). The branch policy still applies.
+      deployment: false
+    # The GITHUB_TOKEN reads; it cannot write a check.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Verify the pin
+        id: pin
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SELF_SHA: ${{ job.workflow_sha }}
+          SELF_REPOSITORY: ${{ job.workflow_repository }}
+          GOVERNANCE_REF: ${{ inputs.governance-ref }}
+        with:
+          script: |
+            // BEGIN verify-pin: the same in both jobs; governance/tests/pr-governance.test.js runs it.
+            async function verifyPin({ github, env }) {
+              const self = env.SELF_SHA || '';
+              const ref = env.GOVERNANCE_REF || '';
+              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'marvinamiranda/.github') {
+                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not marvinamiranda/.github.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(self)) {
+                return 'GitHub did not report the commit this workflow runs from (job.workflow_sha), so the pin cannot be checked.';
+              }
+              if (ref !== self) {
+                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
+              }
+              // test is read as a branch, then compared by its sha: the bare
+              // name "test" in a compare could resolve to a tag of that name.
+              let tip;
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner: 'marvinamiranda', repo: '.github', branch: 'test' });
+                tip = branch && branch.commit && branch.commit.sha;
+              } catch (error) {
+                return `Could not read marvinamiranda/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(tip || '')) {
+                return 'GitHub returned no commit for marvinamiranda/.github test, so the pin cannot be checked.';
+              }
+              let status;
+              try {
+                ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: 'marvinamiranda', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
+              } catch (error) {
+                return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
+              }
+              if (status !== 'identical' && status !== 'behind') {
+                return `${self} is not on marvinamiranda/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
+              }
+              return '';
+            }
+            // END verify-pin
+            const problem = await verifyPin({ github, env: process.env });
+            core.setOutput('ok', problem ? 'false' : 'true');
+            if (problem) {
+              // Nothing is posted and no token is minted: the job fails, and the
+              // reason is in its summary.
+              await core.summary.addHeading('governance/issue-link was not published').addRaw(problem).write();
+              core.setFailed(problem);
+            }
+
+      - name: Fetch the shared matcher
+        if: steps.pin.outputs.ok == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: marvinamiranda/.github
+          ref: ${{ inputs.governance-ref }}
+          path: .org-governance
+          sparse-checkout: governance/issue-link.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Holds only the read GITHUB_TOKEN. Writes the verdict to a file; posts
+      # nothing.
+      - name: Judge the pull request
+        id: judge
+        if: steps.pin.outputs.ok == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const lib = require('./.org-governance/governance/issue-link.js');
+            // The API refuses a summary over 65,535 characters. A crafted body can
+            // make the judge's summary longer than that, the POST would be
+            // rejected, and an older success would stand: so it is cut here.
+            const CAP = 60000;
+            const cap = (text) => {
+              const s = String(text);
+              return s.length <= CAP ? s : `${s.slice(0, CAP - 40)}\n\n(truncated)`;
+            };
+            const { owner, repo } = context.repo;
+            const run = context.payload.workflow_run || {};
+            // `pull_requests` lists EVERY open pull request whose head sha or head
+            // branch matches the run, in any repository. Judging only one of them
+            // would let another that shares the commit pass unjudged, so every
+            // one that targets THIS repository is judged. Anything that cannot be
+            // shown to be this repository's (no id on either side) is not.
+            const here = context.payload.repository && context.payload.repository.id;
+            const listed = Array.isArray(run.pull_requests) ? run.pull_requests : [];
+            const mine = listed.filter((p) => p && Number.isInteger(p.number) && p.number >= 1
+              && here !== undefined && p.base && p.base.repo && p.base.repo.id === here);
+            if (mine.length === 0) {
+              core.setFailed('The workflow run lists no pull request of this repository, so there is no head to post governance/issue-link on. Nothing is posted.');
+              return;
+            }
+            const runHead = /^[0-9a-f]{40}$/.test(run.head_sha || '') ? run.head_sha : undefined;
+            const judged = [];
+            for (const listedPull of mine) {
+              const number = listedPull.number;
+              let verdict;
+              try {
+                // judge() reads the pull request now, not from the event.
+                verdict = await lib.judge({ github, context: { repo: context.repo, payload: { pull_request: { number } } } });
+              } catch (error) {
+                // Fail closed: a verdict that could not be reached is a failure on
+                // the head, not silence that leaves an older success standing.
+                const status = error && error.status ? `HTTP ${error.status}` : 'an error';
+                let headSha = runHead;
+                try {
+                  ({ data: { head: { sha: headSha } } } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
+                } catch (again) {
+                  // The run's own head is the fallback: still a failure, on a commit.
+                }
+                if (!headSha) {
+                  core.setFailed(`The judge failed (${status}) and no head commit could be found. Nothing is posted.`);
+                  return;
+                }
+                verdict = {
+                  ok: false,
+                  title: 'The issue-link judge could not run',
+                  summary: `The judge failed with ${status}. Re-run the PR gate. This failure is posted so an older success does not stand.`,
+                  headSha,
+                };
+              }
+              judged.push({ number, ...verdict });
+            }
+            // One verdict per head commit: a success only if EVERY pull request
+            // judged on that commit passed.
+            const heads = new Map();
+            for (const j of judged) heads.set(j.headSha, [...(heads.get(j.headSha) || []), j]);
+            const verdicts = [...heads].map(([headSha, group]) => {
+              const failing = group.filter((j) => j.ok !== true);
+              if (group.length === 1) {
+                const only = group[0];
+                return { headSha, ok: only.ok === true, title: String(only.title).slice(0, 255), summary: cap(only.summary) };
+              }
+              const ok = failing.length === 0;
+              return {
+                headSha,
+                ok,
+                title: (ok ? `All ${group.length} pull requests on this commit close an issue`
+                  : `#${failing[0].number}: ${failing[0].title}`).slice(0, 255),
+                summary: cap(group.map((j) => `#${j.number}: ${j.ok === true ? 'passes' : 'FAILS'}: ${j.title}\n${j.summary}`).join('\n\n')),
+              };
+            });
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json'), JSON.stringify(verdicts));
+            core.setOutput('judged', 'true');
+            for (const v of verdicts) await core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
+
+      # The Checks App token: the first thing to touch the key, after all fetched
+      # code has run. This repository only, `checks: write` only.
+      - name: Mint the Checks App token
+        id: checks-app
+        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CHECKS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CHECKS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      # The one POST. Inline text only: it reads the verdict as JSON data.
+      - name: Publish governance/issue-link
+        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ steps.checks-app.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const verdicts = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json'), 'utf8'));
+            if (!Array.isArray(verdicts) || verdicts.length === 0
+                || !verdicts.every((v) => v && /^[0-9a-f]{40}$/.test(v.headSha || ''))) {
+              core.setFailed('A verdict names no head commit. Nothing is posted.');
+              return;
+            }
+            // Never over the API's 65,535-character summary limit (see the judge).
+            const cap = (text) => {
+              const s = String(text);
+              return s.length <= 60000 ? s : `${s.slice(0, 59960)}\n\n(truncated)`;
+            };
+            for (const verdict of verdicts) {
+              await github.request('POST /repos/{owner}/{repo}/check-runs', {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'governance/issue-link',
+                head_sha: verdict.headSha,
+                status: 'completed',
+                conclusion: verdict.ok === true ? 'success' : 'failure',
+                output: { title: String(verdict.title).slice(0, 255), summary: cap(verdict.summary) },
+              });
+            }

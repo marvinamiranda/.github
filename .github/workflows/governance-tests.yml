@@ -25,6 +25,10 @@ jobs:
         run: node governance/tests/areas-check.test.js
       - name: PR governance pin check
         run: node governance/tests/pr-governance.test.js
+      - name: issue-link publisher (Checks App workflow)
+        run: node governance/tests/issue-link-publish.test.js
+      - name: issue-link publisher, mutation proof
+        run: node governance/tests/issue-link-publish.mutations.js
       - name: bootstrap (stub gh, no network)
         run: node governance/tests/bootstrap.test.js
       # The identity suite starts zsh as login and interactive shells, as the

@@ -21,12 +21,13 @@ holds `workflows: write`.
 | Issue forms: Epic, Task, Bug, Decision, Spike | `.github/ISSUE_TEMPLATE/` |
 | Pull request template | `.github/pull_request_template.md` |
 | Reusable PR governance workflow (`governance/issue-link`, areas check) | `.github/workflows/pr-governance.yml` |
+| Reusable workflow that publishes `governance/issue-link` as the Checks App, from a caller's `workflow_run` job | `.github/workflows/issue-link-publish.yml` |
 | Issue-link matcher and its tests | `governance/issue-link.js`, `governance/tests/issue-link.test.js` |
 | Areas checker and its tests | `governance/areas-check.js`, `governance/tests/areas-check.test.js` |
 | How to find and prefactor hot shared files | `governance/HOTSPOTS-GUIDE.md` |
 | Bootstrap: issue types, default branch, labels, rulesets, Project, the `governance-checks` environment | `governance/bootstrap.sh` |
 | Agent identities: App manifests, creation, tokens, the agent shell's `gh` shim, posting a review | `governance/identity/` |
-| Tests of the workflow's pin check, the bootstrap and the identity scripts | `governance/tests/` |
+| Tests of the workflows' pin checks and key custody, the bootstrap and the identity scripts | `governance/tests/` |
 
 The issue forms set native issue types. Epic, Decision and Spike must exist as
 organisation issue types first — run the bootstrap before these forms reach
@@ -153,6 +154,80 @@ is the check run it publishes, named exactly `governance/issue-link` and
 created by the GitHub Actions app; the rulesets pin it to that app. That check
 run carries the verdict, and the job does not fail on it, so a failed job left
 by an older run cannot keep a pull request red after a later run passes.
+
+### `issue-link-publish.yml`: `governance/issue-link` from the Checks App
+
+`pr-governance.yml` above posts `governance/issue-link` as the GitHub Actions
+app. That copy can be forged by any workflow a pull request adds, and it is
+filed in the commit's oldest Actions check suite, which a ruleset stops
+counting once that workflow runs again on the commit
+([.github#6](https://github.com/marvinamiranda/.github/issues/6)). This
+reusable workflow posts the same verdict, with the same judge
+(`governance/issue-link.js`), as the Checks App
+([.github#7](https://github.com/marvinamiranda/.github/issues/7), Task
+[.github#10](https://github.com/marvinamiranda/.github/issues/10)). Until the
+rulesets move to the Checks App and `pr-governance.yml` stops posting, the two
+run side by side (the shadow period) and the Actions copy is the one required.
+
+A caller calls it from the `workflow_run` job of its PR gate, on the default
+branch's copy of that workflow (`workflow_run` always runs the default branch's
+file, so a pull request cannot edit the job that receives the key):
+
+```yaml
+  issue-link:
+    if: github.event.workflow_run.event == 'pull_request'
+    permissions: { contents: read, issues: read, pull-requests: read }
+    uses: marvinamiranda/.github/.github/workflows/issue-link-publish.yml@<40-char sha>
+    with:
+      runs-on: '["self-hosted", "gate-ephemeral"]'   # exactly this; see below
+      governance-ref: <the same 40-char sha>
+```
+
+**`runs-on` must be `["self-hosted", "gate-ephemeral"]`.** This job holds the
+Checks App key, and `gate-ephemeral` is the single-use VM pool made for it
+(decision E). The workflow cannot check the label it is given, so the caller
+is the control: any other pool (`pool-linux` runs pull request code on shared
+hosts) would put the key where pull request code has run. A caller passing
+anything else is a `tier:senior` finding.
+
+- Inputs: `runs-on` (JSON, required, no default) and `governance-ref`, which
+  must equal the commit the caller's `uses:` pins and be a commit of this
+  repository's `test`. The pin check is the block in `pr-governance.yml`,
+  byte for byte; a bad pin fails the job before a token is minted or any code
+  is fetched, and nothing is posted.
+- Order: verify the pin; fetch `governance/issue-link.js` at `governance-ref`
+  and judge, holding only the read `GITHUB_TOKEN`; mint the Checks App token
+  (this repository, `checks: write` only); one inline script POSTs the verdict
+  on the pull request's **current** head. The fetched code never sees the key.
+- `workflow_run.pull_requests` lists **every** open pull request whose head
+  sha or head branch matches the run, in any repository. The workflow judges
+  **each one whose base repository is this repository** and posts one check
+  per head commit, a success only if every pull request on that commit
+  passed. If none belongs to this repository, or the payload does not say
+  which repository this is, the job fails and posts nothing. If the judge
+  cannot run, a **failure** is posted for the head (the pull request's, or
+  else the run's own commit), so a success from before a body edit does not
+  stand; if no head commit can be found at all, the job fails and posts nothing.
+- A summary is cut at 60,000 characters with a `(truncated)` marker (both here
+  and in `pr-governance.yml`): the API refuses one over 65,535, and a crafted
+  body could otherwise make the post fail and leave an older success standing.
+- Runs for one commit queue (`concurrency` on the job, never cancelling); the
+  last to run judges the pull requests as they are then.
+- The workflow names the `governance-checks` environment itself
+  (`deployment: false`); the caller sets nothing. Because that environment
+  admits any job on `test`, the workflow checks out no pull request code, has
+  no `run:` step and no `${{ }}` inside a script.
+  `governance/tests/issue-link-publish.test.js` pins each of these, and
+  `governance/tests/issue-link-publish.mutations.js` shows the suite failing on
+  45 deliberately broken copies. No other workflow in this repository may name
+  the environment or the key (also tested).
+- Only JavaScript actions are used, because the `gate-ephemeral` VM has the
+  runner, git, python3, jq and curl and nothing else.
+
+It cannot be exercised on its own pull request: the caller's `workflow_run`
+runs the default branch's copy. The live proof is the caller's PR (omni237
+[#1276](https://github.com/marvinamiranda/omni237/issues/1276) and omni237-ops
+[#304](https://github.com/marvinamiranda/omni237-ops/issues/304) follow-ups).
 
 ### `governance / areas`
 

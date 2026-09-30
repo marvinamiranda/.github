@@ -143,6 +143,24 @@ const cases = [
     }
     ok(`pin check: ${name}`, issues.length === 0, issues.join('; '));
   }
+
+  // The check must fit the Checks API: a summary over 65,535 characters is
+  // refused, the check is not created, and an older success would stand.
+  const judgeStep = ((jobs['issue-link'] || {}).steps || []).find((s) => script(s).includes('lib.judge'));
+  for (const [label, summary, needsCut] of [['a huge summary', 'x'.repeat(168000), true], ['an ordinary one', 'Closes marvinamiranda/omni237#1', false]]) {
+    const created = [];
+    const core = { summary: { addHeading() { return this; }, addRaw() { return this; }, async write() {} } };
+    const github = { rest: { checks: { create: async (a) => { created.push(a); } } } };
+    const lib = { judge: async () => ({ ok: false, title: 'No closing issue link', summary, headSha: 'a'.repeat(40) }) };
+    try {
+      await new AsyncFunction('github', 'context', 'core', 'require', script(judgeStep))(
+        github, { repo: { owner: 'o', repo: 'r' } }, core, () => lib);
+    } catch (error) { created.push({ error: error.message }); }
+    const sent = created.length === 1 && created[0].output ? created[0].output.summary : null;
+    ok(`issue-link: ${label} is created as a check run within the API limit${needsCut ? ', cut and marked' : ', untouched'}`,
+      sent !== null && sent.length <= 65535 && (needsCut ? /\(truncated\)$/.test(sent) : sent === summary), JSON.stringify(created).slice(0, 120));
+  }
+
   console.log(`\n${total - failed}/${total} passed`);
   process.exit(failed ? 1 : 0);
 })();
