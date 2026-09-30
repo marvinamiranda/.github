@@ -1,0 +1,285 @@
+#!/usr/bin/env node
+'use strict';
+
+// .github/workflows/issue-link-publish.yml: the reusable workflow that posts
+// `governance/issue-link` as the Checks App from an adopted repository's
+// `workflow_run` job (Epic marvinamiranda/.github#7, Task #10).
+//
+//   node governance/tests/issue-link-publish.test.js
+//
+// Static: the shape that keeps the Checks App key away from pull request code
+// (the custody review of .github#18 asked for a contract test). Behavioural:
+// the two inline scripts run against a fake API client and the real
+// governance/issue-link.js. Needs python3 with PyYAML, as pr-governance's does.
+//
+// ISSUE_LINK_PUBLISH_WORKFLOW / PR_GOVERNANCE_WORKFLOW point at other copies of
+// the workflows, which is how a deliberately broken copy is shown to turn this
+// suite red (see the mutation proof in the pull request).
+
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const ROOT = path.join(__dirname, '..', '..');
+const WORKFLOWS = path.join(ROOT, '.github', 'workflows');
+const PUBLISH = process.env.ISSUE_LINK_PUBLISH_WORKFLOW
+  ? path.resolve(process.env.ISSUE_LINK_PUBLISH_WORKFLOW)
+  : path.join(WORKFLOWS, 'issue-link-publish.yml');
+const GOVERNANCE = process.env.PR_GOVERNANCE_WORKFLOW
+  ? path.resolve(process.env.PR_GOVERNANCE_WORKFLOW)
+  : path.join(WORKFLOWS, 'pr-governance.yml');
+
+function load(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  const parsed = spawnSync('python3', ['-c', 'import json,sys,yaml;print(json.dumps(yaml.safe_load(open(sys.argv[1]))))', file], { encoding: 'utf8' });
+  if (parsed.status !== 0) { console.log(`not ok - ${path.basename(file)} parses: ${parsed.stderr.trim()}`); process.exit(1); }
+  return { text, doc: JSON.parse(parsed.stdout) };
+}
+
+let failed = 0;
+let total = 0;
+function ok(name, condition, detail = '') {
+  total += 1;
+  if (condition) console.log(`ok - ${name}`);
+  else { failed += 1; console.log(`not ok - ${name}${detail ? `: ${detail}` : ''}`); }
+}
+
+const { text, doc } = load(PUBLISH);
+const governance = load(GOVERNANCE);
+
+const job = (doc.jobs && doc.jobs.publish) || {};
+const steps = job.steps || [];
+const script = (s) => (s && s.with && typeof s.with.script === 'string' ? s.with.script : '');
+const stepText = (s) => JSON.stringify(s);
+const byName = (name) => steps.find((s) => s.name === name);
+const indexOfStep = (name) => steps.findIndex((s) => s.name === name);
+const BEGIN = /\/\/ BEGIN verify-pin[^\n]*\n/;
+const END = /\n[ \t]*\/\/ END verify-pin/;
+const FULL_SHA = /^[0-9a-f]{40}$/;
+const MINTED = '${{ steps.checks-app.outputs.token }}';
+
+const verify = byName('Verify the pin');
+const fetchStep = byName('Fetch the shared matcher');
+const judgeStep = byName('Judge the pull request');
+const mint = byName('Mint the Checks App token');
+const post = byName('Publish governance/issue-link');
+ok('the five steps exist', [verify, fetchStep, judgeStep, mint, post].every(Boolean));
+
+// ------------------------------------------------ trigger and inputs ------
+const call = (doc.on || doc[true] || {}).workflow_call;
+ok('it is a reusable workflow and nothing else', call && Object.keys(doc.on || doc[true]).join() === 'workflow_call');
+const inputs = (call && call.inputs) || {};
+ok('runs-on is required and has no default', inputs['runs-on'] && inputs['runs-on'].required === true && !('default' in inputs['runs-on']));
+ok('governance-ref is required', inputs['governance-ref'] && inputs['governance-ref'].required === true);
+ok('the workflow names no hosted runner label', !/ubuntu-|macos-|windows-/.test(text.replace(/^\s*#.*$/gm, '')));
+ok('the job runs on the runner the caller passes', job['runs-on'] === '${{ fromJSON(inputs.runs-on) }}');
+
+// ------------------------------------------------ the event guard ---------
+ok('the job runs only for the completion of a pull_request run',
+  job.if === "github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'", String(job.if));
+
+// ------------------------------------------------ permissions, environment
+ok('the GITHUB_TOKEN reads and cannot write a check',
+  JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read', issues: 'read', 'pull-requests': 'read' }), JSON.stringify(job.permissions));
+ok('no permission block at any level grants checks or write',
+  !/^\s*checks\s*:/m.test(text.replace(/^\s*#.*$/gm, '')) && !/:\s*write\b/.test(JSON.stringify(doc.permissions || {}) + JSON.stringify(job.permissions || {})));
+ok('the job is in the governance-checks environment, without a deployment record',
+  job.environment && job.environment.name === 'governance-checks' && job.environment.deployment === false, JSON.stringify(job.environment));
+ok('no other job exists', Object.keys(doc.jobs || {}).join() === 'publish');
+
+// ------------------------------------------------ pins ------------------
+const uses = steps.map((s) => s.uses).filter(Boolean);
+ok('every action is pinned to a full commit SHA', uses.length === 5 && uses.every((u) => FULL_SHA.test(u.split('@')[1] || '')), uses.join(', '));
+ok('only first-party actions are used', uses.every((u) => /^actions\//.test(u)), uses.join(', '));
+ok('no setup-* action (the gate VM has no toolcache)', uses.every((u) => !/\/setup-/.test(u)));
+
+// ------------------------------------------------ nothing of the PR runs -
+ok('there is no run: step, so no shell', steps.every((s) => !('run' in s)));
+ok('no script carries a ${{ }} expression: everything reaches it as env or event data',
+  steps.every((s) => !/\$\{\{/.test(script(s))), 'a ${{ }} expression sits inside a script');
+const checkouts = steps.filter((s) => /^actions\/checkout@/.test(s.uses || ''));
+ok('there is exactly one checkout, and it is of marvinamiranda/.github at governance-ref, not of the caller',
+  checkouts.length === 1 && checkouts[0].with.repository === 'marvinamiranda/.github'
+    && checkouts[0].with.ref === '${{ inputs.governance-ref }}' && checkouts[0].with.path === '.org-governance'
+    && checkouts[0].with['persist-credentials'] === false, JSON.stringify(checkouts.map((c) => c.with)));
+ok('the checkout takes only governance/issue-link.js', checkouts[0] && checkouts[0].with['sparse-checkout'] === 'governance/issue-link.js');
+ok('the workflow never mentions a pull request head, merge ref or fork',
+  !/pull_request\.head|refs\/pull|head_ref|head\.repo|head_branch/.test(text.replace(/^\s*#.*$/gm, '')));
+
+// ------------------------------------------------ ordering ---------------
+const at = { verify: indexOfStep('Verify the pin'), fetch: indexOfStep('Fetch the shared matcher'), judge: indexOfStep('Judge the pull request'),
+  mint: indexOfStep('Mint the Checks App token'), post: indexOfStep('Publish governance/issue-link') };
+ok('order: verify, fetch, judge, mint, post', at.verify === 0 && at.verify < at.fetch && at.fetch < at.judge && at.judge < at.mint && at.mint < at.post, JSON.stringify(at));
+ok('the pin step has the id pin, and its env is the workflow commit, the workflow repository and governance-ref',
+  verify && verify.id === 'pin' && verify.env.SELF_SHA === '${{ job.workflow_sha }}' && verify.env.SELF_REPOSITORY === '${{ job.workflow_repository }}'
+    && verify.env.GOVERNANCE_REF === '${{ inputs.governance-ref }}', verify && JSON.stringify(verify.env));
+ok('the workflow never reads github.workflow_sha (the caller\'s commit)', !/github\.workflow_sha|GITHUB_WORKFLOW_SHA/.test(text));
+for (const [label, s] of [['fetch', fetchStep], ['judge', judgeStep], ['mint', mint], ['post', post]]) {
+  ok(`${label}: runs only when the pin verified`, s && /steps\.pin\.outputs\.ok\s*==\s*'true'/.test(s.if || ''), s && s.if);
+}
+for (const [label, s] of [['mint', mint], ['post', post]]) {
+  ok(`${label}: runs only after the judge produced a verdict`, s && /steps\.judge\.outputs\.judged\s*==\s*'true'/.test(s.if || ''), s && s.if);
+}
+ok('the judge step has the id judge', judgeStep && judgeStep.id === 'judge');
+ok('a failed pin is not answered with a check: nothing in the pin step posts', verify && !/check-runs|checks\.create|github\.request/.test(script(verify)));
+ok('a failed pin fails the job (nothing is posted, no token minted)', verify && /core\.setFailed\(problem\)/.test(script(verify)));
+
+// ------------------------------------------------ the key ----------------
+const KEY = /CHECKS_APP_PRIVATE_KEY/;
+ok('the key secret is named by exactly one step, the mint', steps.filter((s) => KEY.test(stepText(s))).length === 1 && mint && KEY.test(stepText(mint)));
+ok('the mint step asks for this repository only, checks write only',
+  mint && mint.with['repositories'] === '${{ github.event.repository.name }}' && mint.with['owner'] === '${{ github.repository_owner }}'
+    && mint.with['permission-checks'] === 'write'
+    && Object.keys(mint.with).filter((k) => k.startsWith('permission-')).join() === 'permission-checks',
+  mint && JSON.stringify(mint.with));
+ok('the mint step reads the client id and key from the environment',
+  mint && mint.with['client-id'] === '${{ vars.CHECKS_APP_CLIENT_ID }}' && mint.with['private-key'] === '${{ secrets.CHECKS_APP_PRIVATE_KEY }}');
+ok('the minted token reaches exactly one step, the post, as its github-token',
+  steps.filter((s) => stepText(s).includes('steps.checks-app.outputs.token')).length === 1 && post && post.with['github-token'] === MINTED);
+ok('the fetched code never sees the minted token or any secret',
+  [verify, fetchStep, judgeStep].every((s) => s && !/secrets\.|steps\.checks-app/.test(stepText(s))));
+ok('no step other than the mint reads the secrets context', steps.filter((s) => /secrets\./.test(stepText(s))).length === 1);
+ok('the file takes no third-party secret, only the Checks App\'s',
+  [...text.matchAll(/secrets\.([A-Z0-9_]+)/g)].every((m) => m[1] === 'CHECKS_APP_PRIVATE_KEY'));
+
+// ------------------------------------------------ the one post ----------
+const posts = steps.filter((s) => /check-runs|checks\.create|checks\.update|createCommitStatus|repos\.createStatus/.test(stepText(s)));
+ok('exactly one step posts anything, and it is the post step', posts.length === 1 && posts[0] === post);
+ok('the post uses the minted token, not the GITHUB_TOKEN', post && post.with['github-token'] === MINTED && !/GITHUB_TOKEN|github\.token/.test(stepText(post)));
+ok('the workflow never creates a check through github.rest or checks.create anywhere', !/checks\.create|rest\.checks|github\.rest\.checks/.test(text));
+ok('no step other than the post passes a github-token at all', steps.filter((s) => s.with && 'github-token' in s.with).length === 1);
+ok('the post is a POST to check-runs for governance/issue-link',
+  post && /github\.request\('POST \/repos\/\{owner\}\/\{repo\}\/check-runs'/.test(script(post)) && /name: 'governance\/issue-link'/.test(script(post)));
+ok('the post takes the head from the verdict, not from the event', post && /head_sha: verdict\.headSha/.test(script(post)) && !/workflow_run/.test(script(post)));
+ok('the verdict file lives in RUNNER_TEMP, outside the workspace',
+  /RUNNER_TEMP/.test(script(judgeStep)) && /RUNNER_TEMP/.test(script(post)) && !/GITHUB_WORKSPACE/.test(text));
+
+// ------------------------------------------------ the pin block ----------
+const block = (t) => { const b = (t.split(BEGIN)[1] || '').split(END)[0]; return b.split('\n').map((l) => l.trim()).join('\n').trim(); };
+const govScripts = Object.values(governance.doc.jobs).flatMap((j) => (j.steps || []).map(script)).filter((s) => BEGIN.test(s));
+ok('pr-governance.yml still carries the pin check', govScripts.length >= 1);
+ok('the pin check is byte-identical to pr-governance.yml\'s (whitespace-trimmed)',
+  govScripts.length >= 1 && govScripts.every((g) => block(g) === block(script(verify))) && block(script(verify)).length > 200);
+
+// ------------------------------------------------ no other workflow ------
+const others = fs.readdirSync(WORKFLOWS).filter((f) => /\.ya?ml$/.test(f) && f !== 'issue-link-publish.yml');
+for (const f of others) {
+  const t = fs.readFileSync(path.join(WORKFLOWS, f), 'utf8');
+  ok(`${f}: names neither the governance-checks environment nor the Checks App key`, !/governance-checks|CHECKS_APP_/.test(t));
+}
+
+// ------------------------------------------------ behaviour --------------
+const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+const HEAD = 'c'.repeat(40);
+const work = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-link-publish-'));
+fs.symlinkSync(ROOT, path.join(work, '.org-governance'));
+fs.mkdirSync(path.join(work, 'tmp'));
+
+function fakeCore() {
+  const out = { failed: [], outputs: {}, summary: [] };
+  return {
+    out,
+    setFailed: (m) => out.failed.push(String(m)),
+    setOutput: (k, v) => { out.outputs[k] = v; },
+    summary: { addHeading() { return this; }, addRaw(t) { out.summary.push(t); return this; }, async write() {} },
+  };
+}
+function fakeApi({ body = 'Closes #742', closing = [742], pullsGet = null } = {}) {
+  const calls = [];
+  return {
+    calls,
+    rest: {
+      pulls: { get: async (a) => { calls.push(['pulls.get', a.pull_number]);
+        if (pullsGet) return pullsGet(calls);
+        return { data: { number: a.pull_number, body, head: { ref: 'x', sha: HEAD }, base: { ref: 'test' } } }; } },
+      repos: { get: async () => ({ data: { default_branch: 'test' } }) },
+      issues: { get: async () => ({ data: {} }) },
+    },
+    graphql: async () => ({ repository: { pullRequest: { closingIssuesReferences: { totalCount: closing.length,
+      nodes: closing.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }),
+    async request(route, params) { calls.push(['request', route, params]); return { data: {} }; },
+  };
+}
+const realRequire = require;
+const requireFrom = (p) => (p.startsWith('.') ? realRequire(path.resolve(work, p)) : realRequire(p));
+const context = (pulls) => ({ repo: { owner: 'marvinamiranda', repo: 'omni237' }, payload: { workflow_run: { event: 'pull_request', pull_requests: pulls } } });
+
+async function runJudge(github, ctx) {
+  const core = fakeCore();
+  process.env.RUNNER_TEMP = path.join(work, 'tmp');
+  const file = path.join(work, 'tmp', 'issue-link-verdict.json');
+  fs.rmSync(file, { force: true });
+  await new AsyncFunction('github', 'context', 'core', 'require', script(judgeStep))(github, ctx, core, requireFrom);
+  return { core, verdict: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null };
+}
+async function runPost(github) {
+  const core = fakeCore();
+  process.env.RUNNER_TEMP = path.join(work, 'tmp');
+  await new AsyncFunction('github', 'context', 'core', 'require', script(post))(github, context([{ number: 1 }]), core, requireFrom);
+  return core;
+}
+
+(async () => {
+  if (!judgeStep || !post) { console.log('not ok - behaviour: the steps are missing'); process.exit(1); }
+
+  // A closing link: success, and the verdict is for the PR's CURRENT head.
+  let gh = fakeApi();
+  let r = await runJudge(gh, context([{ number: 761 }]));
+  ok('judge: a pull request that closes an issue is a success on its current head',
+    r.verdict && r.verdict.ok === true && r.verdict.headSha === HEAD && r.core.out.failed.length === 0, JSON.stringify(r.verdict));
+  ok('judge: it read the pull request the run lists', gh.calls.some((c) => c[0] === 'pulls.get' && c[1] === 761));
+  ok('judge: it posts nothing', !gh.calls.some((c) => c[0] === 'request'));
+  ok('judge: it marks the verdict for the mint and post steps', r.core.out.outputs.judged === 'true');
+
+  gh = fakeApi({ body: 'no link here', closing: [] });
+  r = await runJudge(gh, context([{ number: 761 }]));
+  ok('judge: a body with no closing keyword is a failure verdict', r.verdict && r.verdict.ok === false && r.verdict.headSha === HEAD, JSON.stringify(r.verdict));
+
+  for (const [label, pulls] of [['none', []], ['no list', undefined], ['a non-integer number', [{ number: '7' }]], ['number zero', [{ number: 0 }]]]) {
+    gh = fakeApi();
+    r = await runJudge(gh, context(pulls));
+    ok(`judge: a run listing ${label} fails the job and writes no verdict`,
+      r.core.out.failed.length === 1 && r.verdict === null && r.core.out.outputs.judged === undefined && gh.calls.length === 0, JSON.stringify(r.core.out));
+  }
+
+  // The judge cannot run: a FAILURE is published for the head, never silence.
+  gh = fakeApi({ pullsGet: (calls) => { if (calls.filter((c) => c[0] === 'pulls.get').length === 1) { const e = new Error('boom'); e.status = 502; throw e; }
+    return { data: { head: { sha: HEAD } } }; } });
+  r = await runJudge(gh, context([{ number: 761 }]));
+  ok('judge: an API error becomes a failure verdict on the head, not silence',
+    r.verdict && r.verdict.ok === false && r.verdict.headSha === HEAD && /502/.test(r.verdict.summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdict));
+
+  gh = fakeApi({ pullsGet: () => { const e = new Error('down'); e.status = 503; throw e; } });
+  r = await runJudge(gh, context([{ number: 761 }]));
+  ok('judge: if not even the head can be read, the job fails and nothing is written',
+    r.verdict === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined, JSON.stringify(r.core.out));
+
+  // The post.
+  const file = path.join(work, 'tmp', 'issue-link-verdict.json');
+  for (const [label, verdict, conclusion] of [
+    ['success', { ok: true, title: 'Closes x', summary: 'fine', headSha: HEAD }, 'success'],
+    ['failure', { ok: false, title: 'No closing issue link', summary: 'add one', headSha: HEAD }, 'failure'],
+    ['a truthy non-boolean ok is not a success', { ok: 'yes', title: 't', summary: 's', headSha: HEAD }, 'failure'],
+  ]) {
+    fs.writeFileSync(file, JSON.stringify(verdict));
+    gh = fakeApi();
+    const core = await runPost(gh);
+    const req = gh.calls.filter((c) => c[0] === 'request');
+    ok(`post: ${label} is published once, as ${conclusion}, on the verdict's head`,
+      req.length === 1 && req[0][1] === 'POST /repos/{owner}/{repo}/check-runs' && req[0][2].name === 'governance/issue-link'
+        && req[0][2].conclusion === conclusion && req[0][2].status === 'completed' && req[0][2].head_sha === HEAD
+        && req[0][2].owner === 'marvinamiranda' && req[0][2].repo === 'omni237' && core.out.failed.length === 0, JSON.stringify(req));
+  }
+  for (const [label, headSha] of [['missing', undefined], ['not a full sha', 'abc123'], ['a branch name', 'test']]) {
+    fs.writeFileSync(file, JSON.stringify({ ok: true, title: 't', summary: 's', headSha }));
+    gh = fakeApi();
+    const core = await runPost(gh);
+    ok(`post: a verdict whose head is ${label} posts nothing and fails the job`,
+      !gh.calls.some((c) => c[0] === 'request') && core.out.failed.length === 1);
+  }
+
+  fs.rmSync(work, { recursive: true, force: true });
+  console.log(`\n${total - failed}/${total} passed`);
+  process.exit(failed ? 1 : 0);
+})().catch((error) => { console.log(`not ok - the behaviour suite threw: ${error.stack}`); process.exit(1); });
