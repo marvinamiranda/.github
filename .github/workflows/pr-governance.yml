@@ -41,6 +41,27 @@
 # pin, and any change to .github/** in an adopted repository, is tier:senior
 # and has an adversarial review (DELIVERY §10).
 #
+# WHERE THE JOBS RUN (marvinamiranda/.github#34). Both jobs take seconds, and on
+# the caller's shared pool they queued behind 20-minute CI jobs: a body edit
+# that should re-run governance/issue-link in 10 s waited an hour, and the merge
+# waited with it. So there is a dedicated lane, `governance-lane`: one small
+# always-on runner that carries no `pool-linux` label, so no CI job can take it.
+#
+#   - The labels are the literal below, reviewed here. The organisation variable
+#     PR_GOVERNANCE_LANE only CHOOSES: exactly `dedicated` (GitHub compares
+#     strings ignoring case) selects the lane, and anything else, or nothing,
+#     keeps the caller's `runs-on`. No value can send these jobs to
+#     `gate-ephemeral` (decision E reserves it for the PR gate) or to a hosted
+#     runner.
+#   - A switch, not a hard-coded label, because a required check on a label no
+#     runner carries is a merge freeze in every adopted repository, including
+#     the pull request that would revert it. The switch lets this file and the
+#     callers' pins merge before the runner exists, and turns the lane off in
+#     one step, for every repository, if its runner goes down.
+#   - The caller's `runs-on` stays required and is still the fallback.
+#   - governance/tests/pr-governance.test.js evaluates the expression for each
+#     value; pr-governance.mutations.js proves the test sees each weakening.
+#
 # The check is inline because code fetched at governance-ref cannot vouch for
 # governance-ref; governance/tests/pr-governance.test.js runs it. Actions are
 # pinned by SHA for the same reason. No third-party actions.
@@ -64,7 +85,7 @@ jobs:
   issue-link:
     name: issue-link
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ vars.PR_GOVERNANCE_LANE == 'dedicated' && fromJSON('["self-hosted","governance-lane"]') || fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     permissions:
       checks: write
@@ -170,7 +191,7 @@ jobs:
   areas:
     name: areas
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ vars.PR_GOVERNANCE_LANE == 'dedicated' && fromJSON('["self-hosted","governance-lane"]') || fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     permissions:
       contents: read

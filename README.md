@@ -123,6 +123,20 @@ jobs:
 - No `paths:` filter: both jobs must report on every pull request.
 - `runs-on` is required and has no default, because a required check on a
   runner that never starts is a merge freeze.
+- **The governance lane** (#34). Both jobs take seconds, and on the shared
+  `pool-linux` they queued behind 20-minute CI jobs (an hour for a body edit on
+  2026-10-01). When the organisation variable `PR_GOVERNANCE_LANE` is exactly
+  `dedicated`, both jobs run on `["self-hosted", "governance-lane"]` instead: one
+  small always-on runner with no `pool-linux` label, so no CI job can take it.
+  The labels are a literal in the reusable workflow; the variable only chooses
+  between them and the caller's `runs-on`, and any other value, or none, keeps
+  the caller's. So the caller's `runs-on` is still what runs until the lane is
+  switched on, and again the moment the variable is deleted, in every adopted
+  repository at once. Only switch it on while a `governance-lane` runner is
+  online: a required check on a label no runner carries is a freeze.
+  `gate-ephemeral` is never an option here: decision E (#8) reserves it for the
+  PR gate, whose key-holding judge must not wait behind these jobs when the
+  pool's load guard stops it starting VMs.
 - Where the repository has an aggregating PR gate that wakes on `workflow_run`,
   add `PR governance` to its `workflow_run.workflows`: that makes the gate fire
   on every pull request, and stops it judging before governance has finished

@@ -23,8 +23,10 @@ jobs:
         run: node governance/tests/issue-link.test.js
       - name: areas checker
         run: node governance/tests/areas-check.test.js
-      - name: PR governance pin check
+      - name: PR governance pin check and runner lane
         run: node governance/tests/pr-governance.test.js
+      - name: PR governance, mutation proof
+        run: node governance/tests/pr-governance.mutations.js
       - name: issue-link publisher (Checks App workflow)
         run: node governance/tests/issue-link-publish.test.js
       - name: issue-link publisher, mutation proof

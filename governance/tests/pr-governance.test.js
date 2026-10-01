@@ -76,6 +76,51 @@ ok('the workflow never reads github.workflow_sha or GITHUB_WORKFLOW_SHA (in a ca
 const norm = (b) => b.split('\n').map((l) => l.trim()).join('\n').trim();
 ok('both jobs run the identical pin check', blocks.length === 2 && norm(blocks[0]) === norm(blocks[1]));
 
+// --------------------------------------------------------------- runner ----
+// marvinamiranda/.github#34: both jobs run on the dedicated `governance-lane`
+// runner when, and only when, the organisation variable PR_GOVERNANCE_LANE is
+// exactly `dedicated`; otherwise on the caller's runs-on. The expression is
+// read into its parts and EVALUATED for each value below, so what is proved is
+// where the jobs land, not that a string is spelt one way.
+const LANE_LABELS = ['self-hosted', 'governance-lane'];
+const HOSTED = /^(ubuntu|windows|macos)-/i;
+const SWITCH = /^\$\{\{ vars\.PR_GOVERNANCE_LANE == '([^']*)' && fromJSON\('(\[[^']*\])'\) \|\| fromJSON\(inputs\.runs-on\) \}\}$/;
+const runsOn = {};
+for (const name of ['issue-link', 'areas']) {
+  const raw = jobs[name] && jobs[name]['runs-on'];
+  const m = typeof raw === 'string' ? SWITCH.exec(raw) : null;
+  ok(`${name}: runs-on is the lane switch with the caller's runs-on as the fallback`, m !== null, JSON.stringify(raw));
+  if (!m) continue;
+  let labels = null;
+  try { labels = JSON.parse(m[2]); } catch (error) { labels = null; }
+  ok(`${name}: the lane's labels are a literal list in this file`, Array.isArray(labels) && labels.every((l) => typeof l === 'string'), m[2]);
+  runsOn[name] = { value: m[1], labels: Array.isArray(labels) ? labels : [] };
+}
+// PyYAML reads the key `on:` as the boolean true (YAML 1.1), which JSON spells "true".
+const triggers = workflow.on || workflow.true || {};
+const input = ((triggers.workflow_call || {}).inputs || {})['runs-on'] || {};
+ok('runs-on stays a required input with no default (a required check on a runner that never starts is a freeze)',
+  input.required === true && !('default' in input));
+const lanes = Object.values(runsOn);
+ok('both jobs switch together, on the same value, to the same labels',
+  lanes.length === 2 && JSON.stringify(lanes[0]) === JSON.stringify(lanes[1]), JSON.stringify(runsOn));
+for (const [name, lane] of Object.entries(runsOn)) {
+  ok(`${name}: the lane is exactly ${JSON.stringify(LANE_LABELS)}`, JSON.stringify(lane.labels) === JSON.stringify(LANE_LABELS), JSON.stringify(lane.labels));
+  ok(`${name}: the lane names no gate-ephemeral (decision E), no pool-linux (CI would land on it) and no hosted label`,
+    lane.labels.includes('self-hosted') && !lane.labels.some((l) => l === 'gate-ephemeral' || l === 'pool-linux' || HOSTED.test(l)),
+    JSON.stringify(lane.labels));
+  // GitHub's == on strings ignores case; an empty value would match an unset variable.
+  const where = (v, caller) => ((v !== undefined && v.toLowerCase() === lane.value.toLowerCase()) ? lane.labels : caller);
+  const caller = ['self-hosted', 'pool-linux'];
+  for (const [v, expectLane] of [[undefined, false], ['', false], ['true', false], ['1', false], ['on', false],
+    ['gate-ephemeral', false], ['["self-hosted","gate-ephemeral"]', false], ['dedicated ', false],
+    ['dedicated', true], ['Dedicated', true]]) {
+    const got = where(v, caller);
+    ok(`${name}: PR_GOVERNANCE_LANE=${JSON.stringify(v)} runs on ${expectLane ? 'the lane' : "the caller's runs-on"}`,
+      JSON.stringify(got) === JSON.stringify(expectLane ? LANE_LABELS : caller), JSON.stringify(got));
+  }
+}
+
 // ------------------------------------------------------------ behaviour ----
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
 const verifyPin = blocks[0] ? new AsyncFunction('github', 'env', `${blocks[0]}\nreturn verifyPin({ github, env });`) : null;
