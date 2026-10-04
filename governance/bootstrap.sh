@@ -9,16 +9,17 @@
 # required checks run, has no ruleset: "on test" means only "pushed".
 #
 # THEN, FOR EACH PRODUCT REPOSITORY, in this order, and only AFTER its adoption
-# pull request has merged into its test: every step reads that repository's
-# .github/governance/ from test (a dry run can read an unmerged one with
-# --config-dir). Each run from a merged commit (below):
+# pull request has merged into its dev branch: every step reads that
+# repository's .github/governance/ from dev (a dry run can read an unmerged one
+# with --config-dir). Each run from a merged commit (below):
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops                                # 1. dry run
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops --no-rulesets --apply          # 2. default branch, labels
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops --probe --no-rulesets --apply  # 3. Reviewer App probe
-#   4. one Agent App squash-merge into test: under the rulesets a passing pull
-#      request is the only way in, and the Agent App merges agents' ones.
-#      Proven: marvinamiranda/omni237-ops#160 was squash-merged into test by
-#      app/marvinamiranda-agent (commit 2be0641, 2026-09-25 17:52 UTC).
+#   4. one Agent App merge into dev: under the rulesets a passing pull request
+#      is the only way in, and the Agent App merges agents' ones. Proven for
+#      test before the dev cutover: marvinamiranda/omni237-ops#160 was
+#      squash-merged into test by app/marvinamiranda-agent (commit 2be0641,
+#      2026-09-25 17:52 UTC).
 #   governance/bootstrap.sh --repo omni237 --repo omni237-ops --apply                        # 5. rulesets, owner only
 # Without --no-rulesets, step 3 would also apply the rulesets in the same run.
 #
@@ -62,31 +63,36 @@
 #
 # Product structure lives in each product repository, never here (DELIVERY §6):
 # it reads .github/governance/{areas.txt, required-checks.txt,
-# required-checks.main.txt} from each repo's `test` branch, or from
-# --config-dir <dir>/<repo>/ for local testing.
+# required-checks.dev.txt, required-checks.main.txt} from each repo's `dev`
+# branch, or from --config-dir <dir>/<repo>/ for local testing.
+#
+# The branch model (DELIVERY §9.1): dev is the integration default every Task
+# branches from and merges into; test is acceptance, entered only by a
+# promotion from dev; main is production, entered only by a release from test
+# or a hotfix branch. Hotfixes are merged back into test the same day.
 #
 # What it does, in order:
 #   a) org issue types Epic, Decision, Spike (Task and Bug must already exist;
 #      Feature is left alone)
-#   b) per repo: default branch -> test (closing keywords only act on merges
+#   b) per repo: default branch -> dev (closing keywords only act on merges
 #      into the default branch, DELIVERY §4)
 #   c) per repo: the §11 labels, plus area:* labels from areas.txt
 #   d) with --probe: the Reviewer App posts a neutral review/independent check
 #      on each repo's test head, proving it can post there before a ruleset
 #      pins the check to it
-#   e) rulesets `test-integration`, `main-owner-only` and `main-checks` on
-#      marvinamiranda/.github itself first, then on each repo, created or
-#      updated by name (DELIVERY §9, §10); legacy rulesets on test or main are
-#      set to enforcement `disabled` (never deleted). They need the Reviewer
-#      App's id: without it the run stops before it changes anything. Skipped
-#      with --no-rulesets. With --self-only, d) and e) for this repository are
-#      all that runs.
+#   e) rulesets `dev-integration`, `test-integration`, `main-owner-only` and
+#      `main-checks` on marvinamiranda/.github itself first, then on each repo,
+#      created or updated by name (DELIVERY §9, §10); legacy rulesets on dev,
+#      test or main are set to enforcement `disabled` (never deleted). They
+#      need the Reviewer App's id: without it the run stops before it changes
+#      anything. Skipped with --no-rulesets. With --self-only, d) and e) for
+#      this repository are all that runs.
 #   f) with --project: the Project, its Status/Priority/Size fields, and a link
 #      to each repo
 #   g) per repo (not with --self-only): the governance-checks environment,
 #      which holds the Checks App's key (governance/identity/create-app.py
 #      mm-checks). Custom deployment branches with exactly one rule, the branch
-#      test: only default-branch jobs get the key. Any other rule (refs/pull/*,
+#      dev: only default-branch jobs get the key. Any other rule (refs/pull/*,
 #      *, a tag) or policy (protected branches, none) is drift: reported in a
 #      dry run, removed by --apply. It runs with --no-rulesets too.
 #
@@ -139,7 +145,11 @@ OWNER_USER_ID=1245936
 SELF_REPO=".github"
 SELF_CHECKS="governance tests"
 CONFIG_DIR=""
-CONFIG_REF="test"
+# Product configuration is read from the repository's dev branch: dev is the
+# integration default (DELIVERY §9.1), the branch every adoption pull request
+# merges into and every Task branches from. `.github` itself still integrates
+# on test (it has no dev), so --self-only reads nothing.
+CONFIG_REF="dev"
 STRICT_UP_TO_DATE=false
 REVIEWER_APP_ID=""
 REVIEWER_APP_JSON="${MM_REVIEWER_APP_JSON:-$HOME/.config/mm-agent/mm-reviewer/app.json}"
@@ -397,8 +407,15 @@ for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   fetch "repos/$ORG/$repo" || { echo "Repository $ORG/$repo not found" >&2; exit 1; }
   load_config "$repo" areas.txt required
   load_config "$repo" required-checks.txt required
+  # required-checks.dev.txt is optional: its absence is a repository that adds
+  # no dev-only checks, and the dev ruleset still requires issue-link and the
+  # independent review. Reported, never a failure.
+  load_config "$repo" required-checks.dev.txt optional
   load_config "$repo" required-checks.main.txt optional
-  info "$repo: $(config_lines "$WORK/cfg/$repo/areas.txt" | wc -l | tr -d ' ') areas, $(config_lines "$WORK/cfg/$repo/required-checks.txt" | wc -l | tr -d ' ') required checks (+$(config_lines "$WORK/cfg/$repo/required-checks.main.txt" | wc -l | tr -d ' ') on main)"
+  info "$repo: $(config_lines "$WORK/cfg/$repo/areas.txt" | wc -l | tr -d ' ') areas, $(config_lines "$WORK/cfg/$repo/required-checks.txt" | wc -l | tr -d ' ') required checks on test (+$(config_lines "$WORK/cfg/$repo/required-checks.dev.txt" | wc -l | tr -d ' ') on dev, +$(config_lines "$WORK/cfg/$repo/required-checks.main.txt" | wc -l | tr -d ' ') on main)"
+  if [[ "$(config_lines "$WORK/cfg/$repo/required-checks.dev.txt" | wc -l | tr -d ' ')" == "0" ]]; then
+    info "$repo: no .github/governance/required-checks.dev.txt; the dev ruleset requires issue-link and review/independent alone."
+  fi
 done
 
 # ------------------------------------------------------ a) issue types ----
@@ -439,13 +456,14 @@ section "b) Default branch"
 for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   fetch "repos/$ORG/$repo"
   current_default="$(jq -r .default_branch <<<"$BODY")"
-  if [[ "$current_default" == "test" ]]; then
-    info "$repo: test"
+  if [[ "$current_default" == "$CONFIG_REF" ]]; then
+    info "$repo: $CONFIG_REF"
     continue
   fi
-  fetch "repos/$ORG/$repo/branches/test" || { warn "$repo has no test branch; default branch left as '$current_default'."; continue; }
-  info "$repo: '$current_default' -> 'test'. Closing keywords only act on merges into the default branch (DELIVERY §4); workflow_run and schedule workflows will run test's copies."
-  jq -n '{default_branch: "test"}' >"$WORK/default-$repo.json"
+  # The cutover point: dev must exist before the default branch moves to it.
+  fetch "repos/$ORG/$repo/branches/$CONFIG_REF" || { warn "$repo has no $CONFIG_REF branch; default branch left as '$current_default'."; continue; }
+  info "$repo: '$current_default' -> '$CONFIG_REF'. Closing keywords only act on merges into the default branch (DELIVERY §4); workflow_run and schedule workflows will run $CONFIG_REF's copies."
+  jq -n --arg b "$CONFIG_REF" '{default_branch: $b}' >"$WORK/default-$repo.json"
   mutate_json PATCH "repos/$ORG/$repo" "$WORK/default-$repo.json"
 done
 
@@ -503,11 +521,13 @@ done
 # required_status_checks entries: every Actions check pinned to the Actions app,
 # plus review/independent pinned to the Reviewer App when its id is known.
 required_checks_json() {
-  # $1: review | none    $2: issue-link | none    $3...: check list files
-  local with_review="$1" with_link="$2"; shift 2
+  # $1: review | none
+  # $2: extra check contexts, space-separated, or "none"
+  # $3...: check list files
+  local with_review="$1" extra="$2"; shift 2
   {
     for f in "$@"; do config_lines "$f"; done
-    if [[ "$with_link" == "issue-link" ]]; then echo "governance/issue-link"; fi
+    if [[ "$extra" != "none" ]]; then for c in $extra; do echo "$c"; done; fi
   } | awk '!seen[$0]++' | jq -R -s --argjson app "$ACTIONS_APP_ID" '
       split("\n") | map(select(length > 0) | {context: ., integration_id: $app})' >"$WORK/checks.json"
   if [[ "$with_review" == "review" && -n "$REVIEWER_APP_ID" ]]; then
@@ -517,12 +537,38 @@ required_checks_json() {
   fi
 }
 
-# test-integration (DELIVERY §9): pull request, no approvals (the review is the
-# pinned review/independent check), required checks, no force push, no
-# deletion, no bypass for anyone. Squash, which is how every Task lands, or a
-# merge commit, which exists only to bring main back into test after a hotfix
-# (a pull request from main), so the two branches keep one history. A ruleset
-# cannot tie a merge method to a head branch: that one is procedural.
+# dev-integration (DELIVERY §9.1): the integration default. Pull request, no
+# approvals (the review is the pinned review/independent check), no force push,
+# no deletion, no bypass for anyone, merge commits only. Any branch may open a
+# pull request into dev; the dev checks are the repository's
+# required-checks.dev.txt (optional) plus governance/issue-link.
+dev_ruleset() {
+  jq -n --argjson checks "$1" --argjson strict "$STRICT_UP_TO_DATE" '{
+    name: "dev-integration", target: "branch", enforcement: "active",
+    bypass_actors: [],
+    conditions: {ref_name: {include: ["refs/heads/dev"], exclude: []}},
+    rules: [
+      {type: "deletion"},
+      {type: "non_fast_forward"},
+      {type: "pull_request", parameters: {
+        required_approving_review_count: 0, dismiss_stale_reviews_on_push: true,
+        require_code_owner_review: false, require_last_push_approval: false,
+        required_review_thread_resolution: false,
+        require_extra_approval_for_unattributed_changes: false,
+        allowed_merge_methods: ["merge"]}},
+      {type: "required_status_checks", parameters: {
+        strict_required_status_checks_policy: $strict, do_not_enforce_on_create: false,
+        required_status_checks: $checks}}
+    ]}'
+}
+
+# test-integration (DELIVERY §9.1): acceptance, entered only by a promotion
+# from dev, a hotfix branch, or the hotfix back-merge from main (the
+# test-source-policy check enforces the sources). Pull request, no approvals
+# (the review is the pinned review/independent check), required checks, no
+# force push, no deletion, no bypass for anyone, merge commits only so test and
+# main keep one history. A ruleset cannot tie a merge method to a head branch:
+# that one is procedural.
 test_ruleset() {
   jq -n --argjson checks "$1" --argjson strict "$STRICT_UP_TO_DATE" '{
     name: "test-integration", target: "branch", enforcement: "active",
@@ -536,7 +582,7 @@ test_ruleset() {
         require_code_owner_review: false, require_last_push_approval: false,
         required_review_thread_resolution: false,
         require_extra_approval_for_unattributed_changes: false,
-        allowed_merge_methods: ["squash", "merge"]}},
+        allowed_merge_methods: ["merge"]}},
       {type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: $strict, do_not_enforce_on_create: false,
         required_status_checks: $checks}}
@@ -636,11 +682,11 @@ fi
 # --------------------------------------------------------- e) rulesets ----
 section "e) Rulesets"
 # --no-rulesets: everything but the rulesets, so that the Reviewer App probe and
-# one Agent App merge into test are proven before the rulesets make a passing
-# pull request the only way into test.
+# one Agent App merge into dev are proven before the rulesets make a passing
+# pull request the only way in.
 # This repository first: it holds the code every other repository's checks run.
 if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=("$SELF_REPO" ${REPOS[@]+"${REPOS[@]}"}); fi
-OURS=" test-integration main-owner-only main-checks "
+OURS=" dev-integration test-integration main-owner-only main-checks "
 for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
   info "[$repo]"
   existing="$(get_all "repos/$ORG/$repo/rulesets?includes_parents=true&per_page=100")"
@@ -656,27 +702,36 @@ for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
     jq '{id, name, source_type, enforcement, conditions, bypass_actors, rules}' <<<"$detail" | sed 's/^/      /'
     rs_name="$(jq -r .name <<<"$detail")"
     case "$OURS" in *" $rs_name "*) continue ;; esac
-    # A repository ruleset of ours-to-replace: active on test or main.
+    # A repository ruleset of ours-to-replace: active on dev, test or main.
     if jq -e '.source_type == "Repository" and .enforcement != "disabled"
-        and ([.conditions.ref_name.include[]?] | any(. == "refs/heads/test" or . == "refs/heads/main" or . == "~DEFAULT_BRANCH" or . == "~ALL"))' \
+        and ([.conditions.ref_name.include[]?] | any(. == "refs/heads/dev" or . == "refs/heads/test" or . == "refs/heads/main" or . == "~DEFAULT_BRANCH" or . == "~ALL"))' \
         <<<"$detail" >/dev/null; then
       printf '%s\t%s\n' "$id" "$rs_name" >>"$WORK/legacy-$repo"
     fi
   done < <(jq -r '.[].id' <<<"$existing")
 
+  payloads=()
   if [[ "$repo" == "$SELF_REPO" ]]; then
-    # This repository runs no PR governance on itself; its own tests are the check.
+    # This repository integrates on test (it has no dev) and runs no PR
+    # governance on itself; its own tests are the check, so no dev ruleset and
+    # no source-policy or issue-link context.
     printf '%s\n' "$SELF_CHECKS" >"$WORK/self-checks.txt"
     test_ruleset "$(required_checks_json review none "$WORK/self-checks.txt")" >"$WORK/rs-test-$repo.json"
     main_checks_ruleset "$(required_checks_json none none "$WORK/self-checks.txt")" >"$WORK/rs-main-checks-$repo.json"
+    payloads=("$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json")
   else
     cfg="$WORK/cfg/$repo"
-    test_ruleset "$(required_checks_json review issue-link "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
-    main_checks_ruleset "$(required_checks_json none issue-link "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
+    # dev gets the repository's optional dev checks, issue-link, and the
+    # independent review; test adds the source policy and the full test checks;
+    # main adds the source policy, issue-link and the main-only checks.
+    dev_ruleset "$(required_checks_json review "governance/issue-link" "$cfg/required-checks.dev.txt")" >"$WORK/rs-dev-$repo.json"
+    test_ruleset "$(required_checks_json review "test-source-policy governance/issue-link" "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
+    main_checks_ruleset "$(required_checks_json none "main-source-policy governance/issue-link" "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
+    payloads=("$WORK/rs-dev-$repo.json" "$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json")
   fi
   main_owner_ruleset >"$WORK/rs-main-owner-$repo.json"
 
-  for payload in "$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json"; do
+  for payload in "${payloads[@]}"; do
     name="$(jq -r .name "$payload")"
     id="$(jq -r --arg n "$name" 'map(select(.name == $n and .source_type == "Repository")) | first | .id // empty' <<<"$existing")"
     if [[ -z "$id" ]]; then
@@ -788,17 +843,17 @@ fi
 # ------------------------------------ g) the governance-checks environment ----
 # The Checks App's private key lives only in this environment's secret
 # (marvinamiranda/.github#9), so which refs may use the environment decides who
-# can post the merge-gating checks. Only jobs on the default branch, test:
+# can post the merge-gating checks. Only jobs on the default branch, dev:
 # a custom deployment-branch policy (never "protected branches", which admits
 # every protected branch, nor none, which admits every ref) whose one rule is
-# the branch `test`. Any other rule, `refs/pull/*`, `*` or a tag, would release
+# the branch `dev`. Any other rule, `refs/pull/*`, `*` or a tag, would release
 # the key to that ref: it is drift, reported, and removed by --apply (the one
 # thing this script deletes, since keeping it is the hole). Drift goes before
 # the rule is added, so a failure part way leaves fewer refs allowed, not more.
 # create-app.py mm-checks --to-environment checks the same shape before it
 # creates the App.
 CHECKS_ENV="governance-checks"
-CHECKS_ENV_BRANCH="test"
+CHECKS_ENV_BRANCH="$CONFIG_REF"
 section "g) Environment $CHECKS_ENV"
 (( ! SELF_ONLY )) || info "skipped (--self-only)"
 for repo in ${REPOS[@]+"${REPOS[@]}"}; do

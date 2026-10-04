@@ -21,8 +21,10 @@ holds `workflows: write`.
 | Issue forms: Epic, Task, Bug, Decision, Spike | `.github/ISSUE_TEMPLATE/` |
 | Pull request template | `.github/pull_request_template.md` |
 | Reusable PR governance workflow (`governance/issue-link`, areas check) | `.github/workflows/pr-governance.yml` |
+| Reusable source-policy workflow (`test-source-policy`, `main-source-policy`) | `.github/workflows/source-policy.yml` |
 | Reusable workflow that publishes `governance/issue-link` as the Checks App, from a caller's `workflow_run` job | `.github/workflows/issue-link-publish.yml` |
 | Issue-link matcher and its tests | `governance/issue-link.js`, `governance/tests/issue-link.test.js` |
+| Source-policy matcher and its tests | `governance/source-policy.js`, `governance/tests/source-policy.test.js` |
 | Areas checker and its tests | `governance/areas-check.js`, `governance/tests/areas-check.test.js` |
 | How to find and prefactor hot shared files | `governance/HOTSPOTS-GUIDE.md` |
 | Bootstrap: issue types, default branch, labels, rulesets, Project, the `governance-checks` environment | `governance/bootstrap.sh` |
@@ -38,10 +40,27 @@ the default branch, or those three forms open issues with no type.
 ```text
 .github/governance/areas.txt                 areas, as label lines plus path globs
 .github/governance/required-checks.txt       CI checks required on test and main
+.github/governance/required-checks.dev.txt   extra checks required on dev only (optional)
 .github/governance/required-checks.main.txt  extra checks required on main only
 .github/governance/HOTSPOTS.md               its hot shared files (see HOTSPOTS-GUIDE.md)
 .github/workflows/pr-governance.yml          the caller below
+.github/workflows/source-policy.yml          the source-policy caller below
 ```
+
+The branch model (DELIVERY §9.1): **`dev`** is the default and the integration
+branch every Task branches from and merges into; **`test`** is acceptance,
+entered only by a promotion from `dev`; **`main`** is production, entered only
+by a release from `test` or a `hotfix/*`. The source is enforced by the
+`test-source-policy` check on `test` and the `main-source-policy` check on
+`main` (`.github/workflows/source-policy.yml`), and every branch moves by merge
+commits only. **Into `test` or `main` the pull request must also come from the
+same repository**: a fork can name a branch `dev`, `main` or `hotfix/*`, so the
+check compares GitHub's own base and head repository full names with this
+repository and fails closed on a fork, a deleted repository or a mismatch. A
+pull request into `dev` still takes any source.
+`required-checks.txt` applies on `test` and `main`;
+`required-checks.dev.txt` lists only the checks the integration branch adds,
+and may be absent.
 
 `areas.txt`:
 
@@ -66,7 +85,7 @@ name: PR governance
 
 on:
   pull_request:
-    branches: [test, main]
+    branches: [dev, test, main]
     types: [opened, edited, reopened, synchronize, ready_for_review]
 
 permissions:
@@ -86,6 +105,29 @@ jobs:
     uses: marvinamiranda/.github/.github/workflows/pr-governance.yml@<40-char sha>
     with:
       runs-on: '["self-hosted", "pool-linux"]'   # runners are self-hosted
+      governance-ref: <the same sha>
+```
+
+The source policy is a second caller, on the same pull requests. It publishes
+`test-source-policy` or `main-source-policy`; `dev` has no source restriction:
+
+```yaml
+name: Source policy
+on:
+  pull_request:
+    branches: [dev, test, main]
+permissions:
+  checks: write
+  contents: read
+  pull-requests: read
+concurrency:
+  group: source-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  policy:
+    uses: marvinamiranda/.github/.github/workflows/source-policy.yml@<40-char sha>
+    with:
+      runs-on: '["self-hosted", "pool-linux"]'
       governance-ref: <the same sha>
 ```
 
@@ -131,21 +173,35 @@ jobs:
 ### `governance/issue-link`
 
 The check reads the pull request at run time (not from the event payload). It
-fails unless the pull request body closes an issue with a closing keyword
+passes when the pull request body **closes** an issue with a closing keyword
 (`close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`,
 `resolved`), optionally followed by a colon, then one of `#123`,
-`owner/repo#123` or `https://github.com/owner/repo/issues/123`. Text inside
-HTML comments, fenced code and inline code does not count. That regex is the
-fast, offline layer. For a pull request into the **default branch** the
-authority is GitHub's own parsing (GraphQL `closingIssuesReferences`), the same
-parser that closes the issue on merge: if GitHub links no issue, the check
-fails. GitHub parses the body after the event that starts the run, so an empty
-first answer is asked again once, 5 seconds later. A pull request opened
-before `test` became the default branch keeps the links GitHub parsed then:
-edit its body and save it, and GitHub reads it again. A pull request
-referencing only itself fails.
+`owner/repo#123` or `https://github.com/owner/repo/issues/123`. Several
+`Closes` lines all count, and a duplicate (the same number written with another
+keyword, cross-repo form or URL) collapses to one. Text inside HTML comments,
+fenced code and inline code does not count. That regex is the fast, offline
+layer. For a pull request into the **default branch** the authority is GitHub's
+own parsing (GraphQL `closingIssuesReferences`), the same parser that closes
+the issue on merge: if GitHub links no issue, the check fails. GitHub parses
+the body after the event that starts the run, so an empty first answer is asked
+again once, 5 seconds later. A pull request opened before its base became the
+default branch keeps the links GitHub parsed then: edit its body and save it,
+and GitHub reads it again. A pull request referencing only itself fails.
 
-- **Release pull requests** (`test` → `main`) are exempt and pass.
+- **Acceptance items are referenced with `Refs #n`, not closed.** A `Refs`
+  line (like `Refs #200`) records that a milestone or product acceptance Task
+  is touched by this change and stays open until its criteria are proven on
+  `test`; `Refs` never closes an issue, so a body with `Refs` alone does not
+  satisfy the check. `Closes` and `Refs` may name different issues in one body.
+- **Promotion and release pull requests are exempt**, but only when they come
+  from the **same repository**. The promotion from `dev` into `test` and the
+  release from `test` into `main` are a record of what lands, not one Task's
+  closing line, so they pass without a `Closes` line. A fork can name a branch
+  `dev` or `test`, so the exemption also compares GitHub's own base and head
+  repository full names with this repository: a fork, a deleted repository
+  (`null`) or a mismatch is not exempt and fails without a real closing link.
+  The `test-source-policy` / `main-source-policy` check is the control for a
+  fork actually entering `test` or `main`.
 - **`hotfix/*` pull requests** must close at least one issue **in the same
   repository** whose type is **Bug**, and not a pull request.
 
@@ -450,8 +506,9 @@ owner's machine), and GitHub does not document that a cheap endpoint reflects
 a suspension.
 
 `post-review.sh` creates the `review/independent` check run as the Reviewer
-App, and the `test-integration` ruleset pins that context to the Reviewer App's
-id. What that enforces: the check was posted by the Reviewer identity. On one
+App, and the `dev-integration` and `test-integration` rulesets pin that context
+to the Reviewer App's id. What that enforces: the check was posted by the
+Reviewer identity. On one
 machine, keeping builder and reviewer sessions apart is procedural: both keys
 sit under the same user. The known follow-up is to post reviews from a workflow
 in a locked repository that holds the reviewer key as a secret.
@@ -465,7 +522,7 @@ key can make any pull request in an adopted repository mergeable, so every
 agent session on the machine being able to read `~/.config/mm-agent/` rules
 that directory out. The key lives in one place only: the secret
 `CHECKS_APP_PRIVATE_KEY` of each adopted repository's `governance-checks`
-environment. That environment allows only jobs on the default branch, `test`
+environment. That environment allows only jobs on the default branch, `dev`
 (bootstrap step g). The jobs that use it run on `[self-hosted,
 gate-ephemeral]`, single-use VMs
 ([decision E](https://github.com/marvinamiranda/.github/issues/8#issuecomment-5853703168)),
@@ -656,26 +713,29 @@ it, it does so here, after `test-integration` exists, and a re-run is
 idempotent.
 
 **Then, for each product repository, after its adoption pull request has
-merged into its `test`.** Every step reads that repository's
-`.github/governance/` from `test`, so none of them can run before the merge (a
+merged into its `dev`.** Every step reads that repository's
+`.github/governance/` from `dev`, so none of them can run before the merge (a
 dry run can read an unmerged adoption with `--config-dir`). In this order:
 
 ```bash
 governance/bootstrap.sh --repo <repo> ...                                  # 1. dry run: reads only
 governance/bootstrap.sh --repo <repo> ... --no-rulesets --apply            # 2. default branch, labels
 governance/bootstrap.sh --repo <repo> ... --probe --no-rulesets --apply    # 3. the Reviewer App probe
-# 4. one Agent App squash-merge into test (proven: see below)
+# 4. one Agent App merge into dev (proven: see below)
 governance/bootstrap.sh --repo <repo> ... --apply                          # 5. rulesets, owner only
 governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # also the Project
 ```
 
+- **Step 2** moves the default branch to `dev`, the integration default. It
+  requires `dev` to exist first: a repository without it is left as it is, with
+  a warning, so a cutover is deliberate.
 - **Step 3**, `--probe`, has the Reviewer App post a neutral
   `review/independent` on each `test` head, so a missing installation shows up
   now rather than on the first blocked pull request. Pass `--no-rulesets` with
   it: without it, the same run goes on to apply the rulesets, before step 4.
 - **Step 4**: after step 5 a pull request that passes its checks is the only
-  way into `test`, and agents' pull requests are merged by the Agent App, so
-  its squash-merge must work first. It is proven:
+  way into `dev`, and agents' pull requests are merged by the Agent App, so its
+  merge must work first. It was proven for `test` before the dev cutover:
   [omni237-ops#160](https://github.com/marvinamiranda/omni237-ops/pull/160) was
   squash-merged into `test` by `app/marvinamiranda-agent` (commit `2be0641`,
   2026-09-25 17:52 UTC).
@@ -684,11 +744,11 @@ governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # als
   later run checks it. It holds the Checks App's key
   ([The Checks App](#the-checks-app-mm-checks)), so which refs may use it is
   the control: custom deployment branches (`protected_branches: false`,
-  `custom_branch_policies: true`) with exactly one rule, the branch `test`.
+  `custom_branch_policies: true`) with exactly one rule, the branch `dev`.
   Any other rule (`refs/pull/*`, `*`, a tag) and any other policy (protected
   branches, or none, which admits every ref) is drift: a dry run reports it,
-  `--apply` removes it, rules first, then adds `test`, so a failure part way
-  leaves fewer refs allowed, not more. A repository with no `test` branch gets
+  `--apply` removes it, rules first, then adds `dev`, so a failure part way
+  leaves fewer refs allowed, not more. A repository with no `dev` branch gets
   no environment, with a warning. For an environment adopted before the Checks
   App exists:
   ```bash
@@ -737,36 +797,43 @@ checks none in advance: it says which credential it runs with, and a step that
 lacks a permission fails, with nothing after it run. `--apply` on the keyring
 login warns. `--help` prints the same list.
 
-Reads each repository's `.github/governance/` from `test` (`--config-dir
+Reads each repository's `.github/governance/` from `dev` (`--config-dir
 <dir>/<repo>/` overrides it for local testing). Dry run by default; idempotent;
 never deletes, except g)'s drift: a deployment rule that would release the
 Checks App's key to another ref. Labels and Project fields outside the standard are reported for
-the owner to retire; legacy rulesets on `test` or `main` are set to enforcement
-`disabled`, never deleted. `--help` lists the options. Payloads are kept, and
-their path printed, when a run fails.
+the owner to retire; legacy rulesets on `dev`, `test` or `main` are set to
+enforcement `disabled`, never deleted. `--help` lists the options. Payloads are
+kept, and their path printed, when a run fails.
 
 The rulesets go on this repository, first, **and on each `--repo`**. This
-repository's `test` and `main` hold the code every other repository's checks
-run, so they need a pull request, `governance tests`, and (on `test`)
-`review/independent`, with no bypass.
+repository integrates on `test` (it has no `dev`) and runs no PR governance on
+itself, so its `test` and `main` require a pull request, `governance tests`, and
+(on `test`) `review/independent`, with no bypass. A product repository gets the
+four rulesets below.
 
-- **`test-integration`**: pull request, no approvals. The repo's required
-  checks + `governance/issue-link`, all pinned to the Actions app, plus
-  `review/independent` pinned to the Reviewer App. Merge methods: squash, which
-  is how every Task lands, and merge commit, which exists only to bring `main`
-  back into `test` after a hotfix (a pull request from `main`), so the two
-  branches keep one history. A ruleset cannot tie a merge method to a head
-  branch, so using merge commits only for that is procedural. No force push,
-  no deletion, no bypass. `require_extra_approval_for_unattributed_changes` is
-  set to `false` explicitly, and compared. Merge methods compare as a set, and
-  a rule without any counts as GitHub's default, all three.
+- **`dev-integration`**: on `dev`, the integration default. Pull request, no
+  approvals. The optional `required-checks.dev.txt` + `governance/issue-link`,
+  all pinned to the Actions app, plus `review/independent` pinned to the
+  Reviewer App. Any branch may open a pull request into `dev`. Merge commits
+  only, no force push, no deletion, no bypass.
+- **`test-integration`**: on `test`. Pull request, no approvals. The repo's
+  required checks + `governance/issue-link` + `test-source-policy`, all pinned
+  to the Actions app, plus `review/independent` pinned to the Reviewer App. The
+  source must be `dev`, `main` or `hotfix/*` (the `test-source-policy` check);
+  merge commits only, so `test` and `main` keep one history. No force push, no
+  deletion, no bypass.
 - **`main-owner-only`**: restrict updates, with one user (the owner's account,
   by id) as the only bypass, in pull-request mode, and nothing else, because a
   bypass actor bypasses every rule of its ruleset. A user, not the
   organisation-admin role, which would extend to every admin.
-- **`main-checks`**: pull request (merge commits only, no approvals); required
-  checks from both lists + `governance/issue-link`; no force push, no
-  deletion; no bypass, so the owner's merges pass the checks too.
+- **`main-checks`**: on `main`. Pull request (merge commits only, no
+  approvals); required checks from both lists + `governance/issue-link` +
+  `main-source-policy`, whose source must be `test` or `hotfix/*`; no force
+  push, no deletion; no bypass, so the owner's merges pass the checks too.
+
+`require_extra_approval_for_unattributed_changes` is set to `false` explicitly,
+and compared. Merge methods compare as a set, and a rule without any counts as
+GitHub's default, all three.
 
 ## Tests
 
@@ -774,6 +841,8 @@ run, so they need a pull request, `governance tests`, and (on `test`)
 for t in governance/tests/*.test.js; do node "$t" || echo "FAILED: $t"; done   # one file per node
 BOOTSTRAP_BASH=/bin/bash node governance/tests/bootstrap.test.js              # macOS bash 3.2
 IDENTITY_BASH=/bin/bash node governance/tests/identity.test.js
+node governance/tests/issue-link.mutations.js                                 # identity mutants, issue-link
+node governance/tests/source-policy.mutations.js                              # identity mutants, source-policy
 shellcheck governance/bootstrap.sh governance/identity/*.sh
 actionlint                                                                    # reads .github/actionlint.yaml
 ```
@@ -784,4 +853,8 @@ against stubs of `gh` and `curl`, so they need no network and touch no login.
 The identity suite also starts zsh as a login and an interactive shell, under
 a fake HOME whose startup files put another `gh` first; without zsh those
 cases are skipped, and `IDENTITY_REQUIRE_ZSH=1` (set in CI) fails them
-instead.
+instead. `issue-link.mutations.js` and `source-policy.mutations.js` write
+deliberately weakened copies of their module (each a single, exactly-once
+string replacement) and run the suite against each one with
+`ISSUE_LINK_MODULE` / `SOURCE_POLICY_MODULE`: every identity mutant must turn
+the suite red, or the runner fails.

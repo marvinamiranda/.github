@@ -155,13 +155,14 @@ function labelsFromScript() {
   return labels;
 }
 function fixtures(extra = {}) {
-  const repo = (name) => ({ name, full_name: `${ORG}/${name}`, default_branch: 'test' });
+  const repo = (name) => ({ name, full_name: `${ORG}/${name}`, default_branch: 'dev' });
   return {
     [`user/1245936`]: { login: 'rodrigolmiranda', id: 1245936 },
     user: { login: 'rodrigolmiranda', id: 1245936 },
     [`orgs/${ORG}/issue-types`]: ['Task', 'Bug', 'Epic', 'Decision', 'Spike'].map((name, id) => ({ id, name, is_enabled: true })),
     [`repos/${ORG}/prod`]: repo('prod'),
     [`repos/${ORG}/prod/labels?per_page=100`]: labelsFromScript(),
+    [`repos/${ORG}/prod/branches/dev`]: { name: 'dev', commit: { sha: '1'.repeat(40) } },
     [`repos/${ORG}/prod/branches/test`]: { name: 'test', commit: { sha: '1'.repeat(40) } },
     [`repos/${ORG}/.github/branches/test`]: { name: 'test', commit: { sha: '2'.repeat(40) } },
     [`repos/${ORG}/prod/rulesets?includes_parents=true&per_page=100`]: [],
@@ -176,7 +177,7 @@ function fixtures(extra = {}) {
 // environment out altogether.
 const ENV_PATH = (repo) => `repos/${ORG}/${repo}/environments/governance-checks`;
 const RULES_PATH = (repo) => `${ENV_PATH(repo)}/deployment-branch-policies?per_page=100`;
-function environment(repo, { policy = { protected_branches: false, custom_branch_policies: true }, rules = [{ id: 1, name: 'test', type: 'branch' }] } = {}) {
+function environment(repo, { policy = { protected_branches: false, custom_branch_policies: true }, rules = [{ id: 1, name: 'dev', type: 'branch' }] } = {}) {
   if (rules === null) return { [ENV_PATH(repo)]: undefined, [RULES_PATH(repo)]: undefined };
   const out = { [ENV_PATH(repo)]: { name: 'governance-checks', deployment_branch_policy: policy } };
   if (policy && policy.custom_branch_policies) out[RULES_PATH(repo)] = { total_count: rules.length, branch_policies: rules };
@@ -548,17 +549,58 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   ok('--apply refuses to run from outside a git checkout', r.status !== 0 && /Refusing --apply/.test(r.stderr) && r.calls.length === 0, tail(r));
 }
 
+// --------------------------------------------- b) the default branch ----
+{
+  const withDefault = (branch) => fixtures({
+    [`repos/${ORG}/prod`]: { name: 'prod', full_name: `${ORG}/prod`, default_branch: branch },
+  });
+  let r = bootstrap(['--no-rulesets'], { fx: withDefault('test') });
+  const patch = r.stdout.match(/DRY-RUN would run: gh api -X PATCH repos\/[^/]+\/prod --input - <<JSON\n([\s\S]*?)\n\s*JSON\n/);
+  ok('the default branch moves to dev at the cutover, when dev exists',
+    r.status === 0 && patch && JSON.parse(patch[1]).default_branch === 'dev', `${tail(r)} ${patch && patch[1]}`);
+  r = bootstrap(['--no-rulesets'], { fx: withDefault('dev') });
+  ok('a repository already on dev is left alone', r.status === 0 && !/default_branch/.test(r.stdout) && /prod: dev/.test(r.stdout), tail(r));
+  r = bootstrap(['--no-rulesets'], { fx: fixtures({
+    [`repos/${ORG}/prod`]: { name: 'prod', full_name: `${ORG}/prod`, default_branch: 'test' },
+    [`repos/${ORG}/prod/branches/dev`]: undefined,
+  }) });
+  ok('a repository without dev keeps its default branch, with a warning',
+    r.status === 0 && /WARNING: .*no dev branch/.test(r.stdout) && !/default_branch/.test(r.stdout), tail(r));
+}
+
 // ------------------------------------------------------- the rulesets ----
 {
   const r = bootstrap([]);
   const plan = planned(r.stdout);
+  const d = plan['prod/dev-integration'];
   const t = plan['prod/test-integration'];
   const m = plan['prod/main-checks'];
   const self = plan['.github/test-integration'];
-  ok('a dry run with rulesets plans them', r.status === 0 && t && m && self, `${tail(r)} planned=${Object.keys(plan)}`);
-  ok('test-integration allows squash, and merge commits (to bring main back into test after a hotfix)',
-    t && JSON.stringify([...pr(t.body).allowed_merge_methods].sort()) === '["merge","squash"]', t && JSON.stringify(pr(t.body).allowed_merge_methods));
-  ok('main-checks still allows merge commits only', m && JSON.stringify(pr(m.body).allowed_merge_methods) === '["merge"]', m && JSON.stringify(pr(m.body).allowed_merge_methods));
+  ok('a dry run with rulesets plans dev, test and main for a product and test/main for this repository',
+    r.status === 0 && d && t && m && self && !plan['.github/dev-integration'], `${tail(r)} planned=${Object.keys(plan)}`);
+  ok('dev-integration and test-integration allow merge commits only, matching one history across dev, test and main',
+    d && t
+      && JSON.stringify(pr(d.body).allowed_merge_methods) === '["merge"]'
+      && JSON.stringify(pr(t.body).allowed_merge_methods) === '["merge"]',
+    `dev=${d && JSON.stringify(pr(d.body).allowed_merge_methods)} test=${t && JSON.stringify(pr(t.body).allowed_merge_methods)}`);
+  ok('dev-integration and test-integration forbid deletion and non-fast-forward, with no bypass',
+    d && t
+      && [d, t].every((rs) => rs.body.bypass_actors.length === 0
+        && rs.body.rules.some((x) => x.type === 'deletion') && rs.body.rules.some((x) => x.type === 'non_fast_forward')),
+    `${d && JSON.stringify(d.body.bypass_actors)} ${t && JSON.stringify(t.body.bypass_actors)}`);
+  ok('dev-integration requires the dev checks, governance/issue-link and review/independent pinned to the Reviewer App',
+    d && checks(d.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === 15368)
+      && checks(d.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID),
+    d && JSON.stringify(checks(d.body)));
+  ok('test-integration requires governance/issue-link, test-source-policy and review/independent',
+    t && checks(t.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === 15368)
+      && checks(t.body).some((c) => c.context === 'test-source-policy' && c.integration_id === 15368)
+      && checks(t.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID),
+    t && JSON.stringify(checks(t.body)));
+  ok('main-checks requires governance/issue-link and main-source-policy, with no bypass, and allows merge commits only',
+    m && checks(m.body).some((c) => c.context === 'main-source-policy' && c.integration_id === 15368)
+      && m.body.bypass_actors.length === 0 && JSON.stringify(pr(m.body).allowed_merge_methods) === '["merge"]',
+    m && JSON.stringify(checks(m.body)));
   ok('.github\'s own test-integration requires governance tests and review/independent pinned to the Reviewer App',
     self && checks(self.body).some((c) => c.context === 'governance tests' && c.integration_id === 15368)
       && checks(self.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID),
@@ -567,7 +609,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   if (t) {
     // What GitHub would return for the same ruleset, methods in another order.
     const existing = { ...t.body, id: 7, source_type: 'Repository',
-      rules: t.body.rules.map((x) => (x.type === 'pull_request' ? { ...x, parameters: { ...x.parameters, allowed_merge_methods: ['merge', 'squash'] } } : x)) };
+      rules: t.body.rules.map((x) => (x.type === 'pull_request' ? { ...x, parameters: { ...x.parameters, allowed_merge_methods: ['merge'] } } : x)) };
     let again = bootstrap([], { fx: fixtures({
       [`repos/${ORG}/prod/rulesets?includes_parents=true&per_page=100`]: [{ id: 7, name: 'test-integration', source_type: 'Repository' }],
       [`repos/${ORG}/prod/rulesets/7`]: existing }) });
@@ -659,7 +701,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
 // exactly one rule, the default branch. Anything else is drift.
 {
   const WANT_ENV = { deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } };
-  const WANT_RULE = [{ name: 'test', type: 'branch' }];
+  const WANT_RULE = [{ name: 'dev', type: 'branch' }];
   const envPlan = (stdout) => {
     const out = { put: [], post: [], del: [] };
     for (const m of stdout.matchAll(/DRY-RUN would run: gh api -X (PUT|POST) repos\/[^/]+\/prod\/environments\/governance-checks(\S*) --input - <<JSON\n([\s\S]*?)\n\s*JSON\n/g)) {
@@ -678,11 +720,11 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   let plan = envPlan(r.stdout);
   ok('a dry run with no governance-checks environment plans it: custom branch policies, protected branches false',
     r.status === 0 && plan.put.length === 1 && same(plan.put[0], WANT_ENV) && r.writes.length === 0, `${tail(r)} ${JSON.stringify(plan)}`);
-  ok('...and exactly one deployment rule: the default branch, test, as a branch rule',
+  ok('...and exactly one deployment rule: the default branch, dev, as a branch rule',
     same(plan.post, WANT_RULE) && plan.del.length === 0, JSON.stringify(plan));
 
   r = bootstrap(['--no-rulesets', '--apply'], { fx: fixtures(environment('prod', { rules: null })), writable: true });
-  ok('--apply creates governance-checks with custom policies and exactly one rule, test',
+  ok('--apply creates governance-checks with custom policies and exactly one rule, dev',
     r.status === 0 && same(policyIn(r.state), WANT_ENV.deployment_branch_policy) && same(rulesIn(r.state), WANT_RULE) && r.writes.length === 2,
     `${tail(r)} policy=${JSON.stringify(policyIn(r.state))} rules=${JSON.stringify(rulesIn(r.state))} writes=${r.writes.length}`);
   const again = bootstrap(['--no-rulesets', '--apply'], { fx: r.state, writable: true });
@@ -693,23 +735,23 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   for (const [what, extra] of [
     ['refs/pull/*', { id: 2, name: 'refs/pull/*', type: 'branch' }],
     ['*', { id: 3, name: '*', type: 'branch' }],
-    ['a tag rule named test', { id: 4, name: 'test', type: 'tag' }],
+    ['a tag rule named dev', { id: 4, name: 'dev', type: 'tag' }],
   ]) {
-    const fx = fixtures(environment('prod', { rules: [{ id: 1, name: 'test', type: 'branch' }, extra] }));
+    const fx = fixtures(environment('prod', { rules: [{ id: 1, name: 'dev', type: 'branch' }, extra] }));
     r = bootstrap(['--no-rulesets'], { fx });
     plan = envPlan(r.stdout);
-    ok(`a dry run reports an extra ${what} rule as drift and plans its removal, keeping test`,
+    ok(`a dry run reports an extra ${what} rule as drift and plans its removal, keeping dev`,
       r.status === 0 && new RegExp(`DRIFT: .*'${extra.name.replace(/\*/g, '\\*')}' \\(${extra.type}`).test(envSection(r))
         && same(plan.del, [extra.id]) && plan.post.length === 0 && plan.put.length === 0 && r.writes.length === 0, `${tail(r)} ${JSON.stringify(plan)}`);
     r = bootstrap(['--no-rulesets', '--apply'], { fx, writable: true });
-    ok(`--apply removes the ${what} rule and leaves only test`, r.status === 0 && same(rulesIn(r.state), WANT_RULE)
+    ok(`--apply removes the ${what} rule and leaves only dev`, r.status === 0 && same(rulesIn(r.state), WANT_RULE)
       && same(policyIn(r.state), WANT_ENV.deployment_branch_policy), `${tail(r)} rules=${JSON.stringify(rulesIn(r.state))}`);
     const second = bootstrap(['--no-rulesets', '--apply'], { fx: r.state, writable: true });
     ok(`...and a second --apply after removing ${what} writes nothing`, second.status === 0 && second.writes.length === 0, tail(second));
   }
-  // Only a tag rule named test: the tag goes, the branch rule is created.
-  r = bootstrap(['--no-rulesets', '--apply'], { fx: fixtures(environment('prod', { rules: [{ id: 4, name: 'test', type: 'tag' }] })), writable: true });
-  ok('an environment whose only rule is a tag named test ends with the branch rule alone', r.status === 0 && same(rulesIn(r.state), WANT_RULE), JSON.stringify(rulesIn(r.state)));
+  // Only a tag rule named dev: the tag goes, the branch rule is created.
+  r = bootstrap(['--no-rulesets', '--apply'], { fx: fixtures(environment('prod', { rules: [{ id: 4, name: 'dev', type: 'tag' }] })), writable: true });
+  ok('an environment whose only rule is a tag named dev ends with the branch rule alone', r.status === 0 && same(rulesIn(r.state), WANT_RULE), JSON.stringify(rulesIn(r.state)));
 
   // The environment's own policy: protected branches, or none at all.
   for (const [what, policy] of [['protected branches', { protected_branches: true, custom_branch_policies: false }], ['every branch (no policy)', null]]) {
@@ -724,15 +766,15 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
       r.status === 0 && same(policyIn(r.state), WANT_ENV.deployment_branch_policy) && same(rulesIn(r.state), WANT_RULE), `${tail(r)} ${JSON.stringify(policyIn(r.state))}`);
   }
 
-  // Not with --self-only, and not for a repository test is not the default of.
+  // Not with --self-only, and not for a repository dev is not the default of.
   r = bootstrap(['--self-only'], { repo: false });
   ok('--self-only reads and plans no environment', r.status === 0 && !r.calls.some((c) => c.args.some((a) => /environments/.test(a)))
     && /== g\) [^\n]*\n\s+skipped \(--self-only\)/.test(r.stdout), tail(r));
-  const noTest = fixtures({ ...environment('prod', { rules: null }), [`repos/${ORG}/prod`]: { name: 'prod', full_name: `${ORG}/prod`, default_branch: 'main' },
-    [`repos/${ORG}/prod/branches/test`]: undefined });
-  r = bootstrap(['--no-rulesets'], { fx: noTest });
+  const noDev = fixtures({ ...environment('prod', { rules: null }), [`repos/${ORG}/prod`]: { name: 'prod', full_name: `${ORG}/prod`, default_branch: 'main' },
+    [`repos/${ORG}/prod/branches/dev`]: undefined });
+  r = bootstrap(['--no-rulesets'], { fx: noDev });
   plan = envPlan(r.stdout);
-  ok('a repository with no test branch gets no environment, with a warning', r.status === 0 && plan.put.length === 0 && plan.post.length === 0
+  ok('a repository with no dev branch gets no environment, with a warning', r.status === 0 && plan.put.length === 0 && plan.post.length === 0
     && /WARNING: .*governance-checks/.test(envSection(r)), `${tail(r)} ${JSON.stringify(plan)}`);
 }
 
@@ -759,6 +801,14 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   ok('--help says --no-rulesets (and every product step) runs after the adoption pull request has merged, and names --self-only',
     /--no-rulesets[\s\S]{0,300}after[\s\S]{0,60}adoption\s+pull\s+request\s+has\s+merged/.test(text) && /--self-only/.test(text)
       && !/stage an adoption/.test(text), '');
+}
+
+// Evidence for a pull request: with BOOTSTRAP_DRY_RUN_OUT set, write the full
+// dry-run output (the payloads every step would send) to that path. Off by
+// default, so the suite stays quiet.
+if (process.env.BOOTSTRAP_DRY_RUN_OUT) {
+  const dump = bootstrap([]);
+  fs.writeFileSync(process.env.BOOTSTRAP_DRY_RUN_OUT, dump.stdout);
 }
 
 fs.rmSync(root, { recursive: true, force: true });

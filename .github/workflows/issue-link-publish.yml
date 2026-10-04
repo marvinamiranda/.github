@@ -11,11 +11,11 @@
 # default-branch code, with a key that only a job on `test` can read.
 #
 # WHAT HOLDS THE KEY. The job below names the environment `governance-checks`,
-# whose only deployment rule is the branch `test`. A `workflow_run` job runs the
-# DEFAULT branch's copy of the caller, at the default branch's commit, so a pull
-# request cannot edit the job that receives the key. But the environment admits
-# ANY job whose ref is `test` -- `workflow_run`, `pull_request_target`,
-# `issue_comment` -- and it cannot stop such a job running pull request code
+# whose only deployment rule is the default branch, `dev`. A `workflow_run` job
+# runs the DEFAULT branch's copy of the caller, at the default branch's commit,
+# so a pull request cannot edit the job that receives the key. But the
+# environment admits ANY job whose ref is `dev` -- `workflow_run`,
+# `pull_request_target`, `issue_comment` -- and it cannot stop such a job running pull request code
 # (the custody review of .github#18). So this job must never check out, build,
 # run or evaluate anything a pull request supplies:
 #   * the only checkout is of marvinamiranda/.github at governance-ref, which
