@@ -53,7 +53,12 @@ entered only by a promotion from `dev`; **`main`** is production, entered only
 by a release from `test` or a `hotfix/*`. The source is enforced by the
 `test-source-policy` check on `test` and the `main-source-policy` check on
 `main` (`.github/workflows/source-policy.yml`), and every branch moves by merge
-commits only. `required-checks.txt` applies on `test` and `main`;
+commits only. **Into `test` or `main` the pull request must also come from the
+same repository**: a fork can name a branch `dev`, `main` or `hotfix/*`, so the
+check compares GitHub's own base and head repository full names with this
+repository and fails closed on a fork, a deleted repository or a mismatch. A
+pull request into `dev` still takes any source.
+`required-checks.txt` applies on `test` and `main`;
 `required-checks.dev.txt` lists only the checks the integration branch adds,
 and may be absent.
 
@@ -188,9 +193,15 @@ and GitHub reads it again. A pull request referencing only itself fails.
   is touched by this change and stays open until its criteria are proven on
   `test`; `Refs` never closes an issue, so a body with `Refs` alone does not
   satisfy the check. `Closes` and `Refs` may name different issues in one body.
-- **Promotion and release pull requests are exempt.** The promotion from `dev`
-  into `test` and the release from `test` into `main` are a record of what
-  lands, not one Task's closing line, so they pass without a `Closes` line.
+- **Promotion and release pull requests are exempt**, but only when they come
+  from the **same repository**. The promotion from `dev` into `test` and the
+  release from `test` into `main` are a record of what lands, not one Task's
+  closing line, so they pass without a `Closes` line. A fork can name a branch
+  `dev` or `test`, so the exemption also compares GitHub's own base and head
+  repository full names with this repository: a fork, a deleted repository
+  (`null`) or a mismatch is not exempt and fails without a real closing link.
+  The `test-source-policy` / `main-source-policy` check is the control for a
+  fork actually entering `test` or `main`.
 - **`hotfix/*` pull requests** must close at least one issue **in the same
   repository** whose type is **Bug**, and not a pull request.
 
@@ -830,6 +841,8 @@ GitHub's default, all three.
 for t in governance/tests/*.test.js; do node "$t" || echo "FAILED: $t"; done   # one file per node
 BOOTSTRAP_BASH=/bin/bash node governance/tests/bootstrap.test.js              # macOS bash 3.2
 IDENTITY_BASH=/bin/bash node governance/tests/identity.test.js
+node governance/tests/issue-link.mutations.js                                 # identity mutants, issue-link
+node governance/tests/source-policy.mutations.js                              # identity mutants, source-policy
 shellcheck governance/bootstrap.sh governance/identity/*.sh
 actionlint                                                                    # reads .github/actionlint.yaml
 ```
@@ -840,4 +853,8 @@ against stubs of `gh` and `curl`, so they need no network and touch no login.
 The identity suite also starts zsh as a login and an interactive shell, under
 a fake HOME whose startup files put another `gh` first; without zsh those
 cases are skipped, and `IDENTITY_REQUIRE_ZSH=1` (set in CI) fails them
-instead.
+instead. `issue-link.mutations.js` and `source-policy.mutations.js` write
+deliberately weakened copies of their module (each a single, exactly-once
+string replacement) and run the suite against each one with
+`ISSUE_LINK_MODULE` / `SOURCE_POLICY_MODULE`: every identity mutant must turn
+the suite red, or the runner fails.

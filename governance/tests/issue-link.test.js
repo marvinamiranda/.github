@@ -102,6 +102,19 @@ const cases = [
   ['a hotfix with only Refs fails: it must still close a Bug', { body: 'Refs #901', head: 'hotfix/till-crash', base: 'main' }, 'fail', [], true, ['marvinamiranda/omni237#901']],
   ['a hotfix can close a Bug and reference an acceptance item', { body: 'Fixes #901\nRefs #902', head: 'hotfix/till-crash', base: 'main' }, 'pass', ['marvinamiranda/omni237#901'], true, ['marvinamiranda/omni237#902']],
   ['ordinary branch needs no Bug', { body: 'Closes #1', head: '1-thing', base: 'test' }, 'pass', ['marvinamiranda/omni237#1'], false],
+
+  // The promotion (dev → test) and release (test → main) exemptions are only
+  // for a same-repository pull request: a fork can name a branch dev or test,
+  // so it must not read as the canonical promotion or release and skip the
+  // closing link. Missing (deleted) and mismatched identities are not exempt.
+  ['a fork promotion dev → test is not exempt', { body: '', head: 'dev', base: 'test', headRepo: 'evil/.github' }, 'fail', []],
+  ['a fork release test → main is not exempt', { body: '', head: 'test', base: 'main', headRepo: 'evil/.github' }, 'fail', []],
+  ['a promotion with a mismatched base repository is not exempt', { body: '', head: 'dev', base: 'test', baseRepo: 'other/repo' }, 'fail', []],
+  ['a release with a mismatched base repository is not exempt', { body: '', head: 'test', base: 'main', baseRepo: 'other/repo' }, 'fail', []],
+  ['a promotion with a deleted head repository is not exempt', { body: '', head: 'dev', base: 'test', headRepo: null }, 'fail', []],
+  ['a release with a missing base repository is not exempt', { body: '', head: 'test', base: 'main', baseRepo: null }, 'fail', []],
+  ['a promotion with no canonical repository is not exempt', { body: '', head: 'dev', base: 'test', repository: '' }, 'fail', []],
+  ['a fork promotion with a real Closes link passes as an ordinary pull request', { body: 'Closes #1', head: 'dev', base: 'test', headRepo: 'evil/.github' }, 'pass', ['marvinamiranda/omni237#1']],
 ];
 
 let failed = 0;
@@ -110,7 +123,9 @@ for (const [name, input, expectedStatus, expectedRefs, expectedRequireBug, expec
     body: input.body,
     headRef: input.head || '742-supplier-list',
     baseRef: input.base || 'test',
-    repository: REPO,
+    repository: 'repository' in input ? input.repository : REPO,
+    baseRepo: 'baseRepo' in input ? input.baseRepo : REPO,
+    headRepo: 'headRepo' in input ? input.headRepo : REPO,
   });
   const refs = verdict.refs.map((r) => r.key);
   const problems = [];
@@ -149,16 +164,20 @@ for (const [name, issue, expected] of bugCases) {
 }
 
 // judge: the published verdict, against a fake API client. `closing` is what
-// GitHub links; `closingSeq` is what it links on each successive lookup.
+// GitHub links; `closingSeq` is what it links on each successive lookup. The
+// base/head repository identities are this repository unless a case passes a
+// fork (`evil/.github`) or null (a deleted fork); the fake mirrors what
+// GitHub's pull request object carries.
 function fakeGitHub({ body, head = '742-supplier-list', base = 'test', number = 761, defaultBranch = 'test',
-  closing = [], closingSeq = null, issues = {} }) {
+  closing = [], closingSeq = null, issues = {}, baseRepo = REPO, headRepo = REPO }) {
   const calls = [];
   let lookups = 0;
+  const repoOf = (fullName) => (fullName === null ? null : { full_name: fullName });
   return {
     calls,
     rest: {
       pulls: { get: async (a) => { calls.push(['pulls.get', a.pull_number]);
-        return { data: { number, body, head: { ref: head, sha: 'a'.repeat(40) }, base: { ref: base } } }; } },
+        return { data: { number, body, head: { ref: head, sha: 'a'.repeat(40), repo: repoOf(headRepo) }, base: { ref: base, repo: repoOf(baseRepo) } } }; } },
       repos: { get: async () => { calls.push(['repos.get']); return { data: { default_branch: defaultBranch } }; } },
       issues: { get: async (a) => { calls.push(['issues.get', a.owner, a.repo, a.issue_number]);
         const issue = issues[a.issue_number];
@@ -193,6 +212,19 @@ const judgeCases = [
   ['no link fails before any GraphQL', { body: 'nothing', closing: [742] }, false,
     (v, gh) => (gh.calls.some((c) => c[0] === 'graphql') ? 'asked GitHub needlessly' : '')],
   ['release test -> main is exempt', { body: '', head: 'test', base: 'main' }, true, () => ''],
+  ['promotion dev -> test is exempt', { body: '', head: 'dev', base: 'test' }, true, () => ''],
+  // A fork can name a branch dev or test; the exemption must not follow the
+  // branch name alone, and must never ask GitHub or pass on a fork.
+  ['a fork promotion is not exempt and fails with no link', { body: '', head: 'dev', base: 'test', headRepo: 'evil/.github' }, false,
+    (v, gh) => (/exempt/i.test(v.title) ? 'exempted a fork promotion' : (gh.calls.some((c) => c[0] === 'graphql') ? 'asked GitHub for a fork' : ''))],
+  ['a fork release is not exempt and fails with no link', { body: '', head: 'test', base: 'main', headRepo: 'evil/.github' }, false,
+    (v, gh) => (/exempt/i.test(v.title) ? 'exempted a fork release' : '')],
+  ['a promotion with a deleted head repository is not exempt', { body: '', head: 'dev', base: 'test', headRepo: null }, false,
+    (v) => (/exempt/i.test(v.title) ? 'exempted a deleted repository' : '')],
+  ['a release with a missing base repository is not exempt', { body: '', head: 'test', base: 'main', baseRepo: null }, false,
+    (v) => (/exempt/i.test(v.title) ? 'exempted a missing repository' : '')],
+  ['a fork promotion with a real Closes link passes as an ordinary pull request', { body: 'Closes #742', head: 'dev', base: 'test', headRepo: 'evil/.github', closing: [742] }, true,
+    (v) => (/exempt/i.test(v.title) ? 'exempted a fork promotion' : '')],
   ['non-default base uses the regex (GitHub would not close anyway)', { body: 'Closes #5', base: 'main', head: 'x' }, true,
     (v, gh) => (gh.calls.some((c) => c[0] === 'graphql') ? 'asked GitHub on a non-default base' : '')],
   ['hotfix closes a Bug in this repo', { body: 'Fixes #901', head: 'hotfix/till', base: 'main', issues: { 901: { type: { name: 'Bug' } } } }, true, () => ''],

@@ -25,6 +25,9 @@ function ok(name, condition, detail = '') {
 }
 
 const PR = 'pull_request';
+// The repository every case runs in unless it overrides an identity; the
+// adversarial cases below pass a fork, a deleted repository or a mismatch.
+const REPO = 'marvinamiranda/omni237';
 
 // [name, input, expected ok, expected check name]
 const cases = [
@@ -57,6 +60,21 @@ const cases = [
   ['main rejects test2 (exact name only)', { baseRef: 'main', headRef: 'test2', eventName: PR }, false, 'main-source-policy'],
   ['main rejects a bare hotfix/', { baseRef: 'main', headRef: 'hotfix/', eventName: PR }, false, 'main-source-policy'],
 
+  // A fork can name a branch dev, main or hotfix/*. Into test or main the base
+  // and head repositories must be this same repository, as GitHub reports
+  // them; a fork, a deleted repository or a mismatch fails closed.
+  ['test rejects a fork whose head branch is dev', { baseRef: 'test', headRef: 'dev', eventName: PR, baseRepo: 'evil/.github', headRepo: 'evil/.github' }, false, 'test-source-policy'],
+  ['test rejects a fork whose head is main (the back-merge)', { baseRef: 'test', headRef: 'main', eventName: PR, headRepo: 'evil/.github' }, false, 'test-source-policy'],
+  ['test rejects a fork whose head is a hotfix branch', { baseRef: 'test', headRef: 'hotfix/till-crash', eventName: PR, headRepo: 'evil/.github' }, false, 'test-source-policy'],
+  ['main rejects a fork whose head is test (the release)', { baseRef: 'main', headRef: 'test', eventName: PR, baseRepo: 'evil/.github', headRepo: 'evil/.github' }, false, 'main-source-policy'],
+  ['test rejects a head repository that is missing (a deleted fork)', { baseRef: 'test', headRef: 'dev', eventName: PR, headRepo: null }, false, 'test-source-policy'],
+  ['main rejects a base repository that is missing', { baseRef: 'main', headRef: 'test', eventName: PR, baseRepo: null }, false, 'main-source-policy'],
+  ['test rejects a mismatched base repository', { baseRef: 'test', headRef: 'dev', eventName: PR, baseRepo: 'other/repo' }, false, 'test-source-policy'],
+  ['main rejects a mismatched head repository', { baseRef: 'main', headRef: 'test', eventName: PR, headRepo: 'other/repo' }, false, 'main-source-policy'],
+  ['test rejects an unknown canonical repository', { baseRef: 'test', headRef: 'dev', eventName: PR, repository: '' }, false, 'test-source-policy'],
+  // dev is the integration default and still takes any source, fork included.
+  ['dev still accepts a fork branch (the integration path)', { baseRef: 'dev', headRef: 'feature/x', eventName: PR, headRepo: 'evil/.github' }, true, 'dev-source-policy'],
+
   // Wrong base and missing refs: fail closed.
   ['an unknown base fails closed', { baseRef: 'feature', headRef: 'dev', eventName: PR }, false, 'source-policy'],
   ['an empty base fails closed', { baseRef: '', headRef: 'dev', eventName: PR }, false, 'source-policy'],
@@ -77,7 +95,14 @@ const cases = [
 ];
 
 for (const [name, input, expectedOk, expectedName] of cases) {
-  const verdict = evaluate(input);
+  // Every case is this repository's pull request unless it says otherwise; the
+  // default identities are what the workflow would pass for a same-repo branch.
+  const verdict = evaluate({
+    ...input,
+    repository: 'repository' in input ? input.repository : REPO,
+    baseRepo: 'baseRepo' in input ? input.baseRepo : REPO,
+    headRepo: 'headRepo' in input ? input.headRepo : REPO,
+  });
   const problems = [];
   if (verdict.ok !== expectedOk) problems.push(`ok ${verdict.ok}, expected ${expectedOk}`);
   if (verdict.name !== expectedName) problems.push(`name ${JSON.stringify(verdict.name)}, expected ${expectedName}`);
@@ -107,18 +132,37 @@ for (const [name, input, expectedOk, expectedName] of cases) {
     /feature/.test(wrongBase.message) && /dev/.test(wrongBase.message), wrongBase.message);
 }
 
+// An identity failure must name the repository that could not enter, so a
+// blocked author can act without reading the workflow.
+{
+  const fork = evaluate({ baseRef: 'test', headRef: 'dev', eventName: PR, repository: REPO, baseRepo: REPO, headRepo: 'evil/.github' });
+  ok('a fork promotion names the head repository and fails closed',
+    fork.ok === false && /evil\/\.github/.test(fork.message) && /fails closed/.test(fork.message), fork.message);
+  const missing = evaluate({ baseRef: 'main', headRef: 'test', eventName: PR, repository: REPO, baseRepo: REPO, headRepo: null });
+  ok('a missing head repository names the base and fails closed',
+    missing.ok === false && /main/.test(missing.message) && /missing|deleted/i.test(missing.message), missing.message);
+  const unknown = evaluate({ baseRef: 'test', headRef: 'dev', eventName: PR, repository: '' });
+  ok('an unknown canonical repository fails closed with a message',
+    unknown.ok === false && /unknown/.test(unknown.message), unknown.message);
+}
+
 // The CLI fails with a status a shell can branch on: 0 pass, 1 policy failure.
 {
   const run = (args) => spawnSync(process.execPath, [modulePath, ...args], { encoding: 'utf8' });
-  const pass = run(['--base', 'test', '--head', 'dev', '--event', PR]);
+  const sameRepo = ['--repository', REPO, '--base-repo', REPO, '--head-repo', REPO];
+  const pass = run(['--base', 'test', '--head', 'dev', '--event', PR, ...sameRepo]);
   let body = {};
   try { body = JSON.parse(pass.stdout); } catch (error) { /* reported below */ }
   ok('CLI: an allowed source exits 0 and prints the verdict as JSON',
     pass.status === 0 && body.ok === true && body.name === 'test-source-policy', `status=${pass.status} stdout=${pass.stdout} stderr=${pass.stderr}`);
-  const fail = run(['--base', 'main', '--head', 'dev', '--event', PR]);
+  const fail = run(['--base', 'main', '--head', 'dev', '--event', PR, ...sameRepo]);
   ok('CLI: a rejected source exits 1', fail.status === 1, `status=${fail.status} stdout=${fail.stdout} stderr=${fail.stderr}`);
-  const wrongEvent = run(['--base', 'test', '--head', 'dev', '--event', 'push']);
+  const wrongEvent = run(['--base', 'test', '--head', 'dev', '--event', 'push', ...sameRepo]);
   ok('CLI: a wrong event exits 1 (fail closed)', wrongEvent.status === 1, `status=${wrongEvent.status} stdout=${wrongEvent.stdout}`);
+  const fork = run(['--base', 'test', '--head', 'dev', '--event', PR, '--repository', REPO, '--base-repo', REPO, '--head-repo', 'evil/.github']);
+  ok('CLI: a fork promotion exits 1 (fail closed)', fork.status === 1, `status=${fork.status} stdout=${fork.stdout}`);
+  const noIdentity = run(['--base', 'test', '--head', 'dev', '--event', PR]);
+  ok('CLI: a promotion with no repository identity exits 1 (fail closed)', noIdentity.status === 1, `status=${noIdentity.status} stdout=${noIdentity.stdout}`);
 }
 
 console.log(`\n${total - failed}/${total} passed`);

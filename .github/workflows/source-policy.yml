@@ -8,10 +8,14 @@
 #   into main: test (release) or hotfix/*
 #
 # A pull request into dev is the ordinary Task path and is not restricted; the
-# check is published as `dev-source-policy` there for the record. Anything else
-# fails closed: a wrong base, a wrong head, an empty ref, or an event that is
-# not a pull request is a failure, never a pass by omission. The pure decision
-# is governance/source-policy.js, run by governance/tests/source-policy.test.js.
+# check is published as `dev-source-policy` there for the record. Into test or
+# main the source must also be the same repository: a fork can name a branch
+# dev, main or hotfix/*, so the workflow passes GitHub's actual base and head
+# repository full names (null included) and context.repo, and a fork, a deleted
+# repository or a mismatch fails closed. Anything else fails closed: a wrong
+# base, a wrong head, an empty ref, or an event that is not a pull request is a
+# failure, never a pass by omission. The pure decision is
+# governance/source-policy.js, run by governance/tests/source-policy.test.js.
 #
 # The check run is created through the Checks API because a reusable workflow's
 # own job is named "<caller job> / <this job>", which a ruleset cannot require,
@@ -137,7 +141,19 @@ jobs:
           script: |
             const lib = require('./.org-governance/governance/source-policy.js');
             const pr = context.payload.pull_request;
-            const verdict = lib.evaluate({ baseRef: pr.base.ref, headRef: pr.head.ref, eventName: context.eventName });
+            // The identities are GitHub's own: this repository (context.repo)
+            // and the pull request's base and head repositories. They are passed
+            // through as they are, null included (a deleted fork), never inferred
+            // from a branch name: a fork can name a branch dev, main or hotfix/*.
+            const fullName = (repo) => (repo && repo.full_name) ? repo.full_name : null;
+            const verdict = lib.evaluate({
+              baseRef: pr.base.ref,
+              headRef: pr.head.ref,
+              eventName: context.eventName,
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              baseRepo: fullName(pr.base && pr.base.repo),
+              headRepo: fullName(pr.head && pr.head.repo),
+            });
             // An unknown base has no required context; fail the job instead of
             // posting a check no ruleset pins.
             if (verdict.name === 'source-policy') core.setFailed(verdict.message);

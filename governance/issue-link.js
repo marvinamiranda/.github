@@ -101,7 +101,20 @@ function findReferenceRefs(body, repository) {
 // request from dev into test (DELIVERY §9.1): their bodies are a record of what
 // lands, not one Task's closing line. `hotfix/*` into test is NOT exempt: it
 // must close its Bug.
-function isReleasePullRequest(headRef, baseRef) {
+//
+// The exemption is only for a same-repository pull request. A fork can name a
+// branch dev or test, so a branch-name-only rule would let a fork's pull
+// request read as the canonical promotion or release and skip the closing
+// link. The identities are GitHub's own, never inferred from a branch name:
+//   - repository: this repository (the workflow's context.repo)
+//   - baseRepo:   pr.base.repo.full_name
+//   - headRepo:   pr.head.repo.full_name (null for a deleted fork)
+// All three must name the same repository (compared as GitHub does, without
+// case); a missing, deleted/null or mismatched repository is not exempt.
+function isReleasePullRequest({ headRef, baseRef, repository, baseRepo, headRepo } = {}) {
+  const same = (fullName) => Boolean(repository) && Boolean(fullName)
+    && String(fullName).toLowerCase() === String(repository).toLowerCase();
+  if (!same(baseRepo) || !same(headRepo)) return false;
   return (headRef === 'test' && baseRef === 'main') || (headRef === 'dev' && baseRef === 'test');
 }
 
@@ -114,8 +127,10 @@ function isHotfix(headRef) {
 //   refs: the closing references (close/fix/resolve). Only these close an issue.
 //   references: the `Refs` references (acceptance items). They stay open.
 //   requireBug: the workflow must confirm one of `refs` is a Bug (hotfix/*)
-function evaluate({ body, headRef, baseRef, repository }) {
-  if (isReleasePullRequest(headRef, baseRef)) {
+// `repository`, `baseRepo` and `headRepo` are the identities the exemption
+// checks (see isReleasePullRequest); the caller passes GitHub's own values.
+function evaluate({ body, headRef, baseRef, repository, baseRepo, headRepo }) {
+  if (isReleasePullRequest({ headRef, baseRef, repository, baseRepo, headRepo })) {
     const what = headRef === 'dev' ? 'Promotion pull request (dev → test)' : 'Release pull request (test → main)';
     return {
       status: 'exempt',
@@ -194,7 +209,18 @@ async function judge({ github, context, sleep = pause }) {
   const headSha = pr.head.sha;
   const done = (ok, title, summary) => ({ ok, title: title.slice(0, 255), summary, headSha });
 
-  const verdict = evaluate({ body: pr.body || '', headRef: pr.head.ref, baseRef: pr.base.ref, repository });
+  // GitHub's own repository identities decide the exemption: a fork can name a
+  // branch dev or test, so a branch name is not enough. Null is passed through
+  // (a deleted fork), never guessed from the branch name.
+  const fullName = (repo) => (repo && repo.full_name) ? repo.full_name : null;
+  const verdict = evaluate({
+    body: pr.body || '',
+    headRef: pr.head.ref,
+    baseRef: pr.base.ref,
+    repository,
+    baseRepo: fullName(pr.base && pr.base.repo),
+    headRepo: fullName(pr.head && pr.head.repo),
+  });
   if (verdict.status === 'exempt') return done(true, 'Release pull request: exempt', verdict.message);
   if (verdict.status === 'fail') return done(false, 'No closing issue link', verdict.message);
 
@@ -259,7 +285,12 @@ async function judge({ github, context, sleep = pause }) {
 
 module.exports = { CLOSING_REF, REFERENCE_REF, CLOSING_QUERY, stripNonProse, findClosingRefs, findReferenceRefs, isReleasePullRequest, isHotfix, evaluate, isBug, judge };
 
-// CLI, for local use:  node governance/issue-link.js --head <ref> --base <ref> --repo owner/repo < body.md
+// CLI, for local use:
+//   node governance/issue-link.js --head <ref> --base <ref> --repo owner/repo \
+//     [--base-repo owner/repo] [--head-repo owner/repo] < body.md
+// The promotion (dev -> test) and release (test -> main) exemptions require the
+// base and head repository identities; without them a promotion is judged as an
+// ordinary pull request and fails closed on a body with no closing link.
 if (require.main === module) {
   const args = process.argv.slice(2);
   const opt = (name, fallback) => {
@@ -272,6 +303,8 @@ if (require.main === module) {
     headRef: opt('--head', 'feature'),
     baseRef: opt('--base', 'test'),
     repository: opt('--repo', 'owner/repo'),
+    baseRepo: opt('--base-repo', ''),
+    headRepo: opt('--head-repo', ''),
   });
   process.stdout.write(JSON.stringify(verdict, null, 2) + '\n');
   process.exit(verdict.status === 'fail' ? 1 : 0);

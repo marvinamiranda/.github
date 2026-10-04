@@ -23,8 +23,12 @@ jobs:
           persist-credentials: false
       - name: issue-link matcher
         run: node governance/tests/issue-link.test.js
+      - name: issue-link identity, mutation proof
+        run: node governance/tests/issue-link.mutations.js
       - name: source-policy matcher
         run: node governance/tests/source-policy.test.js
+      - name: source-policy identity, mutation proof
+        run: node governance/tests/source-policy.mutations.js
       - name: areas checker
         run: node governance/tests/areas-check.test.js
       - name: PR governance pin check
