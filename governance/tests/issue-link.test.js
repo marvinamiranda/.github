@@ -17,10 +17,14 @@ const modulePath = process.env.ISSUE_LINK_MODULE
   : path.join(__dirname, '..', 'issue-link.js');
 const { evaluate, isBug, judge } = require(modulePath);
 
+// The Refs support (DELIVERY §9.1) is what `expectedReferences` pins: acceptance
+// items are referenced with Refs, they stay open, and Refs alone never passes.
+const refKeys = (v) => (v.references || []).map((r) => r.key);
+
 const REPO = 'marvinamiranda/omni237';
 const template = fs.readFileSync(path.join(__dirname, '..', '..', '.github', 'pull_request_template.md'), 'utf8');
 
-// [name, { body, head, base }, expected status, expected refs (keys), requireBug?]
+// [name, { body, head, base }, expected status, expected refs (keys), requireBug?, expected references (keys)?]
 const cases = [
   // Accepted forms
   ['same-repo Closes', { body: 'Closes #742' }, 'pass', ['marvinamiranda/omni237#742']],
@@ -42,8 +46,9 @@ const cases = [
   ['null body', { body: null }, 'fail', []],
   ['untouched template', { body: template }, 'fail', []],
   ['bare reference, no keyword', { body: 'Implements #742' }, 'fail', []],
-  ['non-closing keyword', { body: 'Refs #742\nSee #743\nPart of #744' }, 'fail', []],
-  ['keyword glued to a word', { body: 'prefixes #12\nunfixed #13' }, 'fail', []],
+  ['non-closing keyword', { body: 'Refs #742\nSee #743\nPart of #744' }, 'fail', [], undefined, ['marvinamiranda/omni237#742']],
+  ['keyword glued to a word', { body: 'prefixes #12\nunfixed #13' }, 'fail', [], undefined, []],
+  ['refs glued to a word', { body: 'prefs #12' }, 'fail', [], undefined, []],
   ['number glued to letters', { body: 'Closes #12abc' }, 'fail', []],
   ['no whitespace after keyword', { body: 'Closes#12' }, 'fail', []],
   ['pull request URL is not an issue', { body: 'Closes https://github.com/marvinamiranda/omni237/pull/757' }, 'fail', []],
@@ -55,17 +60,52 @@ const cases = [
   ['inside inline code', { body: 'Write `Closes #742` in the body' }, 'fail', []],
   ['issue zero', { body: 'Closes #0' }, 'fail', []],
 
+  // Multiple closing lines, and duplicates across spellings
+  ['several Closes lines all count', { body: 'Closes #10\nCloses #11\nCloses #12' }, 'pass', [10, 11, 12].map((n) => `marvinamiranda/omni237#${n}`)],
+  ['a duplicate is collapsed across keyword and repository spellings', {
+    body: 'Closes #3\nFixes #3\nResolves marvinamiranda/omni237#3\nCloses https://github.com/marvinamiranda/omni237/issues/3',
+  }, 'pass', ['marvinamiranda/omni237#3']],
+  ['duplicate numbers across repositories are distinct', { body: 'Closes #4\nCloses marvinamiranda/sm360-sdk#4' }, 'pass',
+    ['marvinamiranda/omni237#4', 'marvinamiranda/sm360-sdk#4']],
+
+  // Refs: acceptance items are referenced, stay open, and never close
+  ['Closes and Refs together: Closes passes, Refs stays open', { body: 'Closes #100\nRefs #200' }, 'pass',
+    ['marvinamiranda/omni237#100'], undefined, ['marvinamiranda/omni237#200']],
+  ['several Refs lines deduplicate', { body: 'Refs #200\nrefs #200\nRefs #201' }, 'fail', [], undefined,
+    ['marvinamiranda/omni237#200', 'marvinamiranda/omni237#201']],
+  ['refs-only fails: Refs never satisfies the check', { body: 'Refs #742' }, 'fail', [], undefined, ['marvinamiranda/omni237#742']],
+  ['refs-only cross-repo fails', { body: 'Refs marvinamiranda/sm360-sdk#12' }, 'fail', [], undefined, ['marvinamiranda/sm360-sdk#12']],
+  ['refs-only full URL fails', { body: 'Refs https://github.com/marvinamiranda/omni237-ops/issues/160' }, 'fail', [], undefined,
+    ['marvinamiranda/omni237-ops#160']],
+  ['Refs inside an HTML comment does not count', { body: '<!-- Refs #742 -->' }, 'fail', [], undefined, []],
+  ['Refs inside a fenced block does not count', { body: '```\nRefs #742\n```' }, 'fail', [], undefined, []],
+  ['Refs inside inline code does not count', { body: 'Write `Refs #742` in the body' }, 'fail', [], undefined, []],
+  ['Refs and Closes of the same number: it is closed, not referenced', { body: 'Closes #5\nRefs #5' }, 'pass',
+    ['marvinamiranda/omni237#5'], undefined, []],
+  ['a mis-cased Refs still references', { body: 'REFS #9' }, 'fail', [], undefined, ['marvinamiranda/omni237#9']],
+  ['a colon after Refs still references', { body: 'Refs: #9' }, 'fail', [], undefined, ['marvinamiranda/omni237#9']],
+  ['a Closes hidden in a fence does not close, but the Refs outside still references', {
+    body: '```\nCloses #1\n```\nRefs #2',
+  }, 'fail', [], undefined, ['marvinamiranda/omni237#2']],
+  ['Refs inside an unterminated comment does not count', { body: '<!-- Refs #742\nCloses #742' }, 'fail', []],
+  ['several Closes and Refs across repositories stay separate', {
+    body: 'Closes #7\nCloses marvinamiranda/sm360-sdk#8\nRefs marvinamiranda/omni237-ops#9',
+  }, 'pass', ['marvinamiranda/omni237#7', 'marvinamiranda/sm360-sdk#8'], undefined, ['marvinamiranda/omni237-ops#9']],
+
   // Branch rules
   ['release PR test → main is exempt', { body: '', head: 'test', base: 'main' }, 'exempt', []],
+  ['promotion PR dev → test is exempt', { body: '', head: 'dev', base: 'test' }, 'exempt', []],
   ['test → other base is not exempt', { body: '', head: 'test', base: 'uat' }, 'fail', []],
   ['feature → main is not exempt', { body: '', head: '742-supplier-list', base: 'main' }, 'fail', []],
   ['hotfix without a link fails', { body: 'urgent', head: 'hotfix/till-crash', base: 'main' }, 'fail', [], true],
   ['hotfix with a link must confirm a Bug', { body: 'Fixes #901', head: 'hotfix/till-crash', base: 'main' }, 'pass', ['marvinamiranda/omni237#901'], true],
+  ['a hotfix with only Refs fails: it must still close a Bug', { body: 'Refs #901', head: 'hotfix/till-crash', base: 'main' }, 'fail', [], true, ['marvinamiranda/omni237#901']],
+  ['a hotfix can close a Bug and reference an acceptance item', { body: 'Fixes #901\nRefs #902', head: 'hotfix/till-crash', base: 'main' }, 'pass', ['marvinamiranda/omni237#901'], true, ['marvinamiranda/omni237#902']],
   ['ordinary branch needs no Bug', { body: 'Closes #1', head: '1-thing', base: 'test' }, 'pass', ['marvinamiranda/omni237#1'], false],
 ];
 
 let failed = 0;
-for (const [name, input, expectedStatus, expectedRefs, expectedRequireBug] of cases) {
+for (const [name, input, expectedStatus, expectedRefs, expectedRequireBug, expectedReferences] of cases) {
   const verdict = evaluate({
     body: input.body,
     headRef: input.head || '742-supplier-list',
@@ -76,8 +116,12 @@ for (const [name, input, expectedStatus, expectedRefs, expectedRequireBug] of ca
   const problems = [];
   if (verdict.status !== expectedStatus) problems.push(`status ${verdict.status}, expected ${expectedStatus}`);
   if (JSON.stringify(refs) !== JSON.stringify(expectedRefs)) problems.push(`refs ${JSON.stringify(refs)}, expected ${JSON.stringify(expectedRefs)}`);
+  if (expectedReferences !== undefined && JSON.stringify(refKeys(verdict)) !== JSON.stringify(expectedReferences)) {
+    problems.push(`references ${JSON.stringify(refKeys(verdict))}, expected ${JSON.stringify(expectedReferences)}`);
+  }
   if (expectedRequireBug !== undefined && verdict.requireBug !== expectedRequireBug) problems.push(`requireBug ${verdict.requireBug}, expected ${expectedRequireBug}`);
   if (expectedStatus === 'fail' && !/Closes #123/.test(verdict.message)) problems.push('failure message does not show the fix');
+  if (expectedStatus === 'fail' && (expectedReferences || []).length && !/Refs/.test(verdict.message)) problems.push('failure message does not say Refs never closes');
   if (problems.length) {
     failed += 1;
     console.log(`not ok - ${name}: ${problems.join('; ')}`);

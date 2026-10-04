@@ -19,10 +19,10 @@ Milestones are GitHub milestones, not issues.
 ## Delivery path
 
 1. Start only a **Ready** Task with no open *blocked by*, whose `area:` has no other Task In progress.
-2. Branch from current `test` as `<issue>-<slug>` (for example `742-supplier-list`). Hotfixes branch from `main` as `hotfix/<slug>`.
+2. Branch from current `dev` as `<issue>-<slug>` (for example `742-supplier-list`). Hotfixes branch from `main` as `hotfix/<slug>`.
 3. Commit with Conventional Commits: `feat(area): …`, `fix(area): …`, `test`, `docs`, `refactor`, `chore`.
-4. Open the pull request into `test` with `Closes #n` in the body. Draft until it is a merge candidate.
-5. The Agent App squash-merges when every required check and `review/independent` (posted by the Reviewer App) pass on the head commit.
-6. `main` changes only by a pull request from `test` or `hotfix/*`, merged by the owner with a merge commit. The Agent App opens release pull requests. A hotfix is merged back into `test` the same day by a pull request from `main`, merged with a merge commit: the only pull request into `test` that is not squashed.
+4. Open the pull request into `dev` with `Closes #n` in the body. Draft until it is a merge candidate.
+5. The Agent App merges when every required check and `review/independent` (posted by the Reviewer App) pass on the head commit. `dev` is the integration default.
+6. `test` is acceptance, entered only by a promotion pull request from `dev` (or a hotfix), and `main` is production, entered only by a release from `test` or a `hotfix/*`. The `test-source-policy` and `main-source-policy` checks enforce those sources. The Agent App opens the promotion and release pull requests; every branch moves by merge commits only. A hotfix is merged back into `test` the same day by a pull request from `main`.
 
-Never force-push or delete `test` or `main`, rewrite a pushed shared branch, or `git stash` in a shared checkout.
+Never force-push or delete `dev`, `test` or `main`, rewrite a pushed shared branch, or `git stash` in a shared checkout.

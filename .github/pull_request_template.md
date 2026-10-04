@@ -1,11 +1,15 @@
 Closes #
 
 <!--
-One Task, one pull request. The line above must name the Task or Bug:
+One Task, one pull request. The line above must close the Task or Bug:
 "Closes #n" in the same repository, "Closes owner/repo#n" across repositories,
-or "Closes" followed by the full issue URL. The governance/issue-link check fails
-without it. A hotfix/* pull request must close a Bug.
-A pull request that is still gathering evidence, or has a known gap, is a draft.
+or "Closes" followed by the full issue URL. Several Closes lines are fine, and
+a duplicate collapses. The governance/issue-link check fails without one.
+Acceptance items (a milestone or a product acceptance Task) are referenced with
+"Refs #n": Refs stays open and never closes an issue, so Refs alone does not
+pass. The promotion into test and the release into main are exempt. A hotfix/*
+pull request must close a Bug. A pull request that is still gathering evidence,
+or has a known gap, is a draft.
 -->
 
 ## What changed

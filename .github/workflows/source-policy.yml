@@ -1,0 +1,153 @@
+# Source policy — DELIVERY §9.1, the dev -> test -> main model.
+#
+# Publishes a check run named exactly `test-source-policy` (a pull request into
+# test) or `main-source-policy` (a pull request into main). It allows only the
+# sources the model names:
+#
+#   into test: dev (promotion), hotfix/*, or main (the hotfix back-merge)
+#   into main: test (release) or hotfix/*
+#
+# A pull request into dev is the ordinary Task path and is not restricted; the
+# check is published as `dev-source-policy` there for the record. Anything else
+# fails closed: a wrong base, a wrong head, an empty ref, or an event that is
+# not a pull request is a failure, never a pass by omission. The pure decision
+# is governance/source-policy.js, run by governance/tests/source-policy.test.js.
+#
+# The check run is created through the Checks API because a reusable workflow's
+# own job is named "<caller job> / <this job>", which a ruleset cannot require,
+# and only an App can create a check run — here the Actions app, which the
+# rulesets pin the context to (governance/bootstrap.sh's ACTIONS_APP_ID).
+#
+# The caller pins this file by commit SHA and passes the same SHA as
+# governance-ref, exactly as pr-governance.yml: before the module is fetched,
+# governance-ref must equal job.workflow_sha and that commit must be on
+# marvinamiranda/.github test. The block below is the same verify-pin the other
+# workflows run.
+name: Source policy
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner for the job, as JSON (a label string or a list of labels).
+        type: string
+        required: true
+      governance-ref:
+        description: >-
+          Commit SHA of marvinamiranda/.github whose governance/source-policy.js
+          is used — the same SHA the caller pins this workflow to, and on its
+          test branch.
+        type: string
+        required: true
+
+jobs:
+  source-policy:
+    name: source-policy
+    # Only a pull request names a base and a head to police. Any other event
+    # skips the job: no check is posted, and a required context stays pending
+    # rather than reading as a pass (fail closed).
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Verify the pin
+        id: pin
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SELF_SHA: ${{ job.workflow_sha }}
+          SELF_REPOSITORY: ${{ job.workflow_repository }}
+          GOVERNANCE_REF: ${{ inputs.governance-ref }}
+        with:
+          script: |
+            // BEGIN verify-pin: the same in every job; governance/tests/pr-governance.test.js runs the pr-governance.yml copies.
+            async function verifyPin({ github, env }) {
+              const self = env.SELF_SHA || '';
+              const ref = env.GOVERNANCE_REF || '';
+              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'marvinamiranda/.github') {
+                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not marvinamiranda/.github.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(self)) {
+                return 'GitHub did not report the commit this workflow runs from (job.workflow_sha), so the pin cannot be checked.';
+              }
+              if (ref !== self) {
+                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
+              }
+              // test is read as a branch, then compared by its sha: the bare
+              // name "test" in a compare could resolve to a tag of that name.
+              let tip;
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner: 'marvinamiranda', repo: '.github', branch: 'test' });
+                tip = branch && branch.commit && branch.commit.sha;
+              } catch (error) {
+                return `Could not read marvinamiranda/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(tip || '')) {
+                return 'GitHub returned no commit for marvinamiranda/.github test, so the pin cannot be checked.';
+              }
+              let status;
+              try {
+                ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: 'marvinamiranda', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
+              } catch (error) {
+                return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
+              }
+              if (status !== 'identical' && status !== 'behind') {
+                return `${self} is not on marvinamiranda/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
+              }
+              return '';
+            }
+            // END verify-pin
+            const base = (context.payload.pull_request && context.payload.pull_request.base && context.payload.pull_request.base.ref) || '';
+            const name = base === 'test' ? 'test-source-policy' : base === 'main' ? 'main-source-policy' : 'source-policy';
+            const problem = await verifyPin({ github, env: process.env });
+            core.setOutput('ok', problem ? 'false' : 'true');
+            if (problem) {
+              const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: context.payload.pull_request.number });
+              await github.rest.checks.create({
+                ...context.repo,
+                name,
+                head_sha: pr.head.sha,
+                status: 'completed',
+                conclusion: 'failure',
+                output: { title: 'The governance pin is not a merged commit of marvinamiranda/.github', summary: problem },
+              });
+              core.setFailed(problem);
+            }
+
+      - name: Fetch the shared policy
+        id: policy
+        if: steps.pin.outputs.ok == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: marvinamiranda/.github
+          ref: ${{ inputs.governance-ref }}
+          path: .org-governance
+          sparse-checkout: governance/source-policy.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Publish the source-policy check
+        if: steps.pin.outputs.ok == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const lib = require('./.org-governance/governance/source-policy.js');
+            const pr = context.payload.pull_request;
+            const verdict = lib.evaluate({ baseRef: pr.base.ref, headRef: pr.head.ref, eventName: context.eventName });
+            // An unknown base has no required context; fail the job instead of
+            // posting a check no ruleset pins.
+            if (verdict.name === 'source-policy') core.setFailed(verdict.message);
+            const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
+            await github.rest.checks.create({
+              ...context.repo,
+              name: verdict.name,
+              head_sha: current.head.sha,
+              status: 'completed',
+              conclusion: verdict.ok ? 'success' : 'failure',
+              output: { title: verdict.ok ? `${verdict.head} into ${verdict.base} is allowed` : `${verdict.head || '(no head)'} into ${verdict.base || '(no base)'} is not allowed`, summary: verdict.message },
+            });
+            await core.summary.addHeading(verdict.name).addRaw(verdict.message).write();

@@ -21,6 +21,11 @@
 
 // GitHub's closing keywords, case-insensitive. Nothing else closes an issue.
 const KEYWORD = '(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)';
+// GitHub's referencing keyword. DELIVERY §9.1: acceptance items (a milestone or
+// a product acceptance Task) are referenced with `Refs #n` and stay open until
+// their criteria are proven on tst after promotion. A `Refs` line never closes
+// an issue, so it never satisfies the closing requirement on its own.
+const REFERENCE_KEYWORD = '(?:refs?)';
 const OWNER = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})';
 const REPO = '[A-Za-z0-9._-]{1,100}';
 
@@ -28,14 +33,16 @@ const REPO = '[A-Za-z0-9._-]{1,100}';
 //   #123 | owner/repo#123 | https://github.com/owner/repo/issues/123
 // The keyword must start a word, and the number must end it, so "prefixes #1"
 // and "#12abc" do not count.
-const CLOSING_REF = new RegExp(
-  `(?<![A-Za-z0-9_/-])${KEYWORD}\\s*:?\\s+` +
+const refRegex = (keyword) => new RegExp(
+  `(?<![A-Za-z0-9_/-])${keyword}\\s*:?\\s+` +
     `(?:` +
     `(?:(${OWNER})\\/(${REPO}))?#(\\d+)` +
     `|https:\\/\\/github\\.com\\/(${OWNER})\\/(${REPO})\\/issues\\/(\\d+)` +
     `)(?![0-9A-Za-z_])`,
   'gi',
 );
+const CLOSING_REF = refRegex(KEYWORD);
+const REFERENCE_REF = refRegex(REFERENCE_KEYWORD);
 
 // Text GitHub itself does not read as a closing reference: HTML comments
 // (where the pull request template keeps its examples), fenced code blocks
@@ -64,12 +71,12 @@ function stripNonProse(body) {
   return kept.join('\n');
 }
 
-function findClosingRefs(body, repository) {
+function findRefs(body, repository, regex) {
   const [defaultOwner, defaultRepo] = String(repository || '/').split('/');
   const text = stripNonProse(body);
   const refs = [];
   const seen = new Set();
-  for (const m of text.matchAll(CLOSING_REF)) {
+  for (const m of text.matchAll(regex)) {
     const owner = m[1] || m[4] || defaultOwner;
     const repo = m[2] || m[5] || defaultRepo;
     const number = Number(m[3] || m[6]);
@@ -82,8 +89,20 @@ function findClosingRefs(body, repository) {
   return refs;
 }
 
+function findClosingRefs(body, repository) {
+  return findRefs(body, repository, CLOSING_REF);
+}
+
+function findReferenceRefs(body, repository) {
+  return findRefs(body, repository, REFERENCE_REF);
+}
+
+// A release pull request (test -> main) is exempt, and so is the promotion pull
+// request from dev into test (DELIVERY §9.1): their bodies are a record of what
+// lands, not one Task's closing line. `hotfix/*` into test is NOT exempt: it
+// must close its Bug.
 function isReleasePullRequest(headRef, baseRef) {
-  return headRef === 'test' && baseRef === 'main';
+  return (headRef === 'test' && baseRef === 'main') || (headRef === 'dev' && baseRef === 'test');
 }
 
 function isHotfix(headRef) {
@@ -92,36 +111,49 @@ function isHotfix(headRef) {
 
 // Returns the verdict for a pull request, before any API lookup.
 //   status: 'exempt' | 'pass' | 'fail'
+//   refs: the closing references (close/fix/resolve). Only these close an issue.
+//   references: the `Refs` references (acceptance items). They stay open.
 //   requireBug: the workflow must confirm one of `refs` is a Bug (hotfix/*)
 function evaluate({ body, headRef, baseRef, repository }) {
   if (isReleasePullRequest(headRef, baseRef)) {
+    const what = headRef === 'dev' ? 'Promotion pull request (dev → test)' : 'Release pull request (test → main)';
     return {
       status: 'exempt',
       refs: [],
+      references: [],
       requireBug: false,
-      message: 'Release pull request (test → main): exempt from issue linking.',
+      message: `${what}: exempt from issue linking.`,
     };
   }
   const refs = findClosingRefs(body, repository);
+  const closes = new Set(refs.map((r) => r.key.toLowerCase()));
+  const references = findReferenceRefs(body, repository).filter((r) => !closes.has(r.key.toLowerCase()));
   const requireBug = isHotfix(headRef);
   if (refs.length === 0) {
+    const refsOnly = references.length
+      ? `The body references ${references.map((r) => r.key).join(', ')} with Refs, but Refs never closes an issue. `
+      : '';
     return {
       status: 'fail',
       refs,
+      references,
       requireBug,
       message:
         'The pull request body names no issue with a closing keyword. Add a line such as ' +
         '"Closes #123", "Closes owner/repo#123" or "Closes https://github.com/owner/repo/issues/123" ' +
         '(keywords: close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved). ' +
+        refsOnly +
         (requireBug ? 'A hotfix/* pull request must close a Bug. ' : '') +
         'Text inside HTML comments and code does not count.',
     };
   }
+  const staysOpen = references.length ? ` (Refs, stays open: ${references.map((r) => r.key).join(', ')})` : '';
   return {
     status: 'pass',
     refs,
+    references,
     requireBug,
-    message: `Closes ${refs.map((r) => r.key).join(', ')}` + (requireBug ? ' (hotfix: one must be a Bug)' : ''),
+    message: `Closes ${refs.map((r) => r.key).join(', ')}${staysOpen}` + (requireBug ? ' (hotfix: one must be a Bug)' : ''),
   };
 }
 
@@ -197,6 +229,9 @@ async function judge({ github, context, sleep = pause }) {
   } else {
     lines.push(`Closes ${refs.map((r) => r.key).join(', ')} (base ${pr.base.ref} is not the default branch, so GitHub will not close it on merge)`);
   }
+  if (verdict.references && verdict.references.length) {
+    lines.push(`Stays open (Refs): ${verdict.references.map((r) => r.key).join(', ')}`);
+  }
 
   if (verdict.requireBug) {
     // Only issues in this repository: the workflow token can read nothing else,
@@ -222,7 +257,7 @@ async function judge({ github, context, sleep = pause }) {
   return done(true, lines[0], lines.join('\n'));
 }
 
-module.exports = { CLOSING_REF, CLOSING_QUERY, stripNonProse, findClosingRefs, isReleasePullRequest, isHotfix, evaluate, isBug, judge };
+module.exports = { CLOSING_REF, REFERENCE_REF, CLOSING_QUERY, stripNonProse, findClosingRefs, findReferenceRefs, isReleasePullRequest, isHotfix, evaluate, isBug, judge };
 
 // CLI, for local use:  node governance/issue-link.js --head <ref> --base <ref> --repo owner/repo < body.md
 if (require.main === module) {

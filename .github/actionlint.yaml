@@ -1,8 +1,8 @@
 # actionlint 1.7.12 predates the job.workflow_* context properties, which
 # GitHub added on 2026-09-03 ("GitHub Actions: Early September 2026 updates";
 # docs: Contexts reference, `job` context). pr-governance.yml reads two of
-# them to learn which commit of itself is running, and so does
-# issue-link-publish.yml. Only those two, only in those two files, and only on
+# them to learn which commit of itself is running, and so do
+# issue-link-publish.yml and source-policy.yml. Only those three files, and only on
 # the `job` context's own object type (the same text on `needs.<job>.outputs`
 # would still be reported). Delete this file once
 # actionlint knows the properties.
@@ -11,5 +11,8 @@ paths:
     ignore:
       - 'property "workflow_(sha|repository)" is not defined in object type \{check_run_id: number; container: '
   .github/workflows/issue-link-publish.yml:
+    ignore:
+      - 'property "workflow_(sha|repository)" is not defined in object type \{check_run_id: number; container: '
+  .github/workflows/source-policy.yml:
     ignore:
       - 'property "workflow_(sha|repository)" is not defined in object type \{check_run_id: number; container: '
