@@ -770,14 +770,18 @@ id. Missing or invalid identity refuses before any write. `--no-rulesets` and
 Only product `test-integration` and `main-checks` pin `governance/issue-link`
 and `All checks accounted for` to that App. Reviewer and other Actions issuers,
 including dev rulesets, are unchanged. Before any mutation, the bootstrap probes
-all requested repos: both exact names must have been posted by the verified App
+all requested repos: both exact names must have concluded success from the verified App
 on the **same** one of the 20 most recently updated PR heads into test. Check runs
 are paginated. Missing/unreadable proof refuses `--apply`; a dry run warns.
 A shadow aggregate or an Actions-issued copy cannot qualify.
 
 **Per-repo rollout prerequisite:** product T5 must first merge on dev with
 `CHECKS_APP_COPY_REQUIRED = True` and the trusted issue-link publisher enabled.
-Track this in [ops#536](https://github.com/marvinamiranda/omni237-ops/issues/536)
+Promote the trusted publisher onto the repository’s actual default branch before
+expecting `workflow_run` evidence, with its environment branch policy matching.
+For ops the currently observed default and environment policy are `test`; a
+dev merge alone does not execute the candidate publisher. Promotion and policy
+changes remain owner-only. Track this in [ops#536](https://github.com/marvinamiranda/omni237-ops/issues/536)
 and [omni237#2256](https://github.com/marvinamiranda/omni237/issues/2256).
 Observe both required names from App 5105172 on a live PR head into test:
 
@@ -789,7 +793,11 @@ Repeat with `omni237` for its own prerequisite. Pinning before publishers exist
 freezes test/main merges, including hotfixes. T5 goes first while Actions remains
 pinned; once both Apps post required names a failing copy from either can block
 the merge, so schedule the owner cutover close to T5. Pilot ops only, then after
-one observed pilot merge apply to omni237, after its own proof. Agents must not
+one observed pilot merge apply to omni237, after its own proof. For each repo,
+also observe **one PR into main posting both names successfully from 5105172**
+before declaring main-checks cutover proven. Retain the PR number, head SHA,
+updated_at and check-run App ids in the owner rollout record; the bootstrap
+prints the test-target PR evidence it proved on. Agents must not
 apply rulesets. **sm360 and sm360-sdk are excluded**: their `required ready` gate
 and missing Checks App publishers are tracked separately in
 [.github#41](https://github.com/marvinamiranda/.github/issues/41).

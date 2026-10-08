@@ -383,19 +383,21 @@ if (( ! SELF_ONLY && ! SKIP_RULESETS )); then
   info "Checks App id: $CHECKS_APP_ID (marvinamiranda-checks)"
 
   # Probe ALL targets before ANY mutation, including this repo's rulesets.
-  # Both exact contexts must exist on ONE recent PR head into test. Shadow
+  # Both exact contexts must succeed on ONE recent PR head into test. Shadow
   # names, another App, and evidence split across heads cannot qualify.
   checks_publisher_probe() {
-    local repo="$1" prs heads sha runs
+    local repo="$1" prs heads sha runs number updated_at
     prs="$(gh api "repos/$ORG/$repo/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20")" || return 1
     heads="$(jq -er '[.[].head.sha | select(test("^[a-f0-9]{40}$"))] | unique | .[]' <<<"$prs")" || return 1
     while IFS= read -r sha; do
       runs="$(gh api --paginate "repos/$ORG/$repo/commits/$sha/check-runs?per_page=100" | jq -se '[.[] | .check_runs[]]')" || return 1
       if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" '
-        [.[] | select(.app.id == $id and .head_sha == $sha) | .name] as $names |
+        [.[] | select(.app.id == $id and .head_sha == $sha and .conclusion == "success") | .name] as $names |
         (["governance/issue-link", "All checks accounted for"] - $names | length) == 0
       ' <<<"$runs" >/dev/null; then
-        info "Checks App publisher proven for $repo on PR head $sha"
+        number="$(jq -r --arg sha "$sha" '[.[] | select(.head.sha == $sha)][0].number' <<<"$prs")"
+        updated_at="$(jq -r --arg sha "$sha" '[.[] | select(.head.sha == $sha)][0].updated_at' <<<"$prs")"
+        info "Checks App publisher proven for $repo on PR #$number head $sha updated_at $updated_at"
         return 0
       fi
     done <<<"$heads"
@@ -404,7 +406,7 @@ if (( ! SELF_ONLY && ! SKIP_RULESETS )); then
   for repo in "${REPOS[@]}"; do
     if ! checks_publisher_probe "$repo"; then
       if (( APPLY )); then
-        echo "Refusing --apply: Checks App publisher for $repo has not posted both exact required contexts on a recent PR head into test. Merge product T5 and observe both names before pinning." >&2
+        echo "Refusing --apply: Checks App publisher for $repo has not successfully posted both exact required contexts on a recent PR head into test. Merge product T5 and observe both successful names before pinning." >&2
         exit 1
       fi
       warn "Checks App publisher for $repo is not proven; --apply would refuse. Merge product T5 and observe both required names before pinning."
