@@ -152,10 +152,12 @@ CONFIG_DIR=""
 CONFIG_REF="dev"
 STRICT_UP_TO_DATE=false
 REVIEWER_APP_ID=""
+CHECKS_APP_ID=""
+CHECKS_APP_JSON="${MM_CHECKS_APP_JSON:-$HOME/.config/mm-agent/mm-checks/app.json}"
 REVIEWER_APP_JSON="${MM_REVIEWER_APP_JSON:-$HOME/.config/mm-agent/mm-reviewer/app.json}"
 
-# GitHub Actions' app id. Every required CI check and governance/issue-link is a
-# check run created by this app; pinning the context to it means neither a
+# GitHub Actions' app id. CI and unchanged dev-integration checks use this
+# issuer; pinning the context to it means neither a
 # personal token nor another App can satisfy the check. Measured, not assumed:
 # `gh api repos/marvinamiranda/omni237/commits/<sha>/check-runs --jq '.check_runs[].app.id'`
 # returns 15368 for every check on the last five merged pull requests of
@@ -185,6 +187,8 @@ Options:
   --project-title <t>      Project title. Required with --project.
   --reviewer-app-id <id>   The Reviewer App's id, which review/independent is pinned to.
                            Default: "id" in $REVIEWER_APP_JSON.
+  --checks-app-id <id>     The Checks App id for product test/main issue-link and
+                           All checks accounted for. Default: "id" in $CHECKS_APP_JSON.
   --config-dir <dir>       Read <dir>/<repo>/areas.txt etc. instead of the repo's
                            .github/governance/ on $CONFIG_REF (local testing).
   --strict-up-to-date      Require branches to be up to date with the base before merge.
@@ -202,6 +206,7 @@ while [[ $# -gt 0 ]]; do
     --probe) PROBE=1 ;;
     --project-title) [[ $# -ge 2 ]] || { echo "--project-title needs a value" >&2; exit 2; }; PROJECT_TITLE="$2"; shift ;;
     --reviewer-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--reviewer-app-id needs a numeric id" >&2; exit 2; }; REVIEWER_APP_ID="$2"; shift ;;
+    --checks-app-id) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--checks-app-id needs a numeric id" >&2; exit 2; }; CHECKS_APP_ID="$2"; shift ;;
     --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$ORIG_PWD" && cd "$2" && pwd)"; shift ;;
     --strict-up-to-date) STRICT_UP_TO_DATE=true ;;
     -h|--help) usage; exit 0 ;;
@@ -353,6 +358,60 @@ else
     echo "or with $REVIEWER_APP_JSON present; or run with --no-rulesets."
   } >&2
   exit 1
+fi
+
+# Product test/main issuer migration only. Resolve this before ANY ruleset
+# write (including this repository's rulesets); self-only output is unchanged.
+if (( ! SELF_ONLY && ! SKIP_RULESETS )); then
+  if [[ -z "$CHECKS_APP_ID" && -r "$CHECKS_APP_JSON" ]]; then
+    CHECKS_APP_ID="$(jq -r '.id // empty' "$CHECKS_APP_JSON")"
+    [[ "$CHECKS_APP_ID" =~ ^[1-9][0-9]*$ ]] || CHECKS_APP_ID=""
+  fi
+  if [[ -z "$CHECKS_APP_ID" ]]; then
+    echo "No Checks App id: re-run with --checks-app-id <numeric id> or $CHECKS_APP_JSON present; or use --no-rulesets." >&2
+    exit 1
+  fi
+  if [[ "$CHECKS_APP_ID" == "$REVIEWER_APP_ID" || "$CHECKS_APP_ID" == "$ACTIONS_APP_ID" ]]; then
+    echo "Checks App id must differ from Reviewer and Actions ids." >&2
+    exit 1
+  fi
+  published_checks_id="$(gh api apps/marvinamiranda-checks --jq .id)"
+  if [[ "$CHECKS_APP_ID" != "$published_checks_id" ]]; then
+    echo "Checks App id does not match GET /apps/marvinamiranda-checks." >&2
+    exit 1
+  fi
+  info "Checks App id: $CHECKS_APP_ID (marvinamiranda-checks)"
+
+  # Probe ALL targets before ANY mutation, including this repo's rulesets.
+  # Both exact contexts must succeed on ONE recent PR head into test. Shadow
+  # names, another App, and evidence split across heads cannot qualify.
+  checks_publisher_probe() {
+    local repo="$1" prs heads sha runs number updated_at
+    prs="$(gh api "repos/$ORG/$repo/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20")" || return 1
+    heads="$(jq -er '[.[].head.sha | select(test("^[a-f0-9]{40}$"))] | unique | .[]' <<<"$prs")" || return 1
+    while IFS= read -r sha; do
+      runs="$(gh api --paginate "repos/$ORG/$repo/commits/$sha/check-runs?per_page=100" | jq -se '[.[] | .check_runs[]]')" || return 1
+      if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" '
+        [.[] | select(.app.id == $id and .head_sha == $sha and .conclusion == "success") | .name] as $names |
+        (["governance/issue-link", "All checks accounted for"] - $names | length) == 0
+      ' <<<"$runs" >/dev/null; then
+        number="$(jq -r --arg sha "$sha" '[.[] | select(.head.sha == $sha)][0].number' <<<"$prs")"
+        updated_at="$(jq -r --arg sha "$sha" '[.[] | select(.head.sha == $sha)][0].updated_at' <<<"$prs")"
+        info "Checks App publisher proven for $repo on PR #$number head $sha updated_at $updated_at"
+        return 0
+      fi
+    done <<<"$heads"
+    return 1
+  }
+  for repo in "${REPOS[@]}"; do
+    if ! checks_publisher_probe "$repo"; then
+      if (( APPLY )); then
+        echo "Refusing --apply: Checks App publisher for $repo has not successfully posted both exact required contexts on a recent PR head into test. Merge product T5 and observe both successful names before pinning." >&2
+        exit 1
+      fi
+      warn "Checks App publisher for $repo is not proven; --apply would refuse. Merge product T5 and observe both required names before pinning."
+    fi
+  done
 fi
 
 owner_login="$(gh api "user/$OWNER_USER_ID" --jq .login)"
@@ -523,13 +582,14 @@ done
 required_checks_json() {
   # $1: review | none
   # $2: extra check contexts, space-separated, or "none"
-  # $3...: check list files
-  local with_review="$1" extra="$2"; shift 2
+  # $3: issuer for the two Checks App contexts (Actions for self/dev)
+  # $4...: check list files
+  local with_review="$1" extra="$2" checks_app="$3"; shift 3
   {
     for f in "$@"; do config_lines "$f"; done
     if [[ "$extra" != "none" ]]; then for c in $extra; do echo "$c"; done; fi
-  } | awk '!seen[$0]++' | jq -R -s --argjson app "$ACTIONS_APP_ID" '
-      split("\n") | map(select(length > 0) | {context: ., integration_id: $app})' >"$WORK/checks.json"
+  } | awk '!seen[$0]++' | jq -R -s --argjson app "$ACTIONS_APP_ID" --argjson checks_app "$checks_app" '
+      split("\n") | map(select(length > 0) | {context: ., integration_id: (if . == "governance/issue-link" or . == "All checks accounted for" then $checks_app else $app end)})' >"$WORK/checks.json"
   if [[ "$with_review" == "review" && -n "$REVIEWER_APP_ID" ]]; then
     jq --argjson rid "$REVIEWER_APP_ID" '. + [{context: "review/independent", integration_id: $rid}]' "$WORK/checks.json"
   else
@@ -716,17 +776,17 @@ for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
     # governance on itself; its own tests are the check, so no dev ruleset and
     # no source-policy or issue-link context.
     printf '%s\n' "$SELF_CHECKS" >"$WORK/self-checks.txt"
-    test_ruleset "$(required_checks_json review none "$WORK/self-checks.txt")" >"$WORK/rs-test-$repo.json"
-    main_checks_ruleset "$(required_checks_json none none "$WORK/self-checks.txt")" >"$WORK/rs-main-checks-$repo.json"
+    test_ruleset "$(required_checks_json review none "$ACTIONS_APP_ID" "$WORK/self-checks.txt")" >"$WORK/rs-test-$repo.json"
+    main_checks_ruleset "$(required_checks_json none none "$ACTIONS_APP_ID" "$WORK/self-checks.txt")" >"$WORK/rs-main-checks-$repo.json"
     payloads=("$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json")
   else
     cfg="$WORK/cfg/$repo"
     # dev gets the repository's optional dev checks, issue-link, and the
     # independent review; test adds the source policy and the full test checks;
     # main adds the source policy, issue-link and the main-only checks.
-    dev_ruleset "$(required_checks_json review "governance/issue-link" "$cfg/required-checks.dev.txt")" >"$WORK/rs-dev-$repo.json"
-    test_ruleset "$(required_checks_json review "test-source-policy governance/issue-link" "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
-    main_checks_ruleset "$(required_checks_json none "main-source-policy governance/issue-link" "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
+    dev_ruleset "$(required_checks_json review "governance/issue-link" "$ACTIONS_APP_ID" "$cfg/required-checks.dev.txt")" >"$WORK/rs-dev-$repo.json"
+    test_ruleset "$(required_checks_json review "test-source-policy governance/issue-link" "$CHECKS_APP_ID" "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
+    main_checks_ruleset "$(required_checks_json none "main-source-policy governance/issue-link" "$CHECKS_APP_ID" "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
     payloads=("$WORK/rs-dev-$repo.json" "$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json")
   fi
   main_owner_ruleset >"$WORK/rs-main-owner-$repo.json"
