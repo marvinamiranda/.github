@@ -147,6 +147,20 @@ const cases = [
   // The check must fit the Checks API: a summary over 65,535 characters is
   // refused, the check is not created, and an older success would stand.
   const judgeStep = ((jobs['issue-link'] || {}).steps || []).find((s) => script(s).includes('lib.judge'));
+  {
+    const error = new Error('matcher unavailable');
+    error.name = 'MatcherUnavailableError';
+    const created = [];
+    const github = { rest: { checks: { create: async (a) => created.push(a) } } };
+    const lib = { judge: async () => { throw error; } };
+    const core = { summary: { addHeading() { return this; }, addRaw() { return this; }, async write() {} } };
+    let rejected = false;
+    try {
+      await new AsyncFunction('github', 'context', 'core', 'require', script(judgeStep))(
+        github, { repo: { owner: 'o', repo: 'r' } }, core, () => lib);
+    } catch (caught) { rejected = caught === error; }
+    ok('issue-link: matcher exception rejects the Actions job (fail closed), without a fresh API check', rejected && created.length === 0);
+  }
   for (const [label, summary, needsCut] of [['a huge summary', 'x'.repeat(168000), true], ['an ordinary one', 'Closes marvinamiranda/omni237#1', false]]) {
     const created = [];
     const core = { summary: { addHeading() { return this; }, addRaw() { return this; }, async write() {} } };

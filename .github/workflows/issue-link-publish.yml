@@ -61,6 +61,13 @@ on:
         type: string
         required: true
 
+    secrets:
+      CHECKS_APP_PRIVATE_KEY:
+        description: >-
+          Forward this name explicitly from the caller; the called job's
+          governance-checks environment value takes precedence. Never inherit.
+        required: false
+
 jobs:
   publish:
     name: publish governance/issue-link
@@ -198,6 +205,10 @@ jobs:
                 // Fail closed: a verdict that could not be reached is a failure on
                 // the head, not silence that leaves an older success standing.
                 const status = error && error.status ? `HTTP ${error.status}` : 'an error';
+                // Bounded exception category identifies the cause without
+                // publishing an arbitrary error message or request headers.
+                const exception = error && typeof error.name === 'string'
+                  && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name) ? error.name : 'Error';
                 let headSha = runHead;
                 try {
                   ({ data: { head: { sha: headSha } } } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
@@ -211,7 +222,7 @@ jobs:
                 verdict = {
                   ok: false,
                   title: 'The issue-link judge could not run',
-                  summary: `The judge failed with ${status}. Re-run the PR gate. This failure is posted so an older success does not stand.`,
+                  summary: `The judge failed with ${exception} (${status}). Re-run the PR gate. This failure is posted so an older success does not stand.`,
                   headSha,
                 };
               }

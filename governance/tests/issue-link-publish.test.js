@@ -70,6 +70,7 @@ ok('the five steps exist', [verify, fetchStep, judgeStep, mint, post].every(Bool
 const call = (doc.on || doc[true] || {}).workflow_call;
 ok('it is a reusable workflow and nothing else', call && Object.keys(doc.on || doc[true]).join() === 'workflow_call');
 const inputs = (call && call.inputs) || {};
+ok('only the named optional Checks App key is declared for cross-repo forwarding', call && call.secrets && Object.keys(call.secrets).join() === 'CHECKS_APP_PRIVATE_KEY' && call.secrets.CHECKS_APP_PRIVATE_KEY.required === false);
 ok('runs-on is required and has no default', inputs['runs-on'] && inputs['runs-on'].required === true && !('default' in inputs['runs-on']));
 ok('governance-ref is required', inputs['governance-ref'] && inputs['governance-ref'].required === true);
 ok('the workflow names no hosted runner label', !/ubuntu-|macos-|windows-/.test(text.replace(/^\s*#.*$/gm, '')));
@@ -294,6 +295,11 @@ async function runPin(github, env) {
       gh.calls.filter((c) => c[0] === 'pulls.get').length === 2 && r.verdicts.length === 1 && r.verdicts[0].ok === false
         && r.verdicts[0].headSha === HEAD && /#762/.test(r.verdicts[0].title), JSON.stringify(r.verdicts));
   }
+  gh = fakeApi({ bodies: two });
+  r = await runJudge(gh, context([listedPr(761), listedPr(762)]));
+  await runPost(gh);
+  ok('accepted commit-scoped contract: one unlinked PR on a shared head posts App failure',
+    gh.calls.some((c) => c[0] === 'request' && c[2].head_sha === HEAD && c[2].conclusion === 'failure'));
   gh = fakeApi({ bodies: { 761: {}, 762: {} } });
   r = await runJudge(gh, context([listedPr(761), listedPr(762)]));
   ok('judge: two pull requests on one commit that both close an issue: one success',
@@ -327,11 +333,11 @@ async function runPin(github, env) {
   ok('judge: no id on either side is not a match', r.core.out.failed.length === 1 && r.verdicts === null && gh.calls.length === 0);
 
   // ---- the judge cannot run ----------------------------------------------
-  gh = fakeApi({ pullsGet: (calls, a) => { if (calls.filter((c) => c[0] === 'pulls.get').length === 1) { const e = new Error('boom'); e.status = 502; throw e; }
+  gh = fakeApi({ pullsGet: (calls, a) => { if (calls.filter((c) => c[0] === 'pulls.get').length === 1) { const e = new Error('boom'); e.name = 'MatcherUnavailableError'; e.status = 502; throw e; }
     return { data: { head: { sha: HEAD2 } } }; } });
   r = await runJudge(gh, context([listedPr(761)]));
   ok('judge: an API error becomes a failure verdict on the pull request\'s head, not silence',
-    r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD2 && /502/.test(r.verdicts[0].summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdicts));
+    r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD2 && /502/.test(r.verdicts[0].summary) && /MatcherUnavailableError/.test(r.verdicts[0].summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdicts));
 
   gh = fakeApi({ pullsGet: () => { const e = new Error('down'); e.status = 503; throw e; } });
   r = await runJudge(gh, context([listedPr(761)]));

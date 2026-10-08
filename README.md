@@ -858,3 +858,32 @@ deliberately weakened copies of their module (each a single, exactly-once
 string replacement) and run the suite against each one with
 `ISSUE_LINK_MODULE` / `SOURCE_POLICY_MODULE`: every identity mutant must turn
 the suite red, or the runner fails.
+
+### Cross-repository issue-link publisher contract (#33)
+
+The trusted reusable `issue-link-publish.yml` declares only optional
+`workflow_call.secrets.CHECKS_APP_PRIVATE_KEY`. Each product caller forwards
+that **one named secret**, never `secrets: inherit`; the called job's
+`governance-checks` environment value takes precedence. Its existing default
+branch restriction, ephemeral runner, verified merged governance pin,
+read-only matcher step and later checks-only App token remain required.
+Both the Actions PR-governance caller and Checks App publisher must pin the
+same reviewed, merged central commit to use the same matcher.
+
+Accepted supervisor contract: matcher exceptions fail closed in both callers.
+The Checks App catches the exception and posts failure, naming its bounded
+exception category and HTTP status in the summary; the Actions judge throws
+and its job goes red, without a new API check. A check run belongs to a commit:
+when multiple PRs share that head, the App fails if **any** PR is unlinked.
+This stricter aggregation is intentional. A disagreement blocks a merge;
+it cannot authorize a false pass. Tests cover exception handling in both
+callers and both orders of a shared head with one unlinked PR.
+
+After this central fix is independently reviewed and merged to `.github/test`,
+product T5 callers pin that merged commit and enable their required-name posts.
+Product drafts target dev; Claude schedules their batched dev→test promotion
+(at most once per day). A real PR head into the repository's default/test
+branch must then show App5105172 posting both required names successfully.
+Only after that observed proof may the owner cut over rulesets. No synthetic
+check posts, key extraction, environment-policy change, or agent merge is
+part of this central fix.
