@@ -39,6 +39,7 @@ const BASH = process.env.BOOTSTRAP_BASH ? path.resolve(process.env.BOOTSTRAP_BAS
 const ORG = 'marvinamiranda';
 const CANONICAL = `https://github.com/${ORG}/.github.git`;
 const REVIEWER_ID = 5075711;
+const CHECKS_ID = 5105172;
 
 let failed = 0;
 let total = 0;
@@ -54,11 +55,13 @@ const fixtureFile = path.join(root, 'fixtures.json');
 const ghLog = path.join(root, 'gh.log');
 const cfg = path.join(root, 'cfg');
 const reviewerJson = path.join(root, 'reviewer-app.json');
+const checksJson = path.join(root, 'checks-app.json');
 fs.mkdirSync(stubBin);
 fs.mkdirSync(path.join(root, 'home'));
 fs.mkdirSync(path.join(cfg, 'prod'), { recursive: true });
 fs.writeFileSync(path.join(cfg, 'prod', 'areas.txt'), 'core|Everything in this test repository\n#   path: **\n');
-fs.writeFileSync(path.join(cfg, 'prod', 'required-checks.txt'), 'build\n');
+fs.writeFileSync(path.join(cfg, 'prod', 'required-checks.txt'), 'build\nAll checks accounted for\n');
+fs.writeFileSync(checksJson, JSON.stringify({ id: CHECKS_ID, slug: 'fake-checks' }));
 fs.writeFileSync(reviewerJson, JSON.stringify({ id: REVIEWER_ID, slug: 'fake-reviewer' }));
 
 // gh: `gh api [--paginate] <path> [--jq <expr>]` and `gh auth status` read
@@ -221,7 +224,7 @@ function checkout(on) {
 }
 
 // `repo: false` runs without the default `--repo prod --config-dir <cfg>`.
-function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where = null, repo = true, extraEnv = {}, writable = false, cwd = undefined } = {}) {
+function bootstrap(args, { on = 'head', reviewer = true, checksApp = true, fx = fixtures(), where = null, repo = true, extraEnv = {}, writable = false, cwd = undefined } = {}) {
   const co = where || checkout(on);
   fs.writeFileSync(fixtureFile, JSON.stringify(fx));
   fs.writeFileSync(ghLog, '');
@@ -238,6 +241,7 @@ function bootstrap(args, { on = 'head', reviewer = true, fx = fixtures(), where 
       FAKE_GH_LOG: ghLog,
       FAKE_GH_WRITABLE: writable ? '1' : '0',
       MM_REVIEWER_APP_JSON: reviewer ? reviewerJson : path.join(root, 'no-such-reviewer.json'),
+      MM_CHECKS_APP_JSON: checksApp ? checksJson : path.join(root, 'no-such-checks.json'),
       GIT_CONFIG_NOSYSTEM: '1',
       ...extraEnv,
     },
@@ -261,6 +265,79 @@ function planned(stdout) {
 }
 const pr = (rs) => (rs.rules.find((r) => r.type === 'pull_request') || {}).parameters || {};
 const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks') || {}).parameters || {}).required_status_checks || [];
+
+// --------------------------- Checks App issuer pin and fail-closed preflight ----
+{
+  const assertPins = (r, id) => {
+    const plan = planned(r.stdout);
+    for (const name of ['test-integration', 'main-checks']) {
+      const rs = plan[`prod/${name}`];
+      for (const context of ['governance/issue-link', 'All checks accounted for']) {
+        ok(`${name}: ${context} is pinned to Checks App ${id}`, r.status === 0 && rs
+          && checks(rs.body).some((c) => c.context === context && c.integration_id === id), tail(r));
+      }
+      ok(`${name}: all other issuers are unchanged`, rs && checks(rs.body).every((c) =>
+        ['governance/issue-link', 'All checks accounted for'].includes(c.context)
+          || c.integration_id === (c.context === 'review/independent' ? REVIEWER_ID : 15368)), tail(r));
+    }
+    ok('dev-integration retains Actions and Reviewer issuers', plan['prod/dev-integration']
+      && checks(plan['prod/dev-integration'].body).every((c) =>
+        c.integration_id === (c.context === 'review/independent' ? REVIEWER_ID : 15368)), tail(r));
+  };
+  assertPins(bootstrap(['--checks-app-id', '123']), 123);
+  assertPins(bootstrap([]), CHECKS_ID);
+  fs.mkdirSync(path.join(cfg, 'prod2'));
+  for (const file of ['areas.txt', 'required-checks.txt']) {
+    fs.copyFileSync(path.join(cfg, 'prod', file), path.join(cfg, 'prod2', file));
+  }
+  const second = {};
+  for (const [key, value] of Object.entries(fixtures())) {
+    if (key.includes('/prod')) second[key.replace('/prod', '/prod2')] = value;
+  }
+  const multi = bootstrap(['--repo', 'prod2', '--checks-app-id', '123'], { fx: fixtures(second) });
+  const multiPlan = planned(multi.stdout);
+  ok('every --repo gets both Checks App pins in both migrated rulesets', multi.status === 0
+    && ['prod', 'prod2'].every((repo) => ['test-integration', 'main-checks'].every((name) => {
+      const rs = multiPlan[`${repo}/${name}`];
+      return rs && ['governance/issue-link', 'All checks accounted for'].every((context) =>
+        checks(rs.body).some((c) => c.context === context && c.integration_id === 123));
+    })), tail(multi));
+
+  for (const args of [[], ['--apply']]) {
+    const r = bootstrap(args, { checksApp: false });
+    ok(`missing Checks App refuses ${args.includes('--apply') ? 'apply' : 'dry run'} before any ruleset write`,
+      r.status !== 0 && /--checks-app-id/.test(r.stderr) && r.writes.length === 0
+        && Object.keys(planned(r.stdout)).length === 0, tail(r));
+  }
+  let r = bootstrap(['--no-rulesets'], { checksApp: false });
+  ok('no-rulesets requires no Checks App', r.status === 0 && r.writes.length === 0, tail(r));
+  for (const value of ['abc', '-1', '1.5', '']) {
+    r = bootstrap(['--checks-app-id', value]);
+    ok(`Checks App rejects nonnumeric id ${JSON.stringify(value)}`, r.status === 2
+      && /--checks-app-id needs a numeric id/.test(r.stderr) && r.calls.length === 0, tail(r));
+  }
+  r = bootstrap(['--checks-app-id']);
+  ok('Checks App rejects missing argument', r.status === 2 && /numeric id/.test(r.stderr), tail(r));
+  const invalidJson = path.join(root, 'invalid-checks.json');
+  fs.writeFileSync(invalidJson, JSON.stringify({ id: 'not-an-id' }));
+  r = bootstrap([], { extraEnv: { MM_CHECKS_APP_JSON: invalidJson } });
+  ok('invalid app.json id fails closed', r.status !== 0 && /--checks-app-id/.test(r.stderr)
+    && r.writes.length === 0, tail(r));
+  const co = checkout('head');
+  const self = bootstrap(['--self-only'], { repo: false, where: co, checksApp: false });
+  const supplied = bootstrap(['--self-only', '--checks-app-id', '123'], { repo: false, where: co });
+  ok('self-only output is byte-identical regardless of Checks App presence', self.status === 0
+    && supplied.status === 0 && self.stdout === supplied.stdout, tail(self));
+  ok('self-only full output matches pre-change baseline (generated commit IDs normalised)', require('crypto').createHash('sha256')
+    .update(self.stdout.replace(/[a-f0-9]{40}/g, '<commit>').replace(/read now: [a-f0-9]{12}/g, 'read now: <short>')).digest('hex') === '8d14618b821f9c21f5671fc773c32540269983b013b4b83176f016c245ba82a1');
+}
+
+// Focused issuer-contract suite for causal mutations; exercises the same CLI cases.
+if (process.env.BOOTSTRAP_CHECKS_ONLY === '1') {
+  console.log(`${total - failed}/${total} passed`);
+  fs.rmSync(root, { recursive: true, force: true });
+  process.exit(failed ? 1 : 0);
+}
 
 // ------------------------------------------------ N6: the Reviewer App id ----
 {
@@ -593,7 +670,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
       && checks(d.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID),
     d && JSON.stringify(checks(d.body)));
   ok('test-integration requires governance/issue-link, test-source-policy and review/independent',
-    t && checks(t.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === 15368)
+    t && checks(t.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === CHECKS_ID)
       && checks(t.body).some((c) => c.context === 'test-source-policy' && c.integration_id === 15368)
       && checks(t.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID),
     t && JSON.stringify(checks(t.body)));

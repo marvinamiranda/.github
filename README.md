@@ -760,6 +760,25 @@ governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # als
   changing anything. This repository's own `test-integration` would otherwise
   require only `governance tests`, which a pull request here can rewrite.
 
+Product ruleset runs also need `--checks-app-id <numeric id>`, falling back to
+`id` in `~/.config/mm-agent/mm-checks/app.json` (`MM_CHECKS_APP_JSON` overrides
+that path). Missing or invalid identity refuses the whole ruleset run before
+any ruleset write, including this repository's rulesets. `--no-rulesets` and
+`--self-only` require no Checks App id; `--self-only` output is unchanged.
+
+Only product `test-integration` and `main-checks` pin `governance/issue-link`
+and `All checks accounted for` to that App. `review/independent` stays on the
+Reviewer App and every other context stays on Actions (15368). The dev ruleset
+is unchanged. The owner applies this only after installation and shadow soak:
+first on `omni237-ops`, then on the remaining product repositories after an
+observed merge. Agents must not apply it.
+
+**Rollback / pool recovery:** re-run the bootstrap from the merged commit before
+this issuer migration to restore the Actions pins. The local `gate-ephemeral`
+pool has no hosted fallback; if it remains down, the owner uses the same rollback
+rather than bypassing required checks. Keep the prior commit available and use
+the same owner-token and clean-checkout procedure.
+
 **The credential for `--apply`** is a fine-grained personal access token of
 the owner's that expires the next day, passed as `GH_TOKEN` for that run only.
 Never add `admin:org` to the `gh` keyring login: agents on this machine can
@@ -817,8 +836,8 @@ four rulesets below.
   Reviewer App. Any branch may open a pull request into `dev`. Merge commits
   only, no force push, no deletion, no bypass.
 - **`test-integration`**: on `test`. Pull request, no approvals. The repo's
-  required checks + `governance/issue-link` + `test-source-policy`, all pinned
-  to the Actions app, plus `review/independent` pinned to the Reviewer App. The
+  required checks + `governance/issue-link` + `test-source-policy`; the two
+  Checks App contexts use its id, the remaining checks use Actions, plus `review/independent` pinned to the Reviewer App. The
   source must be `dev`, `main` or `hotfix/*` (the `test-source-policy` check);
   merge commits only, so `test` and `main` keep one history. No force push, no
   deletion, no bypass.
@@ -828,7 +847,8 @@ four rulesets below.
   organisation-admin role, which would extend to every admin.
 - **`main-checks`**: on `main`. Pull request (merge commits only, no
   approvals); required checks from both lists + `governance/issue-link` +
-  `main-source-policy`, whose source must be `test` or `hotfix/*`; no force
+  `main-source-policy`; the two Checks App contexts use its id and the rest
+  use Actions. The source must be `test` or `hotfix/*`; no force
   push, no deletion; no bypass, so the owner's merges pass the checks too.
 
 `require_extra_approval_for_unattributed_changes` is set to `false` explicitly,
