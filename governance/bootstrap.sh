@@ -206,7 +206,7 @@ while [[ $# -gt 0 ]]; do
     --probe) PROBE=1 ;;
     --project-title) [[ $# -ge 2 ]] || { echo "--project-title needs a value" >&2; exit 2; }; PROJECT_TITLE="$2"; shift ;;
     --reviewer-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--reviewer-app-id needs a numeric id" >&2; exit 2; }; REVIEWER_APP_ID="$2"; shift ;;
-    --checks-app-id) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--checks-app-id needs a numeric id" >&2; exit 2; }; CHECKS_APP_ID="$2"; shift ;;
+    --checks-app-id) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--checks-app-id needs a numeric id" >&2; exit 2; }; CHECKS_APP_ID="$2"; shift ;;
     --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$ORIG_PWD" && cd "$2" && pwd)"; shift ;;
     --strict-up-to-date) STRICT_UP_TO_DATE=true ;;
     -h|--help) usage; exit 0 ;;
@@ -365,12 +365,51 @@ fi
 if (( ! SELF_ONLY && ! SKIP_RULESETS )); then
   if [[ -z "$CHECKS_APP_ID" && -r "$CHECKS_APP_JSON" ]]; then
     CHECKS_APP_ID="$(jq -r '.id // empty' "$CHECKS_APP_JSON")"
-    [[ "$CHECKS_APP_ID" =~ ^[0-9]+$ ]] || CHECKS_APP_ID=""
+    [[ "$CHECKS_APP_ID" =~ ^[1-9][0-9]*$ ]] || CHECKS_APP_ID=""
   fi
   if [[ -z "$CHECKS_APP_ID" ]]; then
     echo "No Checks App id: re-run with --checks-app-id <numeric id> or $CHECKS_APP_JSON present; or use --no-rulesets." >&2
     exit 1
   fi
+  if [[ "$CHECKS_APP_ID" == "$REVIEWER_APP_ID" || "$CHECKS_APP_ID" == "$ACTIONS_APP_ID" ]]; then
+    echo "Checks App id must differ from Reviewer and Actions ids." >&2
+    exit 1
+  fi
+  published_checks_id="$(gh api apps/marvinamiranda-checks --jq .id)"
+  if [[ "$CHECKS_APP_ID" != "$published_checks_id" ]]; then
+    echo "Checks App id does not match GET /apps/marvinamiranda-checks." >&2
+    exit 1
+  fi
+  info "Checks App id: $CHECKS_APP_ID (marvinamiranda-checks)"
+
+  # Probe ALL targets before ANY mutation, including this repo's rulesets.
+  # Both exact contexts must exist on ONE recent PR head into test. Shadow
+  # names, another App, and evidence split across heads cannot qualify.
+  checks_publisher_probe() {
+    local repo="$1" prs heads sha runs
+    prs="$(gh api "repos/$ORG/$repo/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20")" || return 1
+    heads="$(jq -er '[.[].head.sha | select(test("^[a-f0-9]{40}$"))] | unique | .[]' <<<"$prs")" || return 1
+    while IFS= read -r sha; do
+      runs="$(gh api --paginate "repos/$ORG/$repo/commits/$sha/check-runs?per_page=100" | jq -se '[.[] | .check_runs[]]')" || return 1
+      if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" '
+        [.[] | select(.app.id == $id and .head_sha == $sha) | .name] as $names |
+        (["governance/issue-link", "All checks accounted for"] - $names | length) == 0
+      ' <<<"$runs" >/dev/null; then
+        info "Checks App publisher proven for $repo on PR head $sha"
+        return 0
+      fi
+    done <<<"$heads"
+    return 1
+  }
+  for repo in "${REPOS[@]}"; do
+    if ! checks_publisher_probe "$repo"; then
+      if (( APPLY )); then
+        echo "Refusing --apply: Checks App publisher for $repo has not posted both exact required contexts on a recent PR head into test. Merge product T5 and observe both names before pinning." >&2
+        exit 1
+      fi
+      warn "Checks App publisher for $repo is not proven; --apply would refuse. Merge product T5 and observe both required names before pinning."
+    fi
+  done
 fi
 
 owner_login="$(gh api "user/$OWNER_USER_ID" --jq .login)"

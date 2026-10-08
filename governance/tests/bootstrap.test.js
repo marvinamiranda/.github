@@ -118,6 +118,7 @@ for (let i = 1; i < args.length; i++) {
 }
 log('read');
 if (!(target in fixtures)) { process.stderr.write('gh: Not Found (HTTP 404)\\n'); process.exit(1); }
+if (args.includes('--paginate') && fixtures[target] && fixtures[target].__pages) { process.stdout.write(fixtures[target].__pages.map((p) => JSON.stringify(p)).join('\\n') + '\\n'); process.exit(0); }
 const body = JSON.stringify(fixtures[target]);
 process.stdout.write(jq ? execFileSync('jq', ['-r', jq], { input: body }) : body + '\\n');
 `, { mode: 0o755 });
@@ -160,6 +161,9 @@ function labelsFromScript() {
 function fixtures(extra = {}) {
   const repo = (name) => ({ name, full_name: `${ORG}/${name}`, default_branch: 'dev' });
   return {
+    [`apps/marvinamiranda-checks`]: { id: CHECKS_ID, slug: 'marvinamiranda-checks' },
+    [`repos/${ORG}/prod/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20`]: [{ head: { sha: 'a'.repeat(40) } }],
+    [`repos/${ORG}/prod/commits/${'a'.repeat(40)}/check-runs?per_page=100`]: { total_count: 2, check_runs: ['governance/issue-link', 'All checks accounted for'].map((name) => ({name, head_sha: 'a'.repeat(40), app: { id: CHECKS_ID }})) },
     [`user/1245936`]: { login: 'rodrigolmiranda', id: 1245936 },
     user: { login: 'rodrigolmiranda', id: 1245936 },
     [`orgs/${ORG}/issue-types`]: ['Task', 'Bug', 'Epic', 'Decision', 'Spike'].map((name, id) => ({ id, name, is_enabled: true })),
@@ -284,7 +288,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
       && checks(plan['prod/dev-integration'].body).every((c) =>
         c.integration_id === (c.context === 'review/independent' ? REVIEWER_ID : 15368)), tail(r));
   };
-  assertPins(bootstrap(['--checks-app-id', '123']), 123);
+  assertPins(bootstrap(['--checks-app-id', String(CHECKS_ID)]), CHECKS_ID);
   assertPins(bootstrap([]), CHECKS_ID);
   fs.mkdirSync(path.join(cfg, 'prod2'));
   for (const file of ['areas.txt', 'required-checks.txt']) {
@@ -294,13 +298,13 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   for (const [key, value] of Object.entries(fixtures())) {
     if (key.includes('/prod')) second[key.replace('/prod', '/prod2')] = value;
   }
-  const multi = bootstrap(['--repo', 'prod2', '--checks-app-id', '123'], { fx: fixtures(second) });
+  const multi = bootstrap(['--repo', 'prod2', '--checks-app-id', String(CHECKS_ID)], { fx: fixtures(second) });
   const multiPlan = planned(multi.stdout);
   ok('every --repo gets both Checks App pins in both migrated rulesets', multi.status === 0
     && ['prod', 'prod2'].every((repo) => ['test-integration', 'main-checks'].every((name) => {
       const rs = multiPlan[`${repo}/${name}`];
       return rs && ['governance/issue-link', 'All checks accounted for'].every((context) =>
-        checks(rs.body).some((c) => c.context === context && c.integration_id === 123));
+        checks(rs.body).some((c) => c.context === context && c.integration_id === CHECKS_ID));
     })), tail(multi));
 
   for (const args of [[], ['--apply']]) {
@@ -311,7 +315,7 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   }
   let r = bootstrap(['--no-rulesets'], { checksApp: false });
   ok('no-rulesets requires no Checks App', r.status === 0 && r.writes.length === 0, tail(r));
-  for (const value of ['abc', '-1', '1.5', '']) {
+  for (const value of ['abc', '-1', '1.5', '', '0', '0015368']) {
     r = bootstrap(['--checks-app-id', value]);
     ok(`Checks App rejects nonnumeric id ${JSON.stringify(value)}`, r.status === 2
       && /--checks-app-id needs a numeric id/.test(r.stderr) && r.calls.length === 0, tail(r));
@@ -323,6 +327,51 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
   r = bootstrap([], { extraEnv: { MM_CHECKS_APP_JSON: invalidJson } });
   ok('invalid app.json id fails closed', r.status !== 0 && /--checks-app-id/.test(r.stderr)
     && r.writes.length === 0, tail(r));
+  for (const value of ['0', '0015368', String(REVIEWER_ID), '15368', '123']) {
+    const refusal = bootstrap(['--checks-app-id', value, '--apply']);
+    ok(`Checks App refuses unsafe issuer ${value} before writes`, refusal.status !== 0 && refusal.writes.length === 0 && (![String(REVIEWER_ID), '15368'].includes(value) || /differ from Reviewer and Actions/.test(refusal.stderr)), tail(refusal));
+    const badFile = path.join(root, `checks-${value}.json`);
+    fs.writeFileSync(badFile, JSON.stringify({ id: value }));
+    const fallback = bootstrap(['--apply'], { extraEnv: { MM_CHECKS_APP_JSON: badFile } });
+    ok(`Checks App fallback refuses unsafe issuer ${value} before writes`, fallback.status !== 0 && fallback.writes.length === 0, tail(fallback));
+  }
+  const runsKey = `repos/${ORG}/prod/commits/${'a'.repeat(40)}/check-runs?per_page=100`;
+  for (const omitted of ['governance/issue-link', 'All checks accounted for']) {
+    const fx = fixtures({ [runsKey]: { check_runs: [{ name: omitted === 'governance/issue-link' ? 'All checks accounted for' : 'governance/issue-link', head_sha: 'a'.repeat(40), app: { id: CHECKS_ID } }] } });
+    const refused = bootstrap(['--apply'], { fx });
+    ok(`missing ${omitted} publisher refuses apply before ANY writes`, refused.status !== 0 && refused.writes.length === 0 && /publisher/.test(refused.stderr), tail(refused));
+    const warned = bootstrap([], { fx });
+    ok(`missing ${omitted} publisher warns dry run`, warned.status === 0 && /WARNING: .*publisher/.test(warned.stdout), tail(warned));
+  }
+  for (const [label, fx] of [
+    ['shadow or Actions-only', fixtures({ [runsKey]: { check_runs: [{ name: 'All checks accounted for (Checks App shadow)', app: { id: CHECKS_ID } }, { name: 'governance/issue-link', app: { id: 15368 } }] } })],
+    ['no recent PR', fixtures({ [`repos/${ORG}/prod/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20`]: [] })],
+    ['unreadable check runs', fixtures({ [runsKey]: null })],
+  ]) {
+    const refused = bootstrap(['--apply'], { fx });
+    ok(`${label} refuses apply before writes`, refused.status !== 0 && refused.writes.length === 0, tail(refused));
+  }
+  r = bootstrap([], { fx: fixtures({ [runsKey]: { __pages: [
+    { check_runs: [{ name: 'governance/issue-link', head_sha: 'a'.repeat(40), app: { id: CHECKS_ID } }] },
+    { check_runs: [{ name: 'All checks accounted for', head_sha: 'a'.repeat(40), app: { id: CHECKS_ID } }] },
+  ] } }) });
+  ok('publisher proof reads all check-run pages on one head', r.status === 0 && /publisher proven/.test(r.stdout) && !/publisher.*not proven/.test(r.stdout), tail(r));
+  const recentKey = `repos/${ORG}/prod/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20`;
+  const split = fixtures({
+    [recentKey]: [{ head: { sha: 'a'.repeat(40) } }, { head: { sha: 'b'.repeat(40) } }],
+    [runsKey]: { check_runs: [{ name: 'governance/issue-link', head_sha: 'a'.repeat(40), app: { id: CHECKS_ID } }] },
+    [`repos/${ORG}/prod/commits/${'b'.repeat(40)}/check-runs?per_page=100`]: { check_runs: [{ name: 'All checks accounted for', head_sha: 'b'.repeat(40), app: { id: CHECKS_ID } }] },
+  });
+  r = bootstrap(['--apply'], { fx: split });
+  ok('contexts split across PR heads cannot qualify', r.status !== 0 && r.writes.length === 0, tail(r));
+  r = bootstrap(['--apply'], { fx: fixtures({ [runsKey]: { check_runs: ['governance/issue-link', 'All checks accounted for'].map((name) => ({ name, head_sha: 'b'.repeat(40), app: { id: CHECKS_ID } })) } }) });
+  ok('wrong check-run head cannot qualify', r.status !== 0 && r.writes.length === 0, tail(r));
+  r = bootstrap(['--apply'], { fx: fixtures({ 'apps/marvinamiranda-checks': { id: 42 } }) });
+  ok('public App metadata mismatch refuses before writes', r.status !== 0 && r.writes.length === 0, tail(r));
+  r = bootstrap(['--repo', 'prod2', '--apply'], { fx: fixtures({ ...second, [`repos/${ORG}/prod2/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20`]: [] }) });
+  ok('later repo missing probe blocks every repo mutation', r.status !== 0 && r.writes.length === 0, tail(r));
+  r = bootstrap([]);
+  ok('preflight prints verified Checks App identity and publisher proof', r.status === 0 && /Checks App id: 5105172 \(marvinamiranda-checks\)/.test(r.stdout) && /publisher.*prod/.test(r.stdout), tail(r));
   const co = checkout('head');
   const self = bootstrap(['--self-only'], { repo: false, where: co, checksApp: false });
   const supplied = bootstrap(['--self-only', '--checks-app-id', '123'], { repo: false, where: co });
