@@ -953,11 +953,17 @@ part of this central fix.
 ### Missing-association recovery and key placement (#43)
 
 The central issue-link publisher recovers a missing workflow_run PR association
-through GitHub's paginated commit-associated PR endpoint. It requires one open
+through GitHub's paginated open-PR list filtered by `head=owner:branch`.
+The commit-associated endpoint is unsuitable for a default-branch release head: it
+can report the merged introducer rather than the open release PR. It requires one open
 candidate with the exact run SHA, branch and same-repository identity; forks,
-ambiguous candidates, malformed data and unreadable APIs fail closed. A fresh
+ambiguous candidates, malformed eligible data and unreadable APIs fail closed.
+When the run SHA is valid, those failures publish a failure verdict on that SHA
+so an earlier success cannot stand; invalid/missing SHAs remain unpostable.
+Closed or other-SHA candidates are skipped before deep validation. A fresh
 identity check before and after judging prevents publishing success after a
 force-push or association change. A same-repo test→main release head is valid.
+See GitHub's [open pull-request head filter](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests).
 Existing listed multi-PR commit aggregation remains stricter: any failure fails
 the shared head. Product callers consume this behavior only after this PR merges
 and a separately reviewed caller repin; their existing T5 PRs remain untouched.

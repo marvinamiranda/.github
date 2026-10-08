@@ -188,66 +188,86 @@ jobs:
             const here = context.payload.repository && context.payload.repository.id;
             const validId = (id) => Number.isSafeInteger(id) && id > 0;
             const validRef = (ref) => typeof ref === 'string' && ref.trim() === ref && ref.length > 0;
+            const runHead = /^[0-9a-f]{40}$/.test(run.head_sha || '') ? run.head_sha : undefined;
+            const failOnRunHead = async (reason, failJobAfterPost = false) => {
+              if (!runHead) {
+                core.setFailed(`${reason} No valid run head exists, so nothing is posted.`);
+                return;
+              }
+              const verdict = { headSha: runHead, ok: false,
+                title: 'The issue-link publisher could not verify this run', summary: cap(reason) };
+              if (failJobAfterPost) verdict.failJobAfterPost = true;
+              fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'issue-link-verdict.json'), JSON.stringify([verdict]));
+              core.setOutput('judged', 'true');
+              await core.summary.addHeading('governance/issue-link').addRaw(verdict.summary).write();
+            };
             if (run.pull_requests != null && !Array.isArray(run.pull_requests)) {
-              core.setFailed('The workflow run has a malformed pull request association. Nothing is posted.');
+              await failOnRunHead('The workflow run has a malformed pull request association.');
               return;
             }
             const listed = run.pull_requests || [];
             let mine = listed.filter((p) => p && Number.isInteger(p.number) && p.number >= 1
               && here !== undefined && p.base && p.base.repo && p.base.repo.id === here);
-            const runHead = /^[0-9a-f]{40}$/.test(run.head_sha || '') ? run.head_sha : undefined;
             let recovered = null;
             if (listed.length === 0) {
               // GitHub sometimes omits the workflow_run PR association. The
-              // commit association endpoint supplies candidates, not identity:
+              // open head-branch listing supplies candidates, not identity:
               // only one open PR with this exact SHA, branch and same-repository
               // head/base may be recovered. The default branch is a valid head
               // for a release PR to main; no branch-name allow-list is used.
               const branch = run.head_branch;
               const runRepo = run.head_repository && run.head_repository.id;
               if (!runHead || !validRef(branch) || !validId(here) || runRepo !== here) {
-                core.setFailed('The workflow run has no complete same-repository head identity for PR recovery. Nothing is posted.');
+                await failOnRunHead('The workflow run has no complete same-repository head identity for PR recovery.');
                 return;
               }
               let candidates;
               try {
-                candidates = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit,
-                  { owner, repo, commit_sha: runHead, per_page: 100 });
+                candidates = await github.paginate(github.rest.pulls.list,
+                  { owner, repo, state: 'open', head: `${owner}:${branch}`, per_page: 100 });
               } catch (error) {
-                core.setFailed(`Could not read pull requests associated with the run commit (HTTP ${error && error.status || '?'}). Nothing is posted.`);
+                const status = error && Number.isInteger(error.status) ? error.status : '?';
+                await failOnRunHead(`Could not list open pull requests for the run branch (HTTP ${status}).`);
                 return;
               }
               if (!Array.isArray(candidates)) {
-                core.setFailed('The commit association response is malformed. Nothing is posted.');
+                await failOnRunHead('The open pull request listing is malformed.');
                 return;
               }
               const open = [];
               for (const candidate of candidates) {
                 const head = candidate && candidate.head;
                 const base = candidate && candidate.base;
-                if (!candidate || !validId(candidate.number) || !['open', 'closed'].includes(candidate.state)
-                    || !head || !/^[0-9a-f]{40}$/.test(head.sha || '') || !validRef(head.ref)
-                    || !head.repo || !validId(head.repo.id)
-                    || !base || !validRef(base.ref) || !base.repo || !validId(base.repo.id)) {
-                  core.setFailed('The commit association contains a malformed pull request. Nothing is posted.');
+                if (!candidate || !['open', 'closed'].includes(candidate.state)) {
+                  await failOnRunHead('The open pull request listing contains a malformed candidate.');
                   return;
                 }
-                if (candidate.state !== 'open' || head.sha !== runHead) continue;
-                if (head.ref !== branch || head.repo.id !== here || base.repo.id !== here) {
-                  core.setFailed('An open pull request on the run commit does not match its branch or repository identity. Nothing is posted.');
+                // Ignore irrelevant rows before validating their remaining fields.
+                // The head filter is only a hint; every eligible row is checked.
+                if (candidate.state !== 'open' || (head && /^[0-9a-f]{40}$/.test(head.sha || '') && head.sha !== runHead)
+                    || (head && head.repo && validId(head.repo.id) && head.repo.id !== here)
+                    || (base && base.repo && validId(base.repo.id) && base.repo.id !== here)) continue;
+                if (!validId(candidate.number) || !head || head.sha !== runHead || !validRef(head.ref)
+                    || !head.repo || head.repo.id !== here || !base || !validRef(base.ref)
+                    || !base.repo || base.repo.id !== here) {
+                  await failOnRunHead('An eligible pull request has a malformed head or repository identity.');
+                  return;
+                }
+                if (head.ref !== branch) {
+                  await failOnRunHead('An open pull request on the run commit does not match its branch identity.');
                   return;
                 }
                 open.push(candidate);
               }
               if (open.length !== 1) {
-                core.setFailed('The run commit does not identify exactly one open same-repository pull request. Nothing is posted.');
+                await failOnRunHead('The run commit does not identify exactly one open same-repository pull request.');
                 return;
               }
               recovered = open[0];
               mine = [recovered];
             }
             if (mine.length === 0) {
-              core.setFailed('The workflow run lists no pull request of this repository, so there is no head to post governance/issue-link on. Nothing is posted.');
+              await failOnRunHead('The workflow run lists no pull request of this repository.');
               return;
             }
             const recoveredIsCurrent = async (number) => {
@@ -255,7 +275,7 @@ jobs:
               try {
                 ({ data: current } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
               } catch (error) {
-                core.setFailed(`Could not revalidate the recovered pull request (HTTP ${error && error.status || '?'}). Nothing is posted.`);
+                // The caller will issue a failure verdict on the known run head.
                 return false;
               }
               if (!current || current.number !== number || current.state !== 'open'
@@ -263,7 +283,6 @@ jobs:
                   || !current.head.repo || current.head.repo.id !== here
                   || !current.base || current.base.ref !== recovered.base.ref
                   || !current.base.repo || current.base.repo.id !== here) {
-                core.setFailed('The recovered pull request changed head, branch, base or repository. Nothing is posted.');
                 return false;
               }
               return true;
@@ -271,7 +290,10 @@ jobs:
             const judged = [];
             for (const listedPull of mine) {
               const number = listedPull.number;
-              if (recovered && !(await recoveredIsCurrent(number))) return;
+              if (recovered && !(await recoveredIsCurrent(number))) {
+                await failOnRunHead('The recovered pull request could not be revalidated before judging.');
+                return;
+              }
               let verdict;
               try {
                 // judge() reads the pull request now, not from the event.
@@ -306,10 +328,17 @@ jobs:
               if (recovered) {
                 // issue-link.js rereads the PR. A force-push between our first
                 // read and its read must not green-light an unrelated new head.
-                if (!verdict || verdict.headSha !== runHead || !(await recoveredIsCurrent(number))) {
-                  if (verdict && verdict.headSha !== runHead) core.setFailed('The matcher judged a different head from the recovered run. Nothing is posted.');
+                if (!verdict) {
+                  await failOnRunHead('The issue-link judge returned no verdict.', true);
                   return;
                 }
+                if (verdict.headSha !== runHead || !(await recoveredIsCurrent(number))) {
+                  await failOnRunHead('The recovered pull request or matcher verdict changed identity during judging.');
+                  return;
+                }
+              } else if (!verdict) {
+                await failOnRunHead('The issue-link judge returned no verdict.', true);
+                return;
               }
               judged.push({ number, ...verdict });
             }
@@ -395,4 +424,9 @@ jobs:
                 conclusion: verdict.ok === true ? 'success' : 'failure',
                 output: { title: String(verdict.title).slice(0, 255), summary: cap(verdict.summary) },
               });
+            }
+            // A missing judge result is an internal failure too. Wait until
+            // its failure check has posted so an older success cannot stand.
+            if (verdicts.some((v) => v.failJobAfterPost === true)) {
+              core.setFailed('The issue-link judge returned no verdict. A failure check was posted.');
             }
