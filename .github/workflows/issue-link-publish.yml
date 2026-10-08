@@ -182,22 +182,96 @@ jobs:
             const { owner, repo } = context.repo;
             const run = context.payload.workflow_run || {};
             // `pull_requests` lists EVERY open pull request whose head sha or head
-            // branch matches the run, in any repository. Judging only one of them
-            // would let another that shares the commit pass unjudged, so every
-            // one that targets THIS repository is judged. Anything that cannot be
-            // shown to be this repository's (no id on either side) is not.
+            // branch matches the run, in any repository. Judge every listed PR
+            // of this repository; an explicit other-repository association is
+            // never permission to search for a different PR.
             const here = context.payload.repository && context.payload.repository.id;
-            const listed = Array.isArray(run.pull_requests) ? run.pull_requests : [];
-            const mine = listed.filter((p) => p && Number.isInteger(p.number) && p.number >= 1
+            const validId = (id) => Number.isSafeInteger(id) && id > 0;
+            const validRef = (ref) => typeof ref === 'string' && ref.trim() === ref && ref.length > 0;
+            if (run.pull_requests != null && !Array.isArray(run.pull_requests)) {
+              core.setFailed('The workflow run has a malformed pull request association. Nothing is posted.');
+              return;
+            }
+            const listed = run.pull_requests || [];
+            let mine = listed.filter((p) => p && Number.isInteger(p.number) && p.number >= 1
               && here !== undefined && p.base && p.base.repo && p.base.repo.id === here);
+            const runHead = /^[0-9a-f]{40}$/.test(run.head_sha || '') ? run.head_sha : undefined;
+            let recovered = null;
+            if (listed.length === 0) {
+              // GitHub sometimes omits the workflow_run PR association. The
+              // commit association endpoint supplies candidates, not identity:
+              // only one open PR with this exact SHA, branch and same-repository
+              // head/base may be recovered. The default branch is a valid head
+              // for a release PR to main; no branch-name allow-list is used.
+              const branch = run.head_branch;
+              const runRepo = run.head_repository && run.head_repository.id;
+              if (!runHead || !validRef(branch) || !validId(here) || runRepo !== here) {
+                core.setFailed('The workflow run has no complete same-repository head identity for PR recovery. Nothing is posted.');
+                return;
+              }
+              let candidates;
+              try {
+                candidates = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit,
+                  { owner, repo, commit_sha: runHead, per_page: 100 });
+              } catch (error) {
+                core.setFailed(`Could not read pull requests associated with the run commit (HTTP ${error && error.status || '?'}). Nothing is posted.`);
+                return;
+              }
+              if (!Array.isArray(candidates)) {
+                core.setFailed('The commit association response is malformed. Nothing is posted.');
+                return;
+              }
+              const open = [];
+              for (const candidate of candidates) {
+                const head = candidate && candidate.head;
+                const base = candidate && candidate.base;
+                if (!candidate || !validId(candidate.number) || !['open', 'closed'].includes(candidate.state)
+                    || !head || !/^[0-9a-f]{40}$/.test(head.sha || '') || !validRef(head.ref)
+                    || !head.repo || !validId(head.repo.id)
+                    || !base || !validRef(base.ref) || !base.repo || !validId(base.repo.id)) {
+                  core.setFailed('The commit association contains a malformed pull request. Nothing is posted.');
+                  return;
+                }
+                if (candidate.state !== 'open' || head.sha !== runHead) continue;
+                if (head.ref !== branch || head.repo.id !== here || base.repo.id !== here) {
+                  core.setFailed('An open pull request on the run commit does not match its branch or repository identity. Nothing is posted.');
+                  return;
+                }
+                open.push(candidate);
+              }
+              if (open.length !== 1) {
+                core.setFailed('The run commit does not identify exactly one open same-repository pull request. Nothing is posted.');
+                return;
+              }
+              recovered = open[0];
+              mine = [recovered];
+            }
             if (mine.length === 0) {
               core.setFailed('The workflow run lists no pull request of this repository, so there is no head to post governance/issue-link on. Nothing is posted.');
               return;
             }
-            const runHead = /^[0-9a-f]{40}$/.test(run.head_sha || '') ? run.head_sha : undefined;
+            const recoveredIsCurrent = async (number) => {
+              let current;
+              try {
+                ({ data: current } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
+              } catch (error) {
+                core.setFailed(`Could not revalidate the recovered pull request (HTTP ${error && error.status || '?'}). Nothing is posted.`);
+                return false;
+              }
+              if (!current || current.number !== number || current.state !== 'open'
+                  || !current.head || current.head.sha !== runHead || current.head.ref !== run.head_branch
+                  || !current.head.repo || current.head.repo.id !== here
+                  || !current.base || current.base.ref !== recovered.base.ref
+                  || !current.base.repo || current.base.repo.id !== here) {
+                core.setFailed('The recovered pull request changed head, branch, base or repository. Nothing is posted.');
+                return false;
+              }
+              return true;
+            };
             const judged = [];
             for (const listedPull of mine) {
               const number = listedPull.number;
+              if (recovered && !(await recoveredIsCurrent(number))) return;
               let verdict;
               try {
                 // judge() reads the pull request now, not from the event.
@@ -211,10 +285,12 @@ jobs:
                 const exception = error && typeof error.name === 'string'
                   && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name) ? error.name : 'Error';
                 let headSha = runHead;
-                try {
-                  ({ data: { head: { sha: headSha } } } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
-                } catch (again) {
-                  // The run's own head is the fallback: still a failure, on a commit.
+                if (!recovered) {
+                  try {
+                    ({ data: { head: { sha: headSha } } } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
+                  } catch (again) {
+                    // The run's own head is the fallback: still a failure, on a commit.
+                  }
                 }
                 if (!headSha) {
                   core.setFailed(`The judge failed (${status}) and no head commit could be found. Nothing is posted.`);
@@ -226,6 +302,14 @@ jobs:
                   summary: `The judge failed with ${exception} (${status}). Re-run the PR gate. This failure is posted so an older success does not stand.`,
                   headSha,
                 };
+              }
+              if (recovered) {
+                // issue-link.js rereads the PR. A force-push between our first
+                // read and its read must not green-light an unrelated new head.
+                if (!verdict || verdict.headSha !== runHead || !(await recoveredIsCurrent(number))) {
+                  if (verdict && verdict.headSha !== runHead) core.setFailed('The matcher judged a different head from the recovered run. Nothing is posted.');
+                  return;
+                }
               }
               judged.push({ number, ...verdict });
             }

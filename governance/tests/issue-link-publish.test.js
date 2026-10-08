@@ -106,8 +106,9 @@ ok('there is exactly one checkout, and it is of marvinamiranda/.github at govern
     && checkouts[0].with.ref === '${{ inputs.governance-ref }}' && checkouts[0].with.path === '.org-governance'
     && checkouts[0].with['persist-credentials'] === false, JSON.stringify(checkouts.map((c) => c.with)));
 ok('the checkout takes only governance/issue-link.js', checkouts[0] && checkouts[0].with['sparse-checkout'] === 'governance/issue-link.js');
-ok('the workflow never mentions a pull request head, merge ref or fork',
-  !/pull_request\.head|refs\/pull|head_ref|head\.repo|head_branch/.test(text.replace(/^\s*#.*$/gm, '')));
+ok('the workflow never checks out or runs the pull request head',
+  !/refs\/pull|pull_request\.head|head_ref/.test(text.replace(/^\s*#.*$/gm, ''))
+    && !/GITHUB_WORKSPACE/.test(script(judgeStep)));
 
 // ------------------------------------------------ run limits ------------
 ok('the job has a timeout of at most 10 minutes', typeof job['timeout-minutes'] === 'number' && job['timeout-minutes'] > 0 && job['timeout-minutes'] <= 10, String(job['timeout-minutes']));
@@ -205,7 +206,8 @@ function fakeCore() {
   };
 }
 // `bodies`: pull request number -> { body, head sha, closing issues }.
-function fakeApi({ bodies = { 761: {} }, pullsGet = null, base = 'test', defaultBranch = 'test' } = {}) {
+function fakeApi({ bodies = { 761: {} }, pullsGet = null, base = 'test', defaultBranch = 'test',
+  associatedPages = [], associationError = null } = {}) {
   const calls = [];
   const of = (n) => ({ body: 'Closes #742', head: HEAD, closing: [742], ...(bodies[n] || {}) });
   return {
@@ -214,9 +216,27 @@ function fakeApi({ bodies = { 761: {} }, pullsGet = null, base = 'test', default
       pulls: { get: async (a) => { calls.push(['pulls.get', a.pull_number]);
         if (pullsGet) return pullsGet(calls, a);
         const b = of(a.pull_number);
-        return { data: { number: a.pull_number, body: b.body, head: { ref: 'x', sha: b.head }, base: { ref: base } } }; } },
-      repos: { get: async () => ({ data: { default_branch: defaultBranch } }) },
+        return { data: { number: a.pull_number, state: 'open', draft: false, body: b.body,
+          head: { ref: 'x', sha: b.head, repo: { id: HERE } },
+          base: { ref: base, repo: { id: HERE } } } }; } },
+      repos: { get: async () => ({ data: { default_branch: defaultBranch } }),
+        listPullRequestsAssociatedWithCommit: async (a) => {
+          calls.push(['repos.listPullRequestsAssociatedWithCommit', a]);
+          if (associationError) throw associationError;
+          return { data: associatedPages[a.page - 1] || [] };
+        } },
       issues: { get: async () => ({ data: {} }) },
+    },
+    paginate: async (method, a) => {
+      calls.push(['paginate', a]);
+      const results = [];
+      for (let page = 1; page <= 101; page++) {
+        const response = await method({ ...a, page });
+        if (!Array.isArray(response.data)) throw new Error('malformed association response');
+        results.push(...response.data);
+        if (response.data.length < 100) return results;
+      }
+      throw new Error('association pagination did not terminate');
     },
     graphql: async (q, v) => ({ repository: { pullRequest: { closingIssuesReferences: { totalCount: of(v.number).closing.length,
       nodes: of(v.number).closing.map((n) => ({ number: n, repository: { nameWithOwner: 'marvinamiranda/omni237' } })) } } } }),
@@ -226,9 +246,13 @@ function fakeApi({ bodies = { 761: {} }, pullsGet = null, base = 'test', default
 const realRequire = require;
 const requireFrom = (p) => (p.startsWith('.') ? realRequire(path.resolve(work, p)) : realRequire(p));
 const listedPr = (number, repoId = HERE) => ({ number, base: { ref: 'test', repo: { id: repoId, name: 'omni237' } } });
+const associatedPr = (number, overrides = {}) => ({ number, state: 'open', draft: false,
+  head: { sha: HEAD, ref: 'x', repo: { id: HERE } },
+  base: { ref: 'test', repo: { id: HERE } }, ...overrides });
 const context = (pulls, extra = {}) => ({
   repo: { owner: 'marvinamiranda', repo: 'omni237' },
-  payload: { repository: { id: HERE }, workflow_run: { event: 'pull_request', head_sha: HEAD, pull_requests: pulls, ...extra } },
+  payload: { repository: { id: HERE }, workflow_run: { event: 'pull_request', head_sha: HEAD,
+    head_branch: 'x', head_repository: { id: HERE }, pull_requests: pulls, ...extra } },
 });
 
 async function runJudge(github, ctx) {
@@ -302,6 +326,115 @@ async function runPin(github, env) {
   ok('judge: it posts nothing', !gh.calls.some((c) => c[0] === 'request'));
   ok('judge: it marks the verdict for the mint and post steps', r.core.out.outputs.judged === 'true');
 
+  // ---- missing workflow_run association: recover only one bound live PR ----
+  gh = fakeApi({ associatedPages: [[associatedPr(761)]] });
+  r = await runJudge(gh, context([]));
+  ok('recovery: one exact-SHA same-repository PR is judged after a fresh identity read',
+    r.verdicts && r.verdicts.length === 1 && r.verdicts[0].ok === true && r.verdicts[0].headSha === HEAD
+      && gh.calls.filter((c) => c[0] === 'pulls.get').length >= 3
+      && gh.calls.some((c) => c[0] === 'paginate' && c[1].commit_sha === HEAD)
+      && r.core.out.outputs.judged === 'true', JSON.stringify(r.core.out));
+
+  const release = associatedPr(761, { head: { sha: HEAD, ref: 'test', repo: { id: HERE } },
+    base: { ref: 'main', repo: { id: HERE } } });
+  gh = fakeApi({ associatedPages: [[release]], base: 'main', pullsGet: () => ({ data: {
+    number: 761, state: 'open', draft: false, body: 'Closes #742', head: release.head, base: release.base,
+  } }) });
+  r = await runJudge(gh, context([], { head_branch: 'test' }));
+  ok('recovery: a release PR from the same default-branch head to main is valid',
+    r.verdicts && r.verdicts[0].ok === true && r.verdicts[0].headSha === HEAD, JSON.stringify(r.core.out));
+
+  for (const [label, candidate, runExtra] of [
+    ['wrong SHA', associatedPr(761, { head: { sha: HEAD2, ref: 'x', repo: { id: HERE } } })],
+    ['wrong head repository', associatedPr(761, { head: { sha: HEAD, ref: 'x', repo: { id: 2 } } })],
+    ['fork', associatedPr(761, { head: { sha: HEAD, ref: 'x', repo: { id: 2 } }, base: { ref: 'test', repo: { id: HERE } } })],
+    ['wrong base repository', associatedPr(761, { base: { ref: 'test', repo: { id: 2 } } })],
+    ['wrong branch', associatedPr(761, { head: { sha: HEAD, ref: 'other', repo: { id: HERE } } })],
+    ['missing head ref', associatedPr(761, { head: { sha: HEAD, repo: { id: HERE } } })],
+    ['malformed candidate', { number: 761, state: 'open', head: { sha: HEAD } }],
+    ['missing run branch', associatedPr(761), { head_branch: undefined }],
+    ['blank run branch', associatedPr(761), { head_branch: '   ' }],
+    ['missing run repository', associatedPr(761), { head_repository: undefined }],
+    ['cross-repository run', associatedPr(761), { head_repository: { id: 2 } }],
+  ]) {
+    gh = fakeApi({ associatedPages: [[candidate]] });
+    r = await runJudge(gh, context([], runExtra));
+    ok(`recovery: ${label} fails closed without a verdict`,
+      r.verdicts === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined
+        && !gh.calls.some((c) => c[0] === 'request')
+        && (label.startsWith('missing run') || label === 'blank run branch' || label === 'cross-repository run'
+          ? !gh.calls.some((c) => c[0] === 'paginate')
+          : gh.calls.some((c) => c[0] === 'paginate')), JSON.stringify(r.core.out));
+  }
+
+  gh = fakeApi({ associatedPages: [[associatedPr(761), associatedPr(762)]] });
+  r = await runJudge(gh, context([]));
+  ok('recovery: two open exact candidates are ambiguous and cannot pass',
+    r.verdicts === null && r.core.out.failed.length === 1 && !gh.calls.some((c) => c[0] === 'pulls.get')
+      && gh.calls.some((c) => c[0] === 'paginate'));
+
+  gh = fakeApi({ associatedPages: [[associatedPr(761), { number: 762, state: 'open', head: { sha: HEAD } }]] });
+  r = await runJudge(gh, context([]));
+  ok('recovery: a malformed second candidate cannot hide behind one valid candidate',
+    r.verdicts === null && r.core.out.failed.length === 1 && !gh.calls.some((c) => c[0] === 'pulls.get'));
+
+  gh = fakeApi({ associatedPages: [Array.from({ length: 100 }, (_, n) => associatedPr(n + 1, { state: 'closed' })), [associatedPr(761)]] });
+  r = await runJudge(gh, context([]));
+  ok('recovery: page two is read before selecting the unique open candidate',
+    r.verdicts && r.verdicts[0].ok === true
+      && gh.calls.filter((c) => c[0] === 'repos.listPullRequestsAssociatedWithCommit').length === 2,
+    JSON.stringify(r.core.out));
+
+  const apiError = new Error('association API down'); apiError.status = 502;
+  gh = fakeApi({ associationError: apiError });
+  r = await runJudge(gh, context([]));
+  ok('recovery: an association API error fails closed without mint or post authorization',
+    r.verdicts === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined
+      && gh.calls.some((c) => c[0] === 'paginate') && /Could not read pull requests/.test(r.core.out.failed[0]));
+
+  gh = fakeApi({ associatedPages: [[associatedPr(761)]], pullsGet: (calls, a) => {
+    const read = calls.filter((c) => c[0] === 'pulls.get').length;
+    return { data: { ...associatedPr(a.pull_number), body: 'Closes #742',
+      head: { sha: read >= 2 ? HEAD2 : HEAD, ref: 'x', repo: { id: HERE } } } };
+  } });
+  r = await runJudge(gh, context([]));
+  ok('recovery: a force-push during the matcher cannot publish success on an unrelated head',
+    r.verdicts === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined
+      && gh.calls.filter((c) => c[0] === 'pulls.get').length >= 2,
+    JSON.stringify(r.core.out));
+
+  gh = fakeApi({ associatedPages: [[associatedPr(761)]], pullsGet: (calls, a) => {
+    const read = calls.filter((c) => c[0] === 'pulls.get').length;
+    return { data: { ...associatedPr(a.pull_number), body: 'Closes #742',
+      head: { sha: read === 2 ? HEAD2 : HEAD, ref: 'x', repo: { id: HERE } } } };
+  } });
+  r = await runJudge(gh, context([]));
+  ok('recovery: the matcher verdict itself must name the run head even if the PR moves back',
+    r.verdicts === null && r.core.out.failed.length === 1
+      && gh.calls.filter((c) => c[0] === 'pulls.get').length === 2,
+    JSON.stringify(r.core.out));
+
+  gh = fakeApi({ associatedPages: [[associatedPr(761)]], pullsGet: (calls, a) => {
+    const read = calls.filter((c) => c[0] === 'pulls.get').length;
+    return { data: { ...associatedPr(a.pull_number), body: 'Closes #742', state: read >= 3 ? 'closed' : 'open' } };
+  } });
+  r = await runJudge(gh, context([]));
+  ok('recovery: a PR closed after matching cannot authorize a success',
+    r.verdicts === null && r.core.out.failed.length === 1 && r.core.out.outputs.judged === undefined
+      && gh.calls.filter((c) => c[0] === 'pulls.get').length >= 3,
+    JSON.stringify(r.core.out));
+
+  gh = fakeApi({ associatedPages: [[associatedPr(761)]], pullsGet: (calls, a) => {
+    const read = calls.filter((c) => c[0] === 'pulls.get').length;
+    return { data: { ...associatedPr(a.pull_number), body: 'Closes #742',
+      head: { sha: read >= 3 ? HEAD2 : HEAD, ref: 'x', repo: { id: HERE } } } };
+  } });
+  r = await runJudge(gh, context([]));
+  ok('recovery: a force-push after matching cannot authorize a success',
+    r.verdicts === null && r.core.out.failed.length === 1
+      && gh.calls.filter((c) => c[0] === 'pulls.get').length >= 3,
+    JSON.stringify(r.core.out));
+
   gh = fakeApi({ bodies: { 761: { body: 'no link here', closing: [] } } });
   r = await runJudge(gh, context([listedPr(761)]));
   ok('judge: a body with no closing keyword is a failure verdict', r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD, JSON.stringify(r.verdicts));
@@ -339,7 +472,10 @@ async function runPin(github, env) {
     gh = fakeApi();
     r = await runJudge(gh, context(pulls));
     ok(`judge: a run listing ${label} of this repository fails the job and writes no verdict`,
-      r.core.out.failed.length === 1 && r.verdicts === null && r.core.out.outputs.judged === undefined && gh.calls.length === 0, JSON.stringify(r.core.out));
+      r.core.out.failed.length === 1 && r.verdicts === null && r.core.out.outputs.judged === undefined
+        && (label === 'none' || label === 'no list'
+          ? gh.calls.some((c) => c[0] === 'paginate')
+          : gh.calls.length === 0), JSON.stringify(r.core.out));
   }
   gh = fakeApi();
   const noRepo = context([listedPr(761)]);
@@ -358,7 +494,7 @@ async function runPin(github, env) {
     return { data: { head: { sha: HEAD2 } } }; } });
   r = await runJudge(gh, context([listedPr(761)]));
   ok('judge: an API error becomes a failure verdict on the pull request\'s head, not silence',
-    r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD2 && /502/.test(r.verdicts[0].summary) && /MatcherUnavailableError/.test(r.verdicts[0].summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdicts));
+    r.verdicts && r.verdicts[0].ok === false && r.verdicts[0].headSha === HEAD2 && /502/.test(r.verdicts[0].summary) && /MatcherUnavailableError/.test(r.verdicts[0].summary) && !/boom/.test(r.verdicts[0].summary) && r.core.out.outputs.judged === 'true', JSON.stringify(r.verdicts));
 
   gh = fakeApi({ pullsGet: () => { const e = new Error('down'); e.status = 503; throw e; } });
   r = await runJudge(gh, context([listedPr(761)]));
