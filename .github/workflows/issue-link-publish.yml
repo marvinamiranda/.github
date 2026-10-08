@@ -29,8 +29,9 @@
 #
 # ORDER, and why. (1) Verify the pin: nothing below runs unless it holds.
 # (2) Fetch issue-link.js at governance-ref and judge, holding ONLY the read
-# token. (3) Mint the Checks App token -- the first step that touches the key,
-# after all code has run -- for this repository only, with `checks: write`
+# token. (3) Require a nonempty key with inline code, failing the job loudly
+# if absent; then mint the Checks App token, after all fetched code has run,
+# for this repository only, with `checks: write`
 # only, revoked when the job ends. (4) One inline script reads the verdict as
 # JSON and POSTs it with that token. The judge (fetched code) never sees the
 # key; the step that sees the key runs only inline text of this file.
@@ -251,11 +252,27 @@ jobs:
             core.setOutput('judged', 'true');
             for (const v of verdicts) await core.summary.addHeading('governance/issue-link').addRaw(v.summary).write();
 
-      # The Checks App token: the first thing to touch the key, after all fetched
-      # code has run. This repository only, `checks: write` only.
+      # After fetched code is finished, fail loudly if the cross-repo named
+      # key did not resolve. This inline check reveals presence only, never
+      # the key or an arbitrary error message. A failure keeps the job red.
+      - name: Require the Checks App key
+        id: key
+        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CHECKS_PRIVATE_KEY: ${{ secrets.CHECKS_APP_PRIVATE_KEY }}
+        with:
+          script: |
+            if (!(process.env.CHECKS_PRIVATE_KEY || '').trim()) {
+              core.setFailed('CHECKS_APP_PRIVATE_KEY is empty. Check explicit named forwarding and the governance-checks environment. No App token is minted and no check is posted.');
+              return;
+            }
+            core.setOutput('ready', 'true');
+
+      # This repository only, `checks: write` only.
       - name: Mint the Checks App token
         id: checks-app
-        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true'
+        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true' && steps.key.outputs.ready == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.CHECKS_APP_CLIENT_ID }}
@@ -266,7 +283,7 @@ jobs:
 
       # The one POST. Inline text only: it reads the verdict as JSON data.
       - name: Publish governance/issue-link
-        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true'
+        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.judged == 'true' && steps.key.outputs.ready == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           github-token: ${{ steps.checks-app.outputs.token }}

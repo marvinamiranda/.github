@@ -926,6 +926,9 @@ that **one named secret**, never `secrets: inherit`; the called job's
 `governance-checks` environment value takes precedence. Its existing default
 branch restriction, ephemeral runner, verified merged governance pin,
 read-only matcher step and later checks-only App token remain required.
+After the read-only matcher has finished, a trusted inline presence check
+fails the job loudly if the named key is empty or whitespace; minting and
+posting require its affirmative output. It never prints the key.
 Both the Actions PR-governance caller and Checks App publisher must pin the
 same reviewed, merged central commit to use the same matcher.
 

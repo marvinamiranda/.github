@@ -62,9 +62,10 @@ const MINTED = '${{ steps.checks-app.outputs.token }}';
 const verify = byName('Verify the pin');
 const fetchStep = byName('Fetch the shared matcher');
 const judgeStep = byName('Judge the pull request');
+const keyCheck = byName('Require the Checks App key');
 const mint = byName('Mint the Checks App token');
 const post = byName('Publish governance/issue-link');
-ok('the five steps exist', [verify, fetchStep, judgeStep, mint, post].every(Boolean));
+ok('the six steps exist', [verify, fetchStep, judgeStep, keyCheck, mint, post].every(Boolean));
 
 // ------------------------------------------------ trigger and inputs ------
 const call = (doc.on || doc[true] || {}).workflow_call;
@@ -91,7 +92,7 @@ ok('no other job exists', Object.keys(doc.jobs || {}).join() === 'publish');
 
 // ------------------------------------------------ pins ------------------
 const uses = steps.map((s) => s.uses).filter(Boolean);
-ok('every action is pinned to a full commit SHA', uses.length === 5 && uses.every((u) => FULL_SHA.test(u.split('@')[1] || '')), uses.join(', '));
+ok('every action is pinned to a full commit SHA', uses.length === 6 && uses.every((u) => FULL_SHA.test(u.split('@')[1] || '')), uses.join(', '));
 ok('only first-party actions are used', uses.every((u) => /^actions\//.test(u)), uses.join(', '));
 ok('no setup-* action (the gate VM has no toolcache)', uses.every((u) => !/\/setup-/.test(u)));
 
@@ -118,16 +119,16 @@ ok('no step runs on always(), failure() or cancelled(): the mint and post need a
 
 // ------------------------------------------------ ordering ---------------
 const at = { verify: indexOfStep('Verify the pin'), fetch: indexOfStep('Fetch the shared matcher'), judge: indexOfStep('Judge the pull request'),
-  mint: indexOfStep('Mint the Checks App token'), post: indexOfStep('Publish governance/issue-link') };
-ok('order: verify, fetch, judge, mint, post', at.verify === 0 && at.verify < at.fetch && at.fetch < at.judge && at.judge < at.mint && at.mint < at.post, JSON.stringify(at));
+  key: indexOfStep('Require the Checks App key'), mint: indexOfStep('Mint the Checks App token'), post: indexOfStep('Publish governance/issue-link') };
+ok('order: verify, fetch, judge, mint, post', at.verify === 0 && at.verify < at.fetch && at.fetch < at.judge && at.judge < at.key && at.key < at.mint && at.mint < at.post, JSON.stringify(at));
 ok('the pin step has the id pin, and its env is the workflow commit, the workflow repository and governance-ref',
   verify && verify.id === 'pin' && verify.env.SELF_SHA === '${{ job.workflow_sha }}' && verify.env.SELF_REPOSITORY === '${{ job.workflow_repository }}'
     && verify.env.GOVERNANCE_REF === '${{ inputs.governance-ref }}', verify && JSON.stringify(verify.env));
 ok('the workflow never reads github.workflow_sha (the caller\'s commit)', !/github\.workflow_sha|GITHUB_WORKFLOW_SHA/.test(text));
-for (const [label, s] of [['fetch', fetchStep], ['judge', judgeStep], ['mint', mint], ['post', post]]) {
+for (const [label, s] of [['fetch', fetchStep], ['judge', judgeStep], ['key', keyCheck], ['mint', mint], ['post', post]]) {
   ok(`${label}: runs only when the pin verified`, s && /steps\.pin\.outputs\.ok\s*==\s*'true'/.test(s.if || ''), s && s.if);
 }
-for (const [label, s] of [['mint', mint], ['post', post]]) {
+for (const [label, s] of [['key', keyCheck], ['mint', mint], ['post', post]]) {
   ok(`${label}: runs only after the judge produced a verdict`, s && /steps\.judge\.outputs\.judged\s*==\s*'true'/.test(s.if || ''), s && s.if);
 }
 ok('the judge step has the id judge', judgeStep && judgeStep.id === 'judge');
@@ -136,7 +137,12 @@ ok('a failed pin fails the job (nothing is posted, no token minted)', verify && 
 
 // ------------------------------------------------ the key ----------------
 const KEY = /CHECKS_APP_PRIVATE_KEY/;
-ok('the key secret is named by exactly one step, the mint', steps.filter((s) => KEY.test(stepText(s))).length === 1 && mint && KEY.test(stepText(mint)));
+ok('only the inline key check and mint name the key secret', steps.filter((s) => KEY.test(stepText(s))).length === 2 && keyCheck && KEY.test(stepText(keyCheck)) && mint && KEY.test(stepText(mint)));
+for (const [label, step] of [['mint', mint], ['post', post]]) {
+  ok(`${label}: cannot run without a nonempty verified key`, step && /steps\.key\.outputs\.ready\s*==\s*'true'/.test(step.if || ''), step && step.if);
+}
+ok('key check is inline trusted code, with no external module, API call or expression in its script', keyCheck && keyCheck.id === 'key' && keyCheck.uses === 'actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b' && !/require\(|github\.|\$\{\{/.test(script(keyCheck)));
+ok('key presence receives only the environment secret under its explicit name', keyCheck && keyCheck.env.CHECKS_PRIVATE_KEY === '${{ secrets.CHECKS_APP_PRIVATE_KEY }}');
 ok('the mint step asks for this repository only, checks write only',
   mint && mint.with['repositories'] === '${{ github.event.repository.name }}' && mint.with['owner'] === '${{ github.repository_owner }}'
     && mint.with['permission-checks'] === 'write'
@@ -148,7 +154,7 @@ ok('the minted token reaches exactly one step, the post, as its github-token',
   steps.filter((s) => stepText(s).includes('steps.checks-app.outputs.token')).length === 1 && post && post.with['github-token'] === MINTED);
 ok('the fetched code never sees the minted token or any secret',
   [verify, fetchStep, judgeStep].every((s) => s && !/secrets\.|steps\.checks-app/.test(stepText(s))));
-ok('no step other than the mint reads the secrets context', steps.filter((s) => /secrets\./.test(stepText(s))).length === 1);
+ok('only key presence and mint read the secrets context', steps.filter((s) => /secrets\./.test(stepText(s))).length === 2);
 ok('the file takes no third-party secret, only the Checks App\'s',
   [...text.matchAll(/secrets\.([A-Z0-9_]+)/g)].every((m) => m[1] === 'CHECKS_APP_PRIVATE_KEY'));
 
@@ -272,6 +278,21 @@ async function runPin(github, env) {
       core.out.outputs.ok === String(pass) && (pass ? core.out.failed.length === 0 : core.out.failed.length === 1), JSON.stringify(core.out));
   }
 
+  for (const value of ['', '   ', 'test-private-key-marker']) {
+    const saved = process.env.CHECKS_PRIVATE_KEY;
+    process.env.CHECKS_PRIVATE_KEY = value;
+    const core = fakeCore();
+    try {
+      await new AsyncFunction('core', script(keyCheck))(core);
+    } finally {
+      if (saved === undefined) delete process.env.CHECKS_PRIVATE_KEY;
+      else process.env.CHECKS_PRIVATE_KEY = saved;
+    }
+    const missing = !value.trim();
+    ok(`key presence: ${missing ? 'empty/whitespace fails loudly without authorizing mint or post' : 'nonempty authorizes without exposing key'}`,
+      missing ? core.out.failed.length === 1 && /empty/.test(core.out.failed[0]) && core.out.outputs.ready !== 'true'
+        : core.out.failed.length === 0 && core.out.outputs.ready === 'true' && !JSON.stringify(core.out).includes(value));
+  }
   // ---- one pull request ---------------------------------------------------
   let gh = fakeApi();
   let r = await runJudge(gh, context([listedPr(761)]));
