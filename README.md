@@ -760,6 +760,64 @@ governance/bootstrap.sh --repo <repo> ... --project --project-title "<t>"  # als
   changing anything. This repository's own `test-integration` would otherwise
   require only `governance tests`, which a pull request here can rewrite.
 
+Product ruleset runs also need `--checks-app-id <positive integer>`, falling back
+to `id` in `~/.config/mm-agent/mm-checks/app.json` (`MM_CHECKS_APP_JSON` overrides
+that path). The id must match `GET /apps/marvinamiranda-checks`, differ from the
+Reviewer and Actions ids, and have no leading zero. Preflight prints the verified
+id. Missing or invalid identity refuses before any write. `--no-rulesets` and
+`--self-only` require no Checks App id; `--self-only` output is unchanged.
+
+Only product `test-integration` and `main-checks` pin `governance/issue-link`
+and `All checks accounted for` to that App. Reviewer and other Actions issuers,
+including dev rulesets, are unchanged. Before any mutation, the bootstrap probes
+all requested repos: both exact names must have concluded success from the verified App
+on the **same** one of the 20 most recently updated PR heads into test. Check runs
+are paginated. Missing/unreadable proof refuses `--apply`; a dry run warns.
+A shadow aggregate or an Actions-issued copy cannot qualify.
+
+**Per-repo rollout prerequisite:** product T5 must first merge on dev with
+`CHECKS_APP_COPY_REQUIRED = True` and the trusted issue-link publisher enabled.
+Promote the trusted publisher onto the repository’s actual default branch before
+expecting `workflow_run` evidence, with its environment branch policy matching.
+For ops the currently observed default and environment policy are `test`; a
+dev merge alone does not execute the candidate publisher. Promotion and policy
+changes remain owner-only. Track this in [ops#536](https://github.com/marvinamiranda/omni237-ops/issues/536)
+and [omni237#2256](https://github.com/marvinamiranda/omni237/issues/2256).
+Observe both required names from App 5105172 on a live PR head into test:
+
+```bash
+gh api --paginate "repos/marvinamiranda/omni237-ops/commits/<PR_HEAD_SHA>/check-runs?per_page=100" --jq '.check_runs[] | select(.app.id == 5105172) | [.head_sha, .name, .app.id] | @tsv'
+```
+
+Repeat with `omni237` for its own prerequisite. Pinning before publishers exist
+freezes test/main merges, including hotfixes. T5 goes first while Actions remains
+pinned; once both Apps post required names a failing copy from either can block
+the merge, so schedule the owner cutover close to T5. Pilot ops only, then after
+one observed pilot merge apply to omni237, after its own proof. For each repo,
+also observe **one PR into main posting both names successfully from 5105172**
+before declaring main-checks cutover proven. Retain the PR number, head SHA,
+updated_at and check-run App ids in the owner rollout record; the bootstrap
+prints the test-target PR evidence it proved on. Agents must not
+apply rulesets. **sm360 and sm360-sdk are excluded**: their `required ready` gate
+and missing Checks App publishers are tracked separately in
+[.github#41](https://github.com/marvinamiranda/.github/issues/41).
+
+**Literal rollback / pool recovery:** in a clean owner checkout (not a dirty
+worker checkout), restore Actions pins from the pre-change commit. The older
+script does not accept `--checks-app-id`; omit it. With the day token already
+exported as `GH_TOKEN`, for the pilot:
+
+```bash
+git checkout 6057728
+env -i HOME="$HOME" GH_TOKEN="$GH_TOKEN" PATH=/opt/homebrew/bin:/usr/bin:/bin /bin/bash governance/bootstrap.sh --repo omni237-ops --reviewer-app-id 5075711
+env -i HOME="$HOME" GH_TOKEN="$GH_TOKEN" PATH=/opt/homebrew/bin:/usr/bin:/bin /bin/bash governance/bootstrap.sh --repo omni237-ops --reviewer-app-id 5075711 --apply
+```
+
+If both repos were migrated, add `--repo omni237` to both bootstrap commands.
+Rollback restores Actions pins over each repo's **current** dev configuration,
+not a historical snapshot. The gate-ephemeral pool has no hosted fallback; use
+this owner rollback for a prolonged outage, without bypassing required checks.
+
 **The credential for `--apply`** is a fine-grained personal access token of
 the owner's that expires the next day, passed as `GH_TOKEN` for that run only.
 Never add `admin:org` to the `gh` keyring login: agents on this machine can
@@ -817,8 +875,8 @@ four rulesets below.
   Reviewer App. Any branch may open a pull request into `dev`. Merge commits
   only, no force push, no deletion, no bypass.
 - **`test-integration`**: on `test`. Pull request, no approvals. The repo's
-  required checks + `governance/issue-link` + `test-source-policy`, all pinned
-  to the Actions app, plus `review/independent` pinned to the Reviewer App. The
+  required checks + `governance/issue-link` + `test-source-policy`; the two
+  Checks App contexts use its id, the remaining checks use Actions, plus `review/independent` pinned to the Reviewer App. The
   source must be `dev`, `main` or `hotfix/*` (the `test-source-policy` check);
   merge commits only, so `test` and `main` keep one history. No force push, no
   deletion, no bypass.
@@ -828,7 +886,8 @@ four rulesets below.
   organisation-admin role, which would extend to every admin.
 - **`main-checks`**: on `main`. Pull request (merge commits only, no
   approvals); required checks from both lists + `governance/issue-link` +
-  `main-source-policy`, whose source must be `test` or `hotfix/*`; no force
+  `main-source-policy`; the two Checks App contexts use its id and the rest
+  use Actions. The source must be `test` or `hotfix/*`; no force
   push, no deletion; no bypass, so the owner's merges pass the checks too.
 
 `require_extra_approval_for_unattributed_changes` is set to `false` explicitly,
