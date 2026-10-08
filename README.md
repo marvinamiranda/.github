@@ -949,3 +949,40 @@ branch must then show App5105172 posting both required names successfully.
 Only after that observed proof may the owner cut over rulesets. No synthetic
 check posts, key extraction, environment-policy change, or agent merge is
 part of this central fix.
+
+### Missing-association recovery and key placement (#43)
+
+The central issue-link publisher recovers a missing workflow_run PR association
+through GitHub's paginated open-PR list filtered by `head=owner:branch`.
+The commit-associated endpoint is unsuitable for a default-branch release head: it
+can report the merged introducer rather than the open release PR. It requires one open
+candidate with the exact run SHA, branch and same-repository identity; forks,
+ambiguous candidates, malformed eligible data and unreadable APIs fail closed.
+When the run SHA is valid, those failures publish a failure verdict on that SHA
+so an earlier success cannot stand; invalid/missing SHAs remain unpostable.
+Closed or other-SHA candidates are skipped before deep validation. A fresh
+identity check before and after judging prevents publishing success after a
+force-push or association change. A same-repo test→main release head is valid.
+See GitHub's [open pull-request head filter](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests).
+Existing listed multi-PR commit aggregation remains stricter: any failure fails
+the shared head. Product callers consume this behavior only after this PR merges
+and a separately reviewed caller repin; their existing T5 PRs remain untouched.
+
+Bootstrap step g now reads repository and organization secret **name metadata**
+with pagination. A broader-scoped `CHECKS_APP_PRIVATE_KEY` is DRIFT requiring
+owner remediation; it is never deleted, copied, decrypted or changed by this
+check. Permission, network, malformed and incomplete responses are UNVERIFIED,
+never proof of absence. Step g cannot report up to date until both scopes were
+verified and the key is absent there. `--self-only` makes no such requests and
+retains its byte-identical output.
+
+The owner's day-expiring fine-grained token needs **Secrets: read** at repository
+and organization scopes for these metadata reads. Never expand the agent login's
+keyring privileges. See GitHub's [repository secret metadata endpoint](https://docs.github.com/en/rest/actions/secrets#list-repository-secrets)
+and [organization secret metadata endpoint](https://docs.github.com/en/rest/actions/secrets#list-organization-secrets).
+After a warning, the owner verifies key custody before any manual remediation;
+no secret or environment-policy mutation is authorized by this drift report.
+
+The API-error regression also asserts that arbitrary `error.message` text (the
+fixture's `boom`) cannot leak into the App check summary. Bounded exception
+category and status remain visible.
