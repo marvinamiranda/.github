@@ -118,6 +118,7 @@ for (let i = 1; i < args.length; i++) {
 }
 log('read');
 if (!(target in fixtures)) { process.stderr.write('gh: Not Found (HTTP 404)\\n'); process.exit(1); }
+if (fixtures[target] && fixtures[target].__error) { process.stderr.write('gh: metadata unavailable (HTTP ' + fixtures[target].__error + ')\\n'); process.exit(1); }
 if (args.includes('--paginate') && fixtures[target] && fixtures[target].__pages) { process.stdout.write(fixtures[target].__pages.map((p) => JSON.stringify(p)).join('\\n') + '\\n'); process.exit(0); }
 const body = JSON.stringify(fixtures[target]);
 process.stdout.write(jq ? execFileSync('jq', ['-r', jq], { input: body }) : body + '\\n');
@@ -161,6 +162,8 @@ function labelsFromScript() {
 function fixtures(extra = {}) {
   const repo = (name) => ({ name, full_name: `${ORG}/${name}`, default_branch: 'dev' });
   return {
+    [`orgs/${ORG}/actions/secrets?per_page=100`]: { total_count: 0, secrets: [] },
+    [`repos/${ORG}/prod/actions/secrets?per_page=100`]: { total_count: 0, secrets: [] },
     [`apps/marvinamiranda-checks`]: { id: CHECKS_ID, slug: 'marvinamiranda-checks' },
     [`repos/${ORG}/prod/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20`]: [{ number: 17, updated_at: '2026-10-08T09:00:00Z', head: { sha: 'a'.repeat(40) } }],
     [`repos/${ORG}/prod/commits/${'a'.repeat(40)}/check-runs?per_page=100`]: { total_count: 2, check_runs: ['governance/issue-link', 'All checks accounted for'].map((name) => ({name, head_sha: 'a'.repeat(40), conclusion: 'success', app: { id: CHECKS_ID }})) },
@@ -271,7 +274,7 @@ const pr = (rs) => (rs.rules.find((r) => r.type === 'pull_request') || {}).param
 const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks') || {}).parameters || {}).required_status_checks || [];
 
 // --------------------------- Checks App issuer pin and fail-closed preflight ----
-{
+if (process.env.BOOTSTRAP_DRIFT_ONLY !== '1') {
   const assertPins = (r, id) => {
     const plan = planned(r.stdout);
     for (const name of ['test-integration', 'main-checks']) {
@@ -393,8 +396,36 @@ const checks = (rs) => ((rs.rules.find((r) => r.type === 'required_status_checks
     .update(self.stdout.replace(/[a-f0-9]{40}/g, '<commit>').replace(/read now: [a-f0-9]{12}/g, 'read now: <short>')).digest('hex') === '8d14618b821f9c21f5671fc773c32540269983b013b4b83176f016c245ba82a1');
 }
 
+// Step g only inspects secret NAME metadata; never reads or changes key values.
+{
+  const repoKey = `repos/${ORG}/prod/actions/secrets?per_page=100`;
+  const orgKey = `orgs/${ORG}/actions/secrets?per_page=100`;
+  const key = { name: 'CHECKS_APP_PRIVATE_KEY' };
+  for (const [scope, endpoint] of [['repository', repoKey], ['organization', orgKey]]) {
+    const r = bootstrap(['--no-rulesets'], { fx: fixtures({ [endpoint]: { total_count: 1, secrets: [key] } }) });
+    ok(`${scope} key placement is drift, never automatically mutated`, r.status === 0
+      && r.stdout.includes(`DRIFT: ${scope}`) && r.stdout.includes('CHECKS_APP_PRIVATE_KEY')
+      && r.writes.length === 0 && !/governance-checks: up to date/.test(r.stdout), tail(r));
+    const paged = bootstrap(['--no-rulesets'], { fx: fixtures({ [endpoint]: { __pages: [
+      { total_count: 2, secrets: [{ name: 'OTHER' }] }, { total_count: 2, secrets: [key] },
+    ] } }) });
+    ok(`${scope} key drift on a later metadata page is found`, paged.status === 0 && paged.stdout.includes(`DRIFT: ${scope}`), tail(paged));
+    for (const [label, body] of [['forbidden', { __error: 403 }], ['not found', { __error: 404 }],
+      ['malformed', { total_count: 0, secrets: null }], ['truncated', { total_count: 1, secrets: [] }]]) {
+      const r = bootstrap(['--no-rulesets'], { fx: fixtures({ [endpoint]: body }) });
+      ok(`${scope} ${label} metadata is unverified, not absent`, r.status === 0
+        && r.stdout.includes(`UNVERIFIED: ${scope}`) && !/governance-checks: up to date/.test(r.stdout)
+        && r.writes.length === 0, tail(r));
+    }
+  }
+  const r = bootstrap(['--no-rulesets']);
+  ok('successful empty repo/org metadata allows environment up-to-date', r.status === 0 && /governance-checks: up to date/.test(r.stdout), tail(r));
+  const self = bootstrap(['--self-only'], { repo: false });
+  ok('self-only never queries secret metadata', self.status === 0 && !self.calls.some((c) => c.args.some((a) => a.includes('/actions/secrets'))), tail(self));
+}
+
 // Focused issuer-contract suite for causal mutations; exercises the same CLI cases.
-if (process.env.BOOTSTRAP_CHECKS_ONLY === '1') {
+if (process.env.BOOTSTRAP_CHECKS_ONLY === '1' || process.env.BOOTSTRAP_DRIFT_ONLY === '1') {
   console.log(`${total - failed}/${total} passed`);
   fs.rmSync(root, { recursive: true, force: true });
   process.exit(failed ? 1 : 0);

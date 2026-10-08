@@ -47,6 +47,7 @@
 #     Projects: read and write         f) only with --project
 #   Repository permissions:
 #     Actions: read                    g) read the governance-checks environment and its rules
+#     Secrets: read                   g) repository and organization NAME metadata only
 #     Administration: read and write   b) the default branch; e) rulesets; g) the environment
 #     Contents: read                   each repository's .github/governance/ and test
 #     Issues: read and write           c) labels
@@ -914,10 +915,39 @@ fi
 # creates the App.
 CHECKS_ENV="governance-checks"
 CHECKS_ENV_BRANCH="$CONFIG_REF"
+# Read NAME metadata only. Permission/network/malformed/truncated responses
+# never prove absence, and drift is reported for owner remediation only.
+check_broad_checks_key() { # <endpoint> <scope label>
+  local endpoint="$1" scope="$2" metadata="$WORK/secret-metadata.json"
+  if ! gh api --paginate "$endpoint" >"$metadata" 2>"$WORK/secret-metadata.err"; then
+    warn "UNVERIFIED: $scope Checks App key placement metadata is unreadable; no absence claim."
+    return 1
+  fi
+  if ! jq -se '
+    length > 0 and all(.[];
+      type == "object" and (.total_count | type == "number") and .total_count >= 0
+      and (.secrets | type == "array") and all(.secrets[]; (.name | type == "string")))
+    and (.[0].total_count as $count |
+      all(.[]; .total_count == $count) and
+      ([.[] | .secrets[].name] | length == $count and (unique | length) == $count))
+  ' "$metadata" >/dev/null 2>&1; then
+    warn "UNVERIFIED: $scope Checks App key placement metadata is malformed or incomplete; no absence claim."
+    return 1
+  fi
+  if jq -se '[.[] | .secrets[].name] | index("CHECKS_APP_PRIVATE_KEY") != null' "$metadata" >/dev/null; then
+    warn "DRIFT: $scope CHECKS_APP_PRIVATE_KEY exists outside governance-checks; owner remediation required, secret is not changed."
+    return 1
+  fi
+  return 0
+}
+
 section "g) Environment $CHECKS_ENV"
 (( ! SELF_ONLY )) || info "skipped (--self-only)"
 for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   info "[$repo]"
+  checks_key_placement_verified=1
+  check_broad_checks_key "repos/$ORG/$repo/actions/secrets?per_page=100" "repository $repo" || checks_key_placement_verified=0
+  check_broad_checks_key "orgs/$ORG/actions/secrets?per_page=100" "organization $ORG" || checks_key_placement_verified=0
   env_path="repos/$ORG/$repo/environments/$CHECKS_ENV"
   fetch "repos/$ORG/$repo"
   current_default="$(jq -r .default_branch <<<"$BODY")"
@@ -977,7 +1007,7 @@ for repo in ${REPOS[@]+"${REPOS[@]}"}; do
     jq -n --arg b "$CHECKS_ENV_BRANCH" '{name: $b, type: "branch"}' >"$WORK/env-rule-$repo.json"
     mutate_json POST "$env_path/deployment-branch-policies" "$WORK/env-rule-$repo.json"
   fi
-  (( PLANNED != planned_before )) || info "$CHECKS_ENV: up to date."
+  (( PLANNED != planned_before || ! checks_key_placement_verified )) || info "$CHECKS_ENV: up to date."
 
 done
 
