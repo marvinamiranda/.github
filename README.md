@@ -45,7 +45,15 @@ the default branch, or those three forms open issues with no type.
 .github/governance/HOTSPOTS.md               its hot shared files (see HOTSPOTS-GUIDE.md)
 .github/workflows/pr-governance.yml          the caller below
 .github/workflows/source-policy.yml          the source-policy caller below
+AGENTS.md                                    the repository's agent rules (root)
 ```
+
+**Agent instructions (owner decision 2026-10-10).** Every product repository
+keeps exactly one `AGENTS.md` at its root and no `CLAUDE.md`: Claude Code and
+Codex both load `AGENTS.md` natively. `AGENTS.md` holds only that repository's
+rules; owner-wide rules live in the owner's global `AGENTS.md` and are not
+duplicated per repository. No governance script, check or template in this
+repository requires or reads a `CLAUDE.md`.
 
 The branch model (DELIVERY §9.1): **`dev`** is the default and the integration
 branch every Task branches from and merges into; **`test`** is acceptance,
